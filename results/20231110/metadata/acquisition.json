@@ -1,0 +1,21 @@
+{
+  "source": "tianyi",
+  "mission": "S1B",
+  "sensorMode": "S1",
+  "polarisation": "VV",
+  "imagingMode": "S1",
+  "lookDirection": "LEFT",
+  "centerFrequency": 5400000100.0,
+  "prf": 4105.0903,
+  "startTimeUTC": "2023-11-10T04:39:48.881889",
+  "stopTimeUTC": "2023-11-10T04:39:52.433358",
+  "startGPSTime": 1383626388.881889,
+  "stopGPSTime": 1383626392.433358,
+  "rangeTimeFirstPixel": 0.004179906307,
+  "rangeTimeLastPixel": 0.004284431307000028,
+  "centerLat": 29.70115,
+  "centerLon": 94.91965,
+  "headingAngle": 191.7879,
+  "sceneAverageHeight": 0.0,
+  "incidenceAngleCenter": 38.50775
+}

@@ -1,0 +1,23 @@
+{
+  "azDeskew": "FALSE",
+  "dopplerBasebandEstimationMethod": "dcEstimateList",
+  "dopplerGeometricEstimationMethod": "dcEstimateList",
+  "dopplerCentroidCoordinateType": "RAW",
+  "dopplerEstimate": {
+    "timeUTC": "2023-11-10T04:39:48.881889",
+    "dopplerAtMidRange": 0.01,
+    "dopplerAmbiguity": 0,
+    "geometricDopplerFlag": "false"
+  },
+  "combinedDoppler": {
+    "validityRangeMin": 0.004179906307,
+    "validityRangeMax": 0.004284431307000028,
+    "referencePoint": 0.004179906307,
+    "polynomialDegree": 2,
+    "coefficients": [
+      0.01,
+      0.0,
+      0.0
+    ]
+  }
+}

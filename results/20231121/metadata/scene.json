@@ -1,0 +1,48 @@
+{
+  "sceneCorners": [
+    {
+      "line": 0,
+      "pixel": 0,
+      "lat": 29.8388,
+      "lon": 94.8251,
+      "incidenceAngle": 37.5738,
+      "slantRangeTime": 0.004179906307,
+      "azimuthTime": "2023-11-21T04:39:36.800884",
+      "azimuthTimeUTC": "2023-11-21T04:39:36.800884",
+      "timeUTC": "2023-11-21T04:39:36.800884"
+    },
+    {
+      "line": 0,
+      "pixel": 12543,
+      "lat": 29.7878,
+      "lon": 95.066,
+      "incidenceAngle": 39.4314,
+      "slantRangeTime": 0.004284431307,
+      "azimuthTime": "2023-11-21T04:39:36.800884",
+      "azimuthTimeUTC": "2023-11-21T04:39:36.800884",
+      "timeUTC": "2023-11-21T04:39:36.800884"
+    },
+    {
+      "line": 14579,
+      "pixel": 0,
+      "lat": 29.6166,
+      "lon": 94.7638,
+      "incidenceAngle": 37.5738,
+      "slantRangeTime": 0.004179906307,
+      "azimuthTime": "2023-11-21T04:39:40.352354",
+      "azimuthTimeUTC": "2023-11-21T04:39:40.352354",
+      "timeUTC": "2023-11-21T04:39:40.352354"
+    },
+    {
+      "line": 14579,
+      "pixel": 12543,
+      "lat": 29.5626,
+      "lon": 95.0189,
+      "incidenceAngle": 39.4314,
+      "slantRangeTime": 0.004284431307,
+      "azimuthTime": "2023-11-21T04:39:40.352354",
+      "azimuthTimeUTC": "2023-11-21T04:39:40.352354",
+      "timeUTC": "2023-11-21T04:39:40.352354"
+    }
+  ]
+}

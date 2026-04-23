@@ -1,0 +1,27 @@
+1 prepare:
+
+docker run --rm   -v /home/ysdong/Software/D2SAR:/work   -v /tmp/tianyi_test:/tmp/tianyi_test   -v /home/ysdong/Software/D2SAR/results:/results   d2sar:latest   python3 /work/scripts/tianyi_importer.py   /tmp/tianyi_test/BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853   /results/tianyi_full_new   --download-dem
+
+2 rtc proc
+
+docker run --rm --gpus all  -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Software/D2SAR/results:/results   -v /tmp/tianyi_test:/tmp/tianyi_test   d2sar:latest   python3 /work/scripts/strip_rtc.py   /results/tianyi_full_new/manifest.json   /results/tianyi_strip_gpu   --gpu-mode auto --resolution 5
+
+
+3. insar
+
+docker run --rm   -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Temp/:/temp   -v /home/ysdong/Software/D2SAR/results:/results   d2sar:cuda   python3 /work/scripts/tianyi_importer.py   /temp/BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853.zip   /results/20231110   --download-dem
+
+docker run --rm   -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Temp/:/temp   -v /home/ysdong/Software/D2SAR/results:/results   d2sar:cuda   python3 /work/scripts/tianyi_importer.py   /temp/BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E.zip   /results/20231121   --download-dem
+
+
+docker run --rm --gpus all  -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Software/D2SAR/results:/results   -v /home/ysdong/Temp/:/temp    d2sar:cuda   python3 /work/scripts/strip_insar.py /results/20231110/manifest.json /results/20231121/manifest.json /results/20231110_20231121 
+
+
+
+问题1：crop操作时，应该直接生成master.crop slave.crop 对应的tif和json文件， 注意json中应为crop,很多参数已经发生了变化，然后进入到后续的流程中。目前json文件中文件存在错误导致后续工作无效
+问题2：我们是否可以用gdal vrt文件来管理数据，减少需要写入硬盘的数据量？
+问题3：根据目前的工作，当问题1解决后，我们生成的master和slave png全分辨率图片不要在前面生成，而是在完成normal和crop之后生成，这样可以直接看到normal和裁剪后的数据。
+问题4：在精配准阶段，根据不同分辨率的数据需要用不同的窗口， 小于5米的至少用12x512大小的窗口， 小于10米的至少用256x256窗口，其他的用默认窗口配准。当精配准拟合效果很差时，将使用2倍窗口再次进行精配准。
+当完成上述修改后，请重新从第一阶段开始测试，直到把滤波后的干涉相位png生成，测试时crop window 为 1 1 10000 5000
+
+
