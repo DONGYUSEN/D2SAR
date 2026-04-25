@@ -97,6 +97,62 @@ def _write_json(path: Path, data: dict) -> str:
     return str(path)
 
 
+def _update_scene_corners_for_window(
+    scene: dict,
+    window: tuple[int, int, int, int],
+    scene_corners: list,
+) -> dict:
+    if not scene_corners or not window:
+        return scene
+    row0, col0, rows, cols = window
+    new_scene = dict(scene)
+    if "sceneCorners" not in new_scene:
+        return new_scene
+    old_corners = new_scene["sceneCorners"]
+    if not isinstance(old_corners, list) or len(old_corners) < 4:
+        new_scene["sceneCorners"] = old_corners
+        return new_scene
+
+    top = [c for c in old_corners if c.get("refRow") == min(pt.get("refRow", 0) for pt in old_corners)]
+    bottom = [c for c in old_corners if c.get("refRow") == max(pt.get("refRow", 0) for pt in old_corners)]
+    if len(top) != 2 or len(bottom) != 2:
+        new_scene["sceneCorners"] = old_corners
+        return new_scene
+
+    def _corners_for_row(row_corners):
+        return sorted(row_corners, key=lambda c: c.get("refColumn", 0))
+
+    tl, tr = _corners_for_row(top)
+    bl, br = _corners_for_row(bottom)
+
+    total_rows = max(pt.get("refRow", 0) for pt in old_corners) + 1
+    total_cols = max(pt.get("refColumn", 0) for pt in old_corners) + 1
+
+    x_frac_start = col0 / max(total_cols - 1, 1)
+    x_frac_end = (col0 + cols - 1) / max(total_cols - 1, 1)
+    y_frac_start = row0 / max(total_rows - 1, 1)
+    y_frac_end = (row0 + rows - 1) / max(total_rows - 1, 1)
+
+    lon_top_start = tl.get("lon", 0) + (tr.get("lon", 0) - tl.get("lon", 0)) * x_frac_start
+    lon_top_end = tl.get("lon", 0) + (tr.get("lon", 0) - tl.get("lon", 0)) * x_frac_end
+    lon_bottom_start = bl.get("lon", 0) + (br.get("lon", 0) - bl.get("lon", 0)) * x_frac_start
+    lon_bottom_end = bl.get("lon", 0) + (br.get("lon", 0) - bl.get("lon", 0)) * x_frac_end
+
+    lat_top_start = tl.get("lat", 0) + (tr.get("lat", 0) - tl.get("lat", 0)) * x_frac_start
+    lat_top_end = tr.get("lat", 0) + (tl.get("lat", 0) - tr.get("lat", 0)) * x_frac_start
+    lat_bottom_start = bl.get("lat", 0) + (br.get("lat", 0) - bl.get("lat", 0)) * x_frac_start
+    lat_bottom_end = br.get("lat", 0) + (bl.get("lat", 0) - br.get("lat", 0)) * x_frac_end
+
+    new_corners = [
+        {"lon": lon_top_start, "lat": lat_top_start, "refRow": 0, "refColumn": 0},
+        {"lon": lon_top_end, "lat": lat_top_end, "refRow": 0, "refColumn": cols - 1},
+        {"lon": lon_bottom_start, "lat": lat_bottom_start, "refRow": rows - 1, "refColumn": 0},
+        {"lon": lon_bottom_end, "lat": lat_bottom_end, "refRow": rows - 1, "refColumn": cols - 1},
+    ]
+    new_scene["sceneCorners"] = new_corners
+    return new_scene
+
+
 def build_cropped_manifest(
     *,
     manifest_path: str | Path,
@@ -140,10 +196,11 @@ def build_cropped_manifest(
         slc_rel = manifest_relative_path(output_dir, slc_tif_out)
         slc_out_value = {"path": slc_rel} if isinstance(slc_entry_out, dict) else slc_rel
 
+    updated_scene = _update_scene_corners_for_window(scene, window, scene.get("sceneCorners") or [])
     _write_json(acq_out, new_acq)
     _write_json(rg_out, new_rg)
     _write_json(dop_out, doppler)
-    _write_json(scene_out, scene)
+    _write_json(scene_out, updated_scene)
     _write_json(orbit_out, orbit)
 
     new_manifest = json.loads(json.dumps(manifest))

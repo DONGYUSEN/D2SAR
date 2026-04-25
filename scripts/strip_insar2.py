@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import py_compile
@@ -594,6 +595,33 @@ def resolve_manifest_metadata_path(
         if resolved_path.exists() or not fallback_path.exists():
             return resolved_path
     return fallback_path
+
+
+def _compute_default_resolution(manifest_path: str | Path) -> float:
+    """Compute default resolution from radargrid metadata.
+
+    Default = max(groundRangeResolution, azimuthResolution) × 2,
+    rounded UP to nearest 0.5.
+
+    Args:
+        manifest_path: Path to the master manifest.json
+
+    Returns:
+        Default resolution in meters, rounded up to nearest 0.5
+    """
+    manifest = load_manifest(manifest_path)
+    radargrid_path = resolve_manifest_metadata_path(manifest_path, manifest, "radargrid")
+    with open(radargrid_path, encoding="utf-8") as f:
+        radargrid = json.load(f)
+
+    range_res = float(radargrid.get("groundRangeResolution", 0.0) or 0.0)
+    azimuth_res = float(radargrid.get("azimuthResolution", 0.0) or 0.0)
+    max_res = max(range_res, azimuth_res)
+
+    target = 2.0 * max_res  # 2x sampling as per README
+    default_res = math.ceil(target * 2) / 2.0  # round up to nearest 0.5
+    default_res = math.ceil(target * 2) / 2.0
+    return default_res
 
 
 def gps_to_datetime(ts: str) -> datetime:
@@ -1676,19 +1704,20 @@ def append_utm_coordinates_hdf(output_h5: str, manifest_path: str, block_rows: i
     manifest_path = Path(manifest_path)
     with open(manifest_path, encoding="utf-8") as f:
         manifest = json.load(f)
-    corners = load_scene_corners_with_fallback(manifest_path, manifest)
-    if not corners:
-        with h5py.File(output_h5, "a") as f:
-            lon_ds = f["longitude"]
-            lat_ds = f["latitude"]
-            valid = np.isfinite(lon_ds[()]) & np.isfinite(lat_ds[()])
-            if not np.any(valid):
-                raise RuntimeError("cannot derive UTM coordinates without valid lon/lat")
+
+    with h5py.File(output_h5, "a") as f:
+        lon_ds = f["longitude"]
+        lat_ds = f["latitude"]
+        valid = np.isfinite(lon_ds[()]) & np.isfinite(lat_ds[()])
+        if np.any(valid):
             center_lon = float(np.nanmean(lon_ds[()][valid]))
             center_lat = float(np.nanmean(lat_ds[()][valid]))
-    else:
-        center_lon = sum(pt["lon"] for pt in corners) / len(corners)
-        center_lat = sum(pt["lat"] for pt in corners) / len(corners)
+        else:
+            corners = load_scene_corners_with_fallback(manifest_path, manifest)
+            if not corners:
+                raise RuntimeError("cannot derive UTM coordinates without valid lon/lat or scene corners")
+            center_lon = sum(pt["lon"] for pt in corners) / len(corners)
+            center_lat = sum(pt["lat"] for pt in corners) / len(corners)
     epsg = point2epsg(center_lon, center_lat)
 
     src = osr.SpatialReference()
@@ -3110,17 +3139,19 @@ def _run_nisar_registration_chain(
         "dense_match_plan": str(p1_stage_path / "dense_match_plan.json"),
     }
 
+    master_date = extract_scene_date(context.master_acq_data, context.master_orbit_data)
+    slave_date = extract_scene_date(context.slave_acq_data, context.slave_orbit_data)
     try:
-        outputs["coarse_coreg_slave_png"] = _write_radar_amplitude_png(
-            coarse_coreg_slave_gtiff_path,
-            context.pair_dir / "slave_coarse_coreg_fullres.png",
+        outputs["master_amplitude_png"] = _write_radar_amplitude_png(
+            master_slc,
+            context.pair_dir / f"{master_date}_amplitude.png",
         )
     except Exception:
         pass
     try:
-        outputs["fine_coreg_slave_png"] = _write_radar_amplitude_png(
+        outputs["slave_amplitude_png"] = _write_radar_amplitude_png(
             fine_coreg_slave_gtiff_path,
-            context.pair_dir / "slave_fine_coreg_fullres.png",
+            context.pair_dir / f"{slave_date}_amplitude.png",
         )
     except Exception:
         pass
@@ -3731,6 +3762,7 @@ def _run_crossmul_filter_gpu_pipeline(
     wavelength: float | None = None,
     flatten_starting_range_shift_m: float | None = None,
     progress_reporter: _StageProgress | None = None,
+    filter_gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str | None]:
     return _crossmul_filter_isce3_gpu_subprocess(
         master_slc_path=master_slc_path,
@@ -3743,6 +3775,7 @@ def _run_crossmul_filter_gpu_pipeline(
         wavelength=wavelength,
         flatten_starting_range_shift_m=flatten_starting_range_shift_m,
         progress_reporter=progress_reporter,
+        filter_gpu=filter_gpu,
     )
 
 
@@ -3924,6 +3957,7 @@ def _crossmul_filter_isce3_gpu_subprocess(
     wavelength: float | None = None,
     flatten_starting_range_shift_m: float | None = None,
     progress_reporter: _StageProgress | None = None,
+    filter_gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str | None]:
     output_dir = Path(output_dir)
     p2_dir = stage_dir(output_dir, "p2")
@@ -4030,9 +4064,10 @@ def _crossmul_filter_isce3_gpu_subprocess(
             "    cp.cuda.runtime.deviceSynchronize()\n"
             "    return cp.asnumpy(result)\n"
             "\n"
-            "master_slc_path, slave_slc_path, gpu_id, block_rows, ifg_path, coh_path, filtered_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m = sys.argv[1:]\n"
+            "master_slc_path, slave_slc_path, gpu_id, block_rows, ifg_path, coh_path, filtered_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m, filter_gpu = sys.argv[1:]\n"
             "gpu_id = int(gpu_id)\n"
             "block_rows = int(block_rows)\n"
+            "filter_gpu = filter_gpu.lower() == 'true'\n"
             "flatten_raster = None if flatten_raster == '__NONE__' else flatten_raster\n"
             "range_pixel_spacing = None if range_pixel_spacing == '__NONE__' else float(range_pixel_spacing)\n"
             "wavelength = None if wavelength == '__NONE__' else float(wavelength)\n"
@@ -4089,12 +4124,16 @@ def _crossmul_filter_isce3_gpu_subprocess(
             "    ifg_ds = None\n"
             "filter_backend = 'gpu'\n"
             "filter_fallback_reason = None\n"
-            "try:\n"
-            "    filtered = _goldstein_filter_gpu(interferogram)\n"
-            "except Exception as exc:\n"
+            "if filter_gpu:\n"
+            "    try:\n"
+            "        filtered = _goldstein_filter_gpu(interferogram)\n"
+            "    except Exception as exc:\n"
+            "        filter_backend = 'cpu'\n"
+            "        filter_fallback_reason = str(exc)\n"
+            "        sys.stderr.write(f'[p2 helper] GPU goldstein failed, falling back to CPU: {exc}\\n')\n"
+            "        filtered = _goldstein_filter_cpu(interferogram)\n"
+            "else:\n"
             "    filter_backend = 'cpu'\n"
-            "    filter_fallback_reason = str(exc)\n"
-            "    sys.stderr.write(f'[p2 helper] GPU goldstein failed, falling back to CPU: {exc}\\n')\n"
             "    filtered = _goldstein_filter_cpu(interferogram)\n"
             "print('D2SAR_FILTER_INFO=' + json.dumps({'backend': filter_backend, 'fallback': filter_fallback_reason}), flush=True)\n"
             "filtered_ds = gdal.GetDriverByName('ENVI').Create(str(filtered_path), width, length, 1, gdal.GDT_CFloat32)\n"
@@ -4128,6 +4167,7 @@ def _crossmul_filter_isce3_gpu_subprocess(
             if flatten_starting_range_shift_m is not None
             else "__NONE__"
         ),
+        str(filter_gpu).lower(),
     ]
     process = subprocess.Popen(
         cmd,
@@ -4245,6 +4285,7 @@ def _run_crossmul_and_filter(
                 wavelength=wavelength,
                 flatten_starting_range_shift_m=flatten_starting_range_shift_m,
                 progress_reporter=progress_reporter,
+                filter_gpu=False,
             )
             combined_fallback_reason = None
             if helper_filter_backend != "gpu" and helper_filter_fallback_reason:
@@ -4420,9 +4461,9 @@ def run_crossmul_stage(
         "coherence": _save_stage_array(context.pair_dir, "p2", "coherence", coherence),
         "crossmul_backend": backends.get("crossmul"),
         "goldstein_filter_backend": backends.get("goldstein_filter"),
-        "wrapped_phase_radar_png": _write_radar_wrapped_phase_png(
+        "intf_png": _write_radar_wrapped_phase_png(
             interferogram,
-            context.pair_dir / "wrapped_phase_radar.png",
+            context.pair_dir / f"{context.pair_name}_intf.png",
         ),
     }
     _add_flatten_outputs(result, flatten_options)
@@ -4515,12 +4556,12 @@ def _unwrap_with_snaphu(
     if config_overrides:
         cfg.update(config_overrides)
 
-    # Dynamic tiling: if image > 5000x5000, use 2x2 tiles with 600 overlap
     rows, cols = interferogram.shape
     if rows > 5000 and cols > 5000:
         cfg["ntiles"] = (2, 2)
         cfg["tile_overlap"] = (600, 600)
-        print(f"[SNAPHU] Large image detected ({rows}x{cols}), using 2x2 tiles with 600 overlap")
+        cfg["nproc"] = 4
+        print(f"[SNAPHU] Large image detected ({rows}x{cols}), using 2x2 tiles with 600 overlap, nproc=4")
 
     unw = np.zeros(interferogram.shape, dtype=np.float32)
     conncomp = np.zeros(interferogram.shape, dtype=np.uint32)
@@ -4809,6 +4850,224 @@ def write_primary_product(
     return output_h5, backend_used, fallback_reason
 
 
+def _derive_pair_identity(
+    master_manifest_path: str | Path,
+    slave_manifest_path: str | Path,
+    output_root: str | Path,
+) -> tuple[str, Path]:
+    master_path = Path(master_manifest_path)
+    slave_path = Path(slave_manifest_path)
+    master_manifest = load_manifest(master_path)
+    slave_manifest = load_manifest(slave_path)
+    with open(resolve_manifest_metadata_path(master_path, master_manifest, "acquisition"), encoding="utf-8") as f:
+        master_acq_data = json.load(f)
+    with open(resolve_manifest_metadata_path(master_path, master_manifest, "orbit"), encoding="utf-8") as f:
+        master_orbit_data = json.load(f)
+    with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "acquisition"), encoding="utf-8") as f:
+        slave_acq_data = json.load(f)
+    with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "orbit"), encoding="utf-8") as f:
+        slave_orbit_data = json.load(f)
+    master_date = extract_scene_date(master_acq_data, master_orbit_data)
+    slave_date = extract_scene_date(slave_acq_data, slave_orbit_data)
+    pair_name = build_pair_name(master_date, slave_date)
+    pair_dir = Path(output_root) / pair_name
+    pair_dir.mkdir(parents=True, exist_ok=True)
+    return pair_name, pair_dir
+
+
+def _prepare_runtime_inputs(
+    *,
+    master_manifest_path: str | Path,
+    slave_manifest_path: str | Path,
+    pair_dir: Path,
+    bbox: tuple[float, float, float, float] | None,
+    dem_path: str | None,
+    dem_cache_dir: str | None,
+    dem_margin_deg: float,
+) -> dict:
+    prepared_dir = pair_dir / "prepared"
+    master_prepared_dir = prepared_dir / "master"
+    slave_prepared_dir = prepared_dir / "slave"
+    master_prepared_dir.mkdir(parents=True, exist_ok=True)
+    slave_prepared_dir.mkdir(parents=True, exist_ok=True)
+
+    master_path = Path(master_manifest_path)
+    slave_path = Path(slave_manifest_path)
+    master_manifest = load_manifest(master_path)
+    slave_manifest = load_manifest(slave_path)
+
+    master_scene_corners = load_scene_corners_with_fallback(master_path, master_manifest)
+
+    with open(resolve_manifest_metadata_path(master_path, master_manifest, "acquisition"), encoding="utf-8") as f:
+        master_acq_data = json.load(f)
+    with open(resolve_manifest_metadata_path(master_path, master_manifest, "radargrid"), encoding="utf-8") as f:
+        master_rg_data = json.load(f)
+    with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "acquisition"), encoding="utf-8") as f:
+        slave_acq_data = json.load(f)
+    with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "radargrid"), encoding="utf-8") as f:
+        slave_rg_data = json.load(f)
+
+    with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "doppler"), encoding="utf-8") as f:
+        slave_dop_data = json.load(f)
+
+    from insar_precheck import run_compatibility_precheck
+    precheck = run_compatibility_precheck(
+        master_acquisition=master_acq_data,
+        slave_acquisition=slave_acq_data,
+        master_radargrid=master_rg_data,
+        slave_radargrid=slave_rg_data,
+        master_doppler={},
+        slave_doppler=slave_dop_data,
+        dc_policy="auto",
+        prf_policy="auto",
+        skip_precheck=False,
+    )
+
+    normalize_needed = precheck.get("requires_prep", False)
+    normalized_slave_manifest = None
+    if normalize_needed:
+        from insar_preprocess import build_preprocess_plan
+        normalize_dir = pair_dir / "normalize_temp"
+        normalize_dir.mkdir(parents=True, exist_ok=True)
+        _, normalized_slave_manifest = build_preprocess_plan(
+            precheck=precheck,
+            slave_manifest_path=slave_path,
+            stage_dir=normalize_dir,
+            master_acquisition=master_acq_data,
+            master_radargrid=master_rg_data,
+            slave_acquisition=slave_acq_data,
+            slave_radargrid=slave_rg_data,
+            slave_doppler=slave_dop_data,
+        )
+        normalized_slave_manifest = Path(normalized_slave_manifest)
+
+    effective_slave_path = slave_path
+    if normalized_slave_manifest is not None and normalized_slave_manifest.exists():
+        effective_slave_path = normalized_slave_manifest
+        effective_slave_manifest = load_manifest(effective_slave_path)
+        with open(resolve_manifest_metadata_path(effective_slave_path, effective_slave_manifest, "acquisition"), encoding="utf-8") as f:
+            slave_acq_data = json.load(f)
+        with open(resolve_manifest_metadata_path(effective_slave_path, effective_slave_manifest, "radargrid"), encoding="utf-8") as f:
+            slave_rg_data = json.load(f)
+
+    master_window = None
+    slave_window = None
+    effective_bbox = bbox
+    if bbox is not None:
+        from insar_crop import normalize_crop_request
+        crop_result = normalize_crop_request(
+            bbox=bbox,
+            window=None,
+            radargrid_data=master_rg_data,
+            scene_corners=master_scene_corners,
+        )
+        master_window = (
+            crop_result["master_window"]["row0"],
+            crop_result["master_window"]["col0"],
+            crop_result["master_window"]["rows"],
+            crop_result["master_window"]["cols"],
+        )
+
+    if master_window is not None:
+        from insar_subset import build_cropped_manifest
+        prepared_master_manifest_path = build_cropped_manifest(
+            manifest_path=master_path,
+            output_dir=master_prepared_dir,
+            output_name="master",
+            window=master_window,
+        )
+    else:
+        import shutil
+        prepared_master_manifest_path = str(master_prepared_dir / "manifest.json")
+        shutil.copyfile(master_path, prepared_master_manifest_path)
+        for meta_file in ["acquisition.json", "radargrid.json", "doppler.json", "orbit.json", "scene.json"]:
+            src = master_path.parent / "metadata" / meta_file
+            if src.exists():
+                shutil.copyfile(src, master_prepared_dir / meta_file)
+
+    if master_window is not None:
+        from insar_subset import build_cropped_manifest
+        prepared_slave_manifest_path = build_cropped_manifest(
+            manifest_path=effective_slave_path,
+            output_dir=slave_prepared_dir,
+            output_name="slave",
+            window=master_window,
+        )
+    else:
+        import shutil
+        prepared_slave_manifest_path = str(slave_prepared_dir / "manifest.json")
+        shutil.copyfile(effective_slave_path, prepared_slave_manifest_path)
+        for meta_file in ["acquisition.json", "radargrid.json", "doppler.json", "orbit.json", "scene.json"]:
+            src = effective_slave_path.parent / "metadata" / meta_file
+            if src.exists():
+                shutil.copyfile(src, slave_prepared_dir / meta_file)
+
+    source_dem = _resolve_dem_path(master_path, master_manifest, [], dem_path, dem_cache_dir, dem_margin_deg)
+    prepared_dem_dir = prepared_dir / "dem"
+    prepared_dem_dir.mkdir(parents=True, exist_ok=True)
+    if bbox is not None:
+        expanded_bbox = (
+            bbox[0] - dem_margin_deg,
+            bbox[1] - dem_margin_deg,
+            bbox[2] + dem_margin_deg,
+            bbox[3] + dem_margin_deg,
+        )
+        from osgeo import gdal
+        output_dem_path = prepared_dem_dir / "dem.tif"
+        gdal.Warp(
+            str(output_dem_path),
+            str(source_dem),
+            outputBounds=expanded_bbox,
+            resampleAlg="bilinear",
+            format="GTiff",
+            options=["COMPRESS=LZW", "TILED=YES"],
+        )
+        prepared_dem = str(output_dem_path)
+    else:
+        import shutil
+        if Path(source_dem).suffix.lower() in (".tif", ".vrt"):
+            prepared_dem = str(prepared_dem_dir / "dem.vrt")
+            shutil.copyfile(source_dem, prepared_dem)
+        else:
+            prepared_dem = str(prepared_dem_dir / "dem.tif")
+            shutil.copyfile(source_dem, prepared_dem)
+
+    summary = {
+        "original_master_manifest": str(master_path),
+        "original_slave_manifest": str(slave_path),
+        "effective_slave_manifest": str(effective_slave_path),
+        "prepared_master_manifest": prepared_master_manifest_path,
+        "prepared_slave_manifest": prepared_slave_manifest_path,
+        "prepared_dem": prepared_dem,
+        "effective_bbox": list(bbox) if bbox else None,
+        "effective_master_window": {
+            "row0": master_window[0] if master_window else 0,
+            "col0": master_window[1] if master_window else 0,
+            "rows": master_window[2] if master_window else master_rg_data.get("numberOfRows", 0),
+            "cols": master_window[3] if master_window else master_rg_data.get("numberOfColumns", 0),
+        },
+        "normalization_performed": normalize_needed,
+        "normalization_required": bool(normalized_slave_manifest),
+    }
+    summary_path = prepared_dir / "prepare_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    import shutil as _shutil
+    if normalize_needed and normalize_dir.exists():
+        try:
+            _shutil.rmtree(normalize_dir)
+        except Exception:
+            pass
+
+    return {
+        "prepared_master_manifest": prepared_master_manifest_path,
+        "prepared_slave_manifest": prepared_slave_manifest_path,
+        "prepared_dem": prepared_dem,
+        "effective_bbox": effective_bbox,
+        "effective_master_window": summary["effective_master_window"],
+    }
+
+
 def process_strip_insar2(
     master_manifest_path: str | Path,
     slave_manifest_path: str | Path,
@@ -4823,15 +5082,40 @@ def process_strip_insar2(
     dem_cache_dir: str | None = None,
     dem_margin_deg: float = 0.2,
     no_kml: bool = False,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> dict:
-    context = load_pair_context(
-        master_manifest_path,
-        slave_manifest_path,
-        output_root=output_root,
-        dem_path=dem_path,
-        dem_cache_dir=dem_cache_dir,
-        dem_margin_deg=dem_margin_deg,
-    )
+    if bbox is not None:
+        pair_name, pair_dir = _derive_pair_identity(
+            master_manifest_path,
+            slave_manifest_path,
+            output_root,
+        )
+        prepared_inputs = _prepare_runtime_inputs(
+            master_manifest_path=master_manifest_path,
+            slave_manifest_path=slave_manifest_path,
+            pair_dir=pair_dir,
+            bbox=bbox,
+            dem_path=dem_path,
+            dem_cache_dir=dem_cache_dir,
+            dem_margin_deg=dem_margin_deg,
+        )
+        context = load_pair_context(
+            prepared_inputs["prepared_master_manifest"],
+            prepared_inputs["prepared_slave_manifest"],
+            output_root=output_root,
+            dem_path=prepared_inputs["prepared_dem"],
+            dem_cache_dir=dem_cache_dir,
+            dem_margin_deg=dem_margin_deg,
+        )
+    else:
+        context = load_pair_context(
+            master_manifest_path,
+            slave_manifest_path,
+            output_root=output_root,
+            dem_path=dem_path,
+            dem_cache_dir=dem_cache_dir,
+            dem_margin_deg=dem_margin_deg,
+        )
     stage_backends: dict[str, str] = {}
     fallback_reasons: dict[str, str] = {}
 
@@ -4953,13 +5237,19 @@ def main() -> None:
     parser.add_argument("--gpu-mode", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--unwrap-method", choices=["icu"], default="icu")
-    parser.add_argument("--resolution", type=float, default=20.0)
+    parser.add_argument("--resolution", type=float, default=None,
+                        help="Output ground resolution in meters (default: 2x max SAR resolution, rounded up to 0.5)")
     parser.add_argument("--block-rows", type=int, default=None)
     parser.add_argument("--dem-path")
     parser.add_argument("--dem-cache-dir")
     parser.add_argument("--dem-margin-deg", type=float, default=0.2)
     parser.add_argument("--no-kml", action="store_true")
+    parser.add_argument("--bbox", type=float, nargs=4, metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
+                        help="Geographic bounding box for crop region")
     args = parser.parse_args()
+
+    if args.resolution is None:
+        args.resolution = _compute_default_resolution(args.master_json)
 
     try:
         result = process_strip_insar2(
@@ -4975,6 +5265,7 @@ def main() -> None:
             dem_cache_dir=args.dem_cache_dir,
             dem_margin_deg=args.dem_margin_deg,
             no_kml=args.no_kml,
+            bbox=tuple(args.bbox) if args.bbox else None,
         )
     except Exception as exc:
         show_traceback = str(os.environ.get("D2SAR_STRIP_INSAR2_TRACEBACK", "0")).strip().lower() in {
