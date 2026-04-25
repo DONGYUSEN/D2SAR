@@ -4,14 +4,19 @@ import argparse
 import colorsys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import importlib
 import json
 import os
 from pathlib import Path
+import py_compile
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import traceback
 from xml.sax.saxutils import escape
 
 import h5py
@@ -56,6 +61,21 @@ SNAPHU_DEFAULTS = {
     "single_tile_reoptimize": True,
     "regrow_conncomps": True,
 }
+SNAPHU_RETRY_PROFILES = (
+    ("default", {}),
+    (
+        "relaxed",
+        {
+            "cost_mode": "defo",
+            "min_conncomp_frac": 0.001,
+            "min_region_size": 100,
+            "phase_grad_window": (5, 5),
+            "single_tile_reoptimize": False,
+        },
+    ),
+)
+ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT = 1000
+ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT = 1024
 
 
 @dataclass
@@ -93,6 +113,15 @@ STAGE_DIR_NAMES = {
     "p4": "p4_geocode",
     "p5": "p5_hdf",
     "p6": "p6_publish",
+}
+STAGE_LOG_LABELS = {
+    "p0": "rdr2geo/topo",
+    "p1": "resample/registration",
+    "p2": "crossmul/filter",
+    "p3": "unwrap",
+    "p4": "los",
+    "p5": "product/hdf",
+    "p6": "export/publish",
 }
 GEO2RDR_OFFSET_NODATA = -999999.0
 GEO2RDR_OFFSET_INVALID_LOW = -1.0e5
@@ -150,12 +179,12 @@ def _load_nisar_registration_modules() -> dict[str, object]:
 
 def _default_dense_offsets_cfg() -> dict:
     return {
-        "window_range": 96,
-        "window_azimuth": 96,
-        "half_search_range": 24,
-        "half_search_azimuth": 24,
-        "skip_range": 48,
-        "skip_azimuth": 48,
+        "window_range": 64,
+        "window_azimuth": 64,
+        "half_search_range": 20,
+        "half_search_azimuth": 20,
+        "skip_range": 32,
+        "skip_azimuth": 32,
         "margin": 48,
         "gross_offset_range": None,
         "gross_offset_azimuth": None,
@@ -165,19 +194,49 @@ def _default_dense_offsets_cfg() -> dict:
         "offset_length": None,
         "cross_correlation_domain": "frequency",
         "slc_oversampling_factor": 2,
-        "deramping_method": "magnitude",
-        "deramping_axis": "both",
+        "deramping_method": "complex",
+        "deramping_axis": "azimuth",
         "correlation_statistics_zoom": 21,
-        "correlation_surface_zoom": 16,
-        "correlation_surface_oversampling_factor": 32,
+        "correlation_surface_zoom": 8,
+        "correlation_surface_oversampling_factor": 64,
         "correlation_surface_oversampling_method": "fft",
-        "windows_batch_range": 16,
-        "windows_batch_azimuth": 16,
+        "windows_batch_range": 10,
+        "windows_batch_azimuth": 1,
         "cuda_streams": 2,
         "use_gross_offsets": False,
         "gross_offset_filepath": None,
         "merge_gross_offset": False,
     }
+
+
+def _select_strip_dense_match_plan(effective_resolution: float) -> dict:
+    module = importlib.import_module("insar_registration")
+    return module._select_cpu_dense_match_plan(float(effective_resolution or 0.0))
+
+
+def _run_strip_pycuampcor_dense_offsets(**kwargs):
+    module = importlib.import_module("insar_registration")
+    return module.run_pycuampcor_dense_offsets(**kwargs)
+
+
+def _run_strip_cpu_dense_offsets(**kwargs):
+    module = importlib.import_module("insar_registration")
+    return module.run_cpu_dense_offsets(**kwargs)
+
+
+def _write_strip_registration_outputs(**kwargs):
+    module = importlib.import_module("insar_registration")
+    return module.write_registration_outputs(**kwargs)
+
+
+def _write_strip_varying_gross_offset_file(**kwargs):
+    module = importlib.import_module("insar_registration")
+    return module._write_varying_gross_offset_file(**kwargs)
+
+
+def _strip_raster_shape(path: str | Path) -> tuple[int, int] | None:
+    module = importlib.import_module("insar_registration")
+    return module._raster_shape(path)
 
 
 def _default_rubbersheet_cfg() -> dict:
@@ -211,8 +270,167 @@ def _default_rubbersheet_cfg() -> dict:
     }
 
 
+def _resolve_stage_block_rows(block_rows: int | None) -> tuple[int, int]:
+    if block_rows is None:
+        return (
+            ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
+            ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
+        )
+    rows = int(block_rows)
+    return rows, rows
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_CONSOLE_WRITE_LOCK = threading.Lock()
+try:
+    _CONSOLE_STDOUT_FD = os.dup(1)
+except Exception:
+    _CONSOLE_STDOUT_FD = None
+
+
+def _console_write(text: str) -> None:
+    if not isinstance(text, str):
+        text = str(text)
+    if _CONSOLE_STDOUT_FD is None:
+        print(text, end="", flush=True)
+        return
+    data = text.encode("utf-8", errors="replace")
+    with _CONSOLE_WRITE_LOCK:
+        os.write(_CONSOLE_STDOUT_FD, data)
+
+
+def _log_stage_status(
+    stage: str,
+    status: str,
+    *,
+    backend_used: str | None = None,
+    fallback_reason: str | None = None,
+) -> None:
+    label = STAGE_LOG_LABELS.get(stage, stage)
+    message = f"[{utc_now_iso()}] [{stage}] {status} {label}"
+    if backend_used:
+        message += f" backend={backend_used}"
+    if fallback_reason:
+        message += f" fallback={fallback_reason}"
+    print(message, flush=True)
+
+
+class _StageProgress:
+    def __init__(self, stage: str):
+        self.stage = stage
+        self._active = False
+        self._last_len = 0
+        self._last_message = ""
+        self._last_running_tick = -1
+
+    def _render(self, message: str) -> None:
+        padded = message
+        if self._last_len > len(message):
+            padded += " " * (self._last_len - len(message))
+        _console_write(f"\r{padded}")
+        self._active = True
+        self._last_len = len(message)
+        self._last_message = message
+
+    def block(self, *, backend: str, current: int, total: int, detail: str) -> None:
+        total = max(int(total), 1)
+        current = min(max(int(current), 0), total)
+        percent = 100.0 * float(current) / float(total)
+        self._render(
+            f"[{self.stage}] {backend.upper()} progress {current}/{total} blocks "
+            f"({percent:.1f}%) {detail}"
+        )
+
+    def running(self, *, backend: str, detail: str, elapsed: float, force: bool = False) -> None:
+        tick = int(max(float(elapsed), 0.0))
+        if not force and tick == self._last_running_tick:
+            return
+        self._last_running_tick = tick
+        self._render(f"[{self.stage}] {backend.upper()} running {detail} elapsed={tick}s")
+
+    def close(self) -> None:
+        if self._active:
+            _console_write("\n")
+        self._active = False
+        self._last_len = 0
+        self._last_message = ""
+        self._last_running_tick = -1
+
+
+def _run_with_running_progress(
+    *,
+    progress_reporter: _StageProgress | None,
+    backend: str,
+    detail: str,
+    func,
+    interval_s: float = 1.0,
+):
+    if progress_reporter is None:
+        return func()
+
+    start_time = time.monotonic()
+    stop_event = threading.Event()
+
+    def _ticker() -> None:
+        progress_reporter.running(backend=backend, detail=detail, elapsed=0.0, force=True)
+        while not stop_event.wait(max(float(interval_s), 0.05)):
+            progress_reporter.running(
+                backend=backend,
+                detail=detail,
+                elapsed=time.monotonic() - start_time,
+            )
+
+    thread = threading.Thread(target=_ticker, daemon=True)
+    thread.start()
+    try:
+        return func()
+    finally:
+        stop_event.set()
+        thread.join(timeout=max(float(interval_s), 0.05) + 0.2)
+
+
+@contextmanager
+def _silence_isce3_journal(log_path: str | Path):
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    with open(log_path, "a", encoding="utf-8") as sink:
+        saved_stdout = os.dup(1)
+        saved_stderr = os.dup(2)
+        try:
+            os.dup2(sink.fileno(), 1)
+            os.dup2(sink.fileno(), 2)
+            yield str(log_path)
+        finally:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+            try:
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os.dup2(saved_stdout, 1)
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stdout)
+            os.close(saved_stderr)
+
+
+def _run_with_silenced_journal(log_path: str | Path, func):
+    with _silence_isce3_journal(log_path):
+        return func()
 
 
 def validate_stage_name(stage: str) -> str:
@@ -649,8 +867,14 @@ def _write_envi_single_band(path: Path, data: np.ndarray, *, dtype=gdal.GDT_Floa
 
 
 def _write_offset_raster(path: Path, data: np.ndarray | None) -> str:
-    arr = np.asarray(data if data is not None else np.zeros((1, 1), dtype=np.float32), dtype=np.float32)
-    return _write_float_gtiff(path, arr, nodata=GEO2RDR_OFFSET_NODATA)
+    arr_in = data if data is not None else np.zeros((1, 1), dtype=np.float32)
+    arr = np.asarray(arr_in)
+    dtype = gdal.GDT_Float64 if arr.dtype == np.dtype(np.float64) else gdal.GDT_Float32
+    if dtype == gdal.GDT_Float64:
+        arr = np.asarray(arr, dtype=np.float64)
+    else:
+        arr = np.asarray(arr, dtype=np.float32)
+    return _write_float_gtiff(path, arr, dtype=dtype, nodata=GEO2RDR_OFFSET_NODATA)
 
 
 def _estimate_offset_mean_from_raster(path: str | Path) -> float:
@@ -694,6 +918,104 @@ def goldstein_filter(
             weight_sum[row_start:row_start + window_size, col_start:col_start + window_size] += 1.0
     weight_sum[weight_sum == 0] = 1.0
     return (filtered / weight_sum).astype(np.complex64)
+
+
+def _goldstein_filter_gpu(
+    interferogram: np.ndarray,
+    *,
+    gpu_id: int,
+    alpha: float = 0.5,
+    window_size: int = 32,
+    step: int | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> np.ndarray:
+    cp = importlib.import_module("cupy")
+
+    if interferogram.ndim != 2:
+        raise ValueError("goldstein_filter expects a 2D interferogram")
+    if window_size < 1:
+        raise ValueError("window_size must be positive")
+    if step is None:
+        step = window_size // 2
+    if step < 1:
+        step = 1
+
+    with cp.cuda.Device(int(gpu_id)):
+        arr = cp.asarray(np.asarray(interferogram, dtype=np.complex64))
+        rows, cols = arr.shape
+        hanning = cp.outer(cp.hanning(window_size), cp.hanning(window_size)).astype(cp.complex64)
+        filtered = cp.zeros_like(arr, dtype=cp.complex64)
+        weight_sum = cp.zeros((rows, cols), dtype=cp.float32)
+
+        row_starts = list(range(0, rows - window_size + 1, step))
+        col_starts = list(range(0, cols - window_size + 1, step))
+        total_blocks = max(len(row_starts) * len(col_starts), 1)
+        current_block = 0
+
+        for row_start in row_starts:
+            for col_start in col_starts:
+                window_data = arr[
+                    row_start:row_start + window_size,
+                    col_start:col_start + window_size,
+                ]
+                spectrum = cp.fft.fft2(window_data * hanning)
+                psd = cp.abs(spectrum) ** 2
+                weight = cp.power(psd + 1.0e-10, alpha / 2.0)
+                filtered_window = cp.fft.ifft2(spectrum * weight)
+                filtered[
+                    row_start:row_start + window_size,
+                    col_start:col_start + window_size,
+                ] += filtered_window
+                weight_sum[
+                    row_start:row_start + window_size,
+                    col_start:col_start + window_size,
+                ] += 1.0
+                current_block += 1
+                if progress_reporter is not None:
+                    progress_reporter.block(
+                        backend="gpu",
+                        current=current_block,
+                        total=total_blocks,
+                        detail="goldstein_filter",
+                    )
+
+        weight_sum = cp.where(weight_sum == 0, 1.0, weight_sum)
+        result = (filtered / weight_sum).astype(cp.complex64)
+        cp.cuda.runtime.deviceSynchronize()
+        return cp.asnumpy(result)
+
+
+def _run_goldstein_filter(
+    *,
+    interferogram: np.ndarray,
+    use_gpu: bool,
+    gpu_id: int,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, str, str | None]:
+    fallback_reason = None
+    if use_gpu:
+        try:
+            filtered = _run_with_running_progress(
+                progress_reporter=progress_reporter,
+                backend="gpu",
+                detail="goldstein_filter",
+                func=lambda: _goldstein_filter_gpu(
+                    interferogram,
+                    gpu_id=gpu_id,
+                    progress_reporter=progress_reporter,
+                ),
+            )
+            return np.asarray(filtered, dtype=np.complex64), "gpu", None
+        except Exception as exc:
+            fallback_reason = str(exc)
+
+    filtered = _run_with_running_progress(
+        progress_reporter=progress_reporter,
+        backend="cpu",
+        detail="goldstein_filter",
+        func=lambda: goldstein_filter(np.asarray(interferogram, dtype=np.complex64)),
+    )
+    return np.asarray(filtered, dtype=np.complex64), "cpu", fallback_reason
 
 
 def load_manifest(manifest_path: str | Path) -> dict:
@@ -1090,6 +1412,24 @@ def _write_complex_gtiff(path: Path, data: np.ndarray) -> str:
     return str(path)
 
 
+def _write_complex_envi(path: Path, data: np.ndarray) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows, cols = data.shape
+    ds = gdal.GetDriverByName("ENVI").Create(
+        str(path),
+        cols,
+        rows,
+        1,
+        gdal.GDT_CFloat32,
+    )
+    if ds is None:
+        raise RuntimeError(f"failed to create ENVI raster: {path}")
+    ds.GetRasterBand(1).WriteArray(np.asarray(data, dtype=np.complex64))
+    ds.FlushCache()
+    ds = None
+    return str(path)
+
+
 def _write_float_gtiff(path: Path, data: np.ndarray, *, dtype=gdal.GDT_Float32, nodata=None) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     rows, cols = data.shape
@@ -1177,10 +1517,11 @@ def append_topo_coordinates_hdf(
     manifest_path: str,
     dem_path: str,
     output_h5: str,
-    block_rows: int = 256,
+    block_rows: int = ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
     orbit_interp: str | None = None,
     use_gpu: bool = False,
     gpu_id: int = 0,
+    progress_reporter: _StageProgress | None = None,
 ) -> str:
     import isce3.core
     import isce3.io
@@ -1240,9 +1581,9 @@ def append_topo_coordinates_hdf(
                 "GTiff",
             )
 
-        x_raster = make_raster("x")
-        y_raster = make_raster("y")
-        z_raster = make_raster("z")
+        x_raster = make_raster("x", gdal.GDT_Float64)
+        y_raster = make_raster("y", gdal.GDT_Float64)
+        z_raster = make_raster("z", gdal.GDT_Float64)
         inc_raster = make_raster("inc")
         hdg_raster = make_raster("hdg")
         local_inc_raster = make_raster("localInc")
@@ -1252,20 +1593,21 @@ def append_topo_coordinates_hdf(
         los_e_raster = make_raster("los_east")
         los_n_raster = make_raster("los_north")
 
-        topo.topo(
-            dem_raster,
-            x_raster,
-            y_raster,
-            z_raster,
-            inc_raster,
-            hdg_raster,
-            local_inc_raster,
-            local_psi_raster,
-            simamp_raster,
-            layover_raster,
-            los_e_raster,
-            los_n_raster,
-        )
+        with _silence_isce3_journal(stage_dir(output_h5.parent, "p5") / "isce3_journal.log"):
+            topo.topo(
+                dem_raster,
+                x_raster,
+                y_raster,
+                z_raster,
+                inc_raster,
+                hdg_raster,
+                local_inc_raster,
+                local_psi_raster,
+                simamp_raster,
+                layover_raster,
+                los_e_raster,
+                los_n_raster,
+            )
         for raster in [
             x_raster, y_raster, z_raster, inc_raster, hdg_raster, local_inc_raster,
             local_psi_raster, simamp_raster, layover_raster, los_e_raster, los_n_raster,
@@ -1282,9 +1624,9 @@ def append_topo_coordinates_hdf(
             for name in ("longitude", "latitude", "height"):
                 if name in f:
                     del f[name]
-            d_lon = f.create_dataset("longitude", shape=(length, width), dtype="f4", chunks=(min(block_rows, length), min(1024, width)), compression="gzip", shuffle=True)
-            d_lat = f.create_dataset("latitude", shape=(length, width), dtype="f4", chunks=(min(block_rows, length), min(1024, width)), compression="gzip", shuffle=True)
-            d_hgt = f.create_dataset("height", shape=(length, width), dtype="f4", chunks=(min(block_rows, length), min(1024, width)), compression="gzip", shuffle=True)
+            d_lon = f.create_dataset("longitude", shape=(length, width), dtype="f8", chunks=(min(block_rows, length), min(1024, width)), compression="gzip", shuffle=True)
+            d_lat = f.create_dataset("latitude", shape=(length, width), dtype="f8", chunks=(min(block_rows, length), min(1024, width)), compression="gzip", shuffle=True)
+            d_hgt = f.create_dataset("height", shape=(length, width), dtype="f8", chunks=(min(block_rows, length), min(1024, width)), compression="gzip", shuffle=True)
             f.attrs["coordinate_system"] = "EPSG:4326"
             f.attrs["longitude_units"] = "degrees_east"
             f.attrs["latitude_units"] = "degrees_north"
@@ -1294,11 +1636,19 @@ def append_topo_coordinates_hdf(
             lon_band = lon_ds.GetRasterBand(1)
             lat_band = lat_ds.GetRasterBand(1)
             hgt_band = hgt_ds.GetRasterBand(1)
+            total_blocks = max((int(length) + int(block_rows) - 1) // int(block_rows), 1)
             for row0 in range(0, length, block_rows):
                 rows = min(block_rows, length - row0)
-                d_lon[row0:row0 + rows, :] = _read_band_array(lon_band, 0, row0, width, rows).astype(np.float32)
-                d_lat[row0:row0 + rows, :] = _read_band_array(lat_band, 0, row0, width, rows).astype(np.float32)
-                d_hgt[row0:row0 + rows, :] = _read_band_array(hgt_band, 0, row0, width, rows).astype(np.float32)
+                d_lon[row0:row0 + rows, :] = _read_band_array(lon_band, 0, row0, width, rows).astype(np.float64)
+                d_lat[row0:row0 + rows, :] = _read_band_array(lat_band, 0, row0, width, rows).astype(np.float64)
+                d_hgt[row0:row0 + rows, :] = _read_band_array(hgt_band, 0, row0, width, rows).astype(np.float64)
+                if progress_reporter is not None:
+                    progress_reporter.block(
+                        backend="gpu" if use_gpu else "cpu",
+                        current=(row0 // block_rows) + 1,
+                        total=total_blocks,
+                        detail="write_hdf_coordinates",
+                    )
         return str(output_h5)
     finally:
         dem_raster.close_dataset()
@@ -1628,10 +1978,38 @@ def write_wrapped_phase_png(
 ) -> str:
     phase, _ = _accumulate_wrapped_phase_grid(input_h5, dataset_name, target_width, target_height, block_rows)
     rgb = np.zeros((*phase.shape, 3), dtype=np.uint8)
+    value = np.ones(phase.shape, dtype=np.float64)
+    try:
+        avg_amplitude, _ = accumulate_utm_grid(
+            input_h5,
+            "avg_amplitude",
+            target_width=phase.shape[1],
+            target_height=phase.shape[0],
+            block_rows=block_rows,
+        )
+        avg_amplitude, _ = prepare_display_grid(
+            avg_amplitude,
+            confidence_interval_pct=98.0,
+        )
+        amp_valid = np.isfinite(avg_amplitude) & (avg_amplitude > 0)
+        if np.any(amp_valid):
+            amp_db = 10.0 * np.log10(avg_amplitude[amp_valid])
+            p2 = float(np.percentile(amp_db, 2))
+            p98 = float(np.percentile(amp_db, 98))
+            scaled = np.clip((amp_db - p2) / (p98 - p2 + 1.0e-9), 0.0, 1.0)
+            value[:] = 0.15
+            value[amp_valid] = np.clip(scaled, 0.15, 1.0)
+    except Exception:
+        pass
     valid = np.isfinite(phase)
     if np.any(valid):
         hue = ((phase[valid] + np.pi) / (2.0 * np.pi)).astype(np.float64)
-        colors = np.array([colorsys.hsv_to_rgb(float(h), 1.0, 1.0) for h in hue])
+        colors = np.array(
+            [
+                colorsys.hsv_to_rgb(float(h), 1.0, float(v))
+                for h, v in zip(hue, value[valid], strict=False)
+            ]
+        )
         rgb[valid] = (colors * 255.0).astype(np.uint8)
     Image.fromarray(rgb, mode="RGB").save(output_png)
     return str(output_png)
@@ -1918,20 +2296,21 @@ def _run_rdr2geo_topo(
         str(output_dir / "los_north.tif"), radar_grid.width, radar_grid.length, 1, gdal.GDT_Float32, "GTiff"
     )
 
-    topo.topo(
-        dem_raster,
-        x_raster,
-        y_raster,
-        z_raster,
-        inc_raster,
-        hdg_raster,
-        local_inc_raster,
-        local_psi_raster,
-        simamp_raster,
-        layover_raster,
-        los_e_raster,
-        los_n_raster,
-    )
+    with _silence_isce3_journal(output_dir / "isce3_journal.log"):
+        topo.topo(
+            dem_raster,
+            x_raster,
+            y_raster,
+            z_raster,
+            inc_raster,
+            hdg_raster,
+            local_inc_raster,
+            local_psi_raster,
+            simamp_raster,
+            layover_raster,
+            los_e_raster,
+            los_n_raster,
+        )
     for raster in (
         x_raster,
         y_raster,
@@ -1968,64 +2347,84 @@ def run_geo2rdr_stage(
         return cached_outputs, "cache", None
 
     p0_dir = stage_dir(context.pair_dir, "p0")
+    progress = _StageProgress("p0")
 
     def _gpu():
-        master_topo = _run_rdr2geo_topo(
-            orbit_data=context.master_orbit_data,
-            acquisition_data=context.master_acq_data,
-            radargrid_data=context.master_rg_data,
-            dem_path=context.resolved_dem,
-            orbit_interp=context.orbit_interp,
-            use_gpu=True,
-            gpu_id=gpu_id,
-            output_dir=p0_dir / "master_topo",
-            block_rows=block_rows,
+        def _impl():
+            master_topo = _run_rdr2geo_topo(
+                orbit_data=context.master_orbit_data,
+                acquisition_data=context.master_acq_data,
+                radargrid_data=context.master_rg_data,
+                dem_path=context.resolved_dem,
+                orbit_interp=context.orbit_interp,
+                use_gpu=True,
+                gpu_id=gpu_id,
+                output_dir=p0_dir / "master_topo",
+                block_rows=block_rows,
+            )
+            slave_topo = _run_rdr2geo_topo(
+                orbit_data=context.slave_orbit_data,
+                acquisition_data=context.slave_acq_data,
+                radargrid_data=context.slave_rg_data,
+                dem_path=context.resolved_dem,
+                orbit_interp=context.orbit_interp,
+                use_gpu=True,
+                gpu_id=gpu_id,
+                output_dir=p0_dir / "slave_topo",
+                block_rows=block_rows,
+            )
+            return {"master_topo": master_topo, "slave_topo": slave_topo}
+
+        return _run_with_running_progress(
+            progress_reporter=progress,
+            backend="gpu",
+            detail="rdr2geo/topo",
+            func=_impl,
         )
-        slave_topo = _run_rdr2geo_topo(
-            orbit_data=context.slave_orbit_data,
-            acquisition_data=context.slave_acq_data,
-            radargrid_data=context.slave_rg_data,
-            dem_path=context.resolved_dem,
-            orbit_interp=context.orbit_interp,
-            use_gpu=True,
-            gpu_id=gpu_id,
-            output_dir=p0_dir / "slave_topo",
-            block_rows=block_rows,
-        )
-        return {"master_topo": master_topo, "slave_topo": slave_topo}
 
     def _cpu():
-        master_topo = _run_rdr2geo_topo(
-            orbit_data=context.master_orbit_data,
-            acquisition_data=context.master_acq_data,
-            radargrid_data=context.master_rg_data,
-            dem_path=context.resolved_dem,
-            orbit_interp=context.orbit_interp,
-            use_gpu=False,
-            gpu_id=gpu_id,
-            output_dir=p0_dir / "master_topo",
-            block_rows=block_rows,
-        )
-        slave_topo = _run_rdr2geo_topo(
-            orbit_data=context.slave_orbit_data,
-            acquisition_data=context.slave_acq_data,
-            radargrid_data=context.slave_rg_data,
-            dem_path=context.resolved_dem,
-            orbit_interp=context.orbit_interp,
-            use_gpu=False,
-            gpu_id=gpu_id,
-            output_dir=p0_dir / "slave_topo",
-            block_rows=block_rows,
-        )
-        return {"master_topo": master_topo, "slave_topo": slave_topo}
+        def _impl():
+            master_topo = _run_rdr2geo_topo(
+                orbit_data=context.master_orbit_data,
+                acquisition_data=context.master_acq_data,
+                radargrid_data=context.master_rg_data,
+                dem_path=context.resolved_dem,
+                orbit_interp=context.orbit_interp,
+                use_gpu=False,
+                gpu_id=gpu_id,
+                output_dir=p0_dir / "master_topo",
+                block_rows=block_rows,
+            )
+            slave_topo = _run_rdr2geo_topo(
+                orbit_data=context.slave_orbit_data,
+                acquisition_data=context.slave_acq_data,
+                radargrid_data=context.slave_rg_data,
+                dem_path=context.resolved_dem,
+                orbit_interp=context.orbit_interp,
+                use_gpu=False,
+                gpu_id=gpu_id,
+                output_dir=p0_dir / "slave_topo",
+                block_rows=block_rows,
+            )
+            return {"master_topo": master_topo, "slave_topo": slave_topo}
 
-    output_files, backend_used, fallback_reason = run_stage_with_fallback(
-        stage_name="rdr2geo",
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        gpu_runner=_gpu,
-        cpu_runner=_cpu,
-    )
+        return _run_with_running_progress(
+            progress_reporter=progress,
+            backend="cpu",
+            detail="rdr2geo/topo",
+            func=_impl,
+        )
+
+    try:
+        output_files, backend_used, fallback_reason = run_stage_with_fallback(
+            stage_name="rdr2geo",
+            gpu_mode=gpu_mode,
+            gpu_id=gpu_id,
+            gpu_runner=_gpu,
+            cpu_runner=_cpu,
+        )
+    finally:
+        progress.close()
     output_files["master_topo_vrt"] = output_files["master_topo"]
     output_files["slave_topo_vrt"] = output_files["slave_topo"]
     _write_stage_outputs_record(
@@ -2057,7 +2456,7 @@ def _convert_geo2rdr_output_to_gtiff(
     else:
         arr = np.memmap(str(source_path), dtype=np.float64, mode="r", shape=(rows, cols))
         arr = np.asarray(arr, dtype=np.float64)
-    return _write_offset_raster(output_path, arr.astype(np.float32))
+    return _write_offset_raster(output_path, arr)
 
 
 def _run_slave_geo2rdr_from_master_topo(
@@ -2070,7 +2469,7 @@ def _run_slave_geo2rdr_from_master_topo(
     output_dir: Path,
     use_gpu: bool,
     gpu_id: int,
-    block_rows: int = 256,
+    block_rows: int = ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
 ) -> tuple[str, str]:
     import isce3.io
 
@@ -2106,7 +2505,8 @@ def _run_slave_geo2rdr_from_master_topo(
             numiter=50,
             lines_per_block=block_rows,
         )
-        geo2rdr.geo2rdr(topo_raster, tmpdir)
+        with _silence_isce3_journal(artifacts_dir / "isce3_journal.log"):
+            geo2rdr.geo2rdr(topo_raster, tmpdir)
         tmpdir_path = Path(tmpdir)
         rows = int(getattr(topo_raster, "length", slave_grid.length))
         cols = int(getattr(topo_raster, "width", slave_grid.width))
@@ -2140,6 +2540,7 @@ def run_coarse_resamp_isce3_v2(
     *,
     slave_slc_path: str,
     coarse_coreg_slave_path: str,
+    coarse_coreg_slave_gtiff_path: str | None = None,
     radar_grid,
     doppler,
     ref_radar_grid,
@@ -2155,7 +2556,8 @@ def run_coarse_resamp_isce3_v2(
     try:
         input_slc = _open_slc_as_complex(slave_slc_path)
         out_shape = (int(ref_radar_grid.length), int(ref_radar_grid.width))
-        output_slc = np.full(out_shape, np.complex64(np.nan + 1j * np.nan), dtype=np.complex64)
+        output_slc = np.zeros(out_shape, dtype=np.complex64)
+        log_path = Path(coarse_coreg_slave_path).parent / "isce3_resample_journal.log"
         if rg_offset_path and Path(rg_offset_path).is_file():
             rg_ds = gdal.Open(str(rg_offset_path), gdal.GA_ReadOnly)
             rg_offsets = _read_band_array(rg_ds.GetRasterBand(1), dtype=np.float64).astype(np.float64)
@@ -2172,23 +2574,29 @@ def run_coarse_resamp_isce3_v2(
         az_invalid |= (az_offsets == GEO2RDR_OFFSET_NODATA) | (az_offsets <= GEO2RDR_OFFSET_INVALID_LOW)
         rg_invalid = (~np.isfinite(rg_offsets)) | (rg_offsets == NISAR_OFFSET_INVALID_VALUE)
         rg_invalid |= (rg_offsets == GEO2RDR_OFFSET_NODATA) | (rg_offsets <= GEO2RDR_OFFSET_INVALID_LOW)
-        az_offsets[az_invalid] = np.nan
-        rg_offsets[rg_invalid] = np.nan
+        az_offsets[az_invalid] = NISAR_OFFSET_INVALID_VALUE
+        rg_offsets[rg_invalid] = NISAR_OFFSET_INVALID_VALUE
         if block_size_rg == 0:
             block_size_rg = out_shape[1]
-        resample_slc_blocks(
-            output_resampled_slcs=[output_slc],
-            input_slcs=[input_slc],
-            az_offsets_dataset=az_offsets,
-            rg_offsets_dataset=rg_offsets,
-            input_radar_grid=radar_grid,
-            doppler=doppler if doppler is not None else LUT2d(),
-            block_size_az=block_size_az,
-            block_size_rg=block_size_rg,
-            quiet=True,
-            with_gpu=use_gpu,
+        _run_with_silenced_journal(
+            log_path,
+            lambda: resample_slc_blocks(
+                output_resampled_slcs=[output_slc],
+                input_slcs=[input_slc],
+                az_offsets_dataset=az_offsets,
+                rg_offsets_dataset=rg_offsets,
+                input_radar_grid=radar_grid,
+                doppler=doppler if doppler is not None else LUT2d(),
+                block_size_az=block_size_az,
+                block_size_rg=block_size_rg,
+                fill_value=0.0 + 0.0j,
+                quiet=True,
+                with_gpu=use_gpu,
+            ),
         )
-        _write_complex_gtiff(Path(coarse_coreg_slave_path), output_slc)
+        _write_complex_envi(Path(coarse_coreg_slave_path), output_slc)
+        if coarse_coreg_slave_gtiff_path:
+            _write_complex_gtiff(Path(coarse_coreg_slave_gtiff_path), output_slc)
         return True
     except Exception:
         return False
@@ -2303,23 +2711,27 @@ def _run_nisar_dense_offsets_impl(
     use_gpu: bool,
     gpu_id: int,
 ) -> dict[str, str]:
-    modules = _load_nisar_registration_modules()
-    import isce3
-    import isce3.io
+    reference_envi = Path(output_dir / "reference.slc")
+    secondary_envi = Path(output_dir / "secondary.slc")
+    _copy_raster_to_envi_complex64(reference_slc_path, reference_envi)
+    _copy_raster_to_envi_complex64(secondary_slc_path, secondary_envi)
+    shape = _raster_shape(reference_envi)
+    secondary_shape = _raster_shape(secondary_envi)
+    if shape is None:
+        raise RuntimeError(f"failed to open reference SLC for offsets: {reference_envi}")
+    if secondary_shape is None:
+        raise RuntimeError(f"failed to open secondary SLC for offsets: {secondary_envi}")
+    if shape != secondary_shape:
+        raise RuntimeError(
+            f"dense offsets input shape mismatch: reference={shape} secondary={secondary_shape}"
+        )
+    rows, cols = shape
+
     import isce3.matchtemplate
 
     if use_gpu:
         import isce3.cuda.core
         import isce3.cuda.matchtemplate
-
-    reference_envi = Path(output_dir / "reference.slc")
-    secondary_envi = Path(output_dir / "secondary.slc")
-    _translate_raster(reference_slc_path, reference_envi, driver="ENVI", output_type=gdal.GDT_CFloat32)
-    _translate_raster(secondary_slc_path, secondary_envi, driver="ENVI", output_type=gdal.GDT_CFloat32)
-
-    reference_raster = isce3.io.Raster(str(reference_envi))
-    secondary_raster = isce3.io.Raster(str(secondary_envi))
-    if use_gpu:
         device = isce3.cuda.core.Device(gpu_id)
         isce3.cuda.core.set_device(device)
         ampcor = isce3.cuda.matchtemplate.PyCuAmpcor()
@@ -2329,16 +2741,17 @@ def _run_nisar_dense_offsets_impl(
 
     ampcor.useMmap = 1
     ampcor.referenceImageName = str(reference_envi)
-    ampcor.referenceImageHeight = reference_raster.length
-    ampcor.referenceImageWidth = reference_raster.width
+    ampcor.referenceImageHeight = int(rows)
+    ampcor.referenceImageWidth = int(cols)
     ampcor.secondaryImageName = str(secondary_envi)
-    ampcor.secondaryImageHeight = secondary_raster.length
-    ampcor.secondaryImageWidth = secondary_raster.width
-    ampcor = modules["set_optional_attributes"](
+    ampcor.secondaryImageHeight = int(rows)
+    ampcor.secondaryImageWidth = int(cols)
+    _configure_ampcor_from_cfg(
         ampcor,
-        _default_dense_offsets_cfg(),
-        reference_raster.length,
-        reference_raster.width,
+        cfg=_default_dense_offsets_cfg(),
+        rows=int(rows),
+        cols=int(cols),
+        gross_offset_filepath=None,
     )
 
     dense_offsets_path = output_dir / "dense_offsets"
@@ -2352,35 +2765,35 @@ def _run_nisar_dense_offsets_impl(
     ampcor.covImageName = str(covariance_path)
     ampcor.corrImageName = str(correlation_peak_path)
 
-    modules["create_empty_dataset"](
+    _create_empty_dataset(
         str(dense_offsets_path),
         ampcor.numberWindowAcross,
         ampcor.numberWindowDown,
         2,
         gdal.GDT_Float32,
     )
-    modules["create_empty_dataset"](
+    _create_empty_dataset(
         str(gross_offsets_path),
         ampcor.numberWindowAcross,
         ampcor.numberWindowDown,
         2,
         gdal.GDT_Float32,
     )
-    modules["create_empty_dataset"](
+    _create_empty_dataset(
         str(snr_path),
         ampcor.numberWindowAcross,
         ampcor.numberWindowDown,
         1,
         gdal.GDT_Float32,
     )
-    modules["create_empty_dataset"](
+    _create_empty_dataset(
         str(covariance_path),
         ampcor.numberWindowAcross,
         ampcor.numberWindowDown,
         3,
         gdal.GDT_Float32,
     )
-    modules["create_empty_dataset"](
+    _create_empty_dataset(
         str(correlation_peak_path),
         ampcor.numberWindowAcross,
         ampcor.numberWindowDown,
@@ -2525,16 +2938,15 @@ def _run_nisar_registration_chain(
         use_gpu=use_gpu,
         gpu_id=gpu_id,
     )
-    coarse_range_envi, coarse_azimuth_envi = _prepare_nisar_geo2rdr_offsets(
-        coarse_rg_offset_path=coarse_rg_offset_path,
-        coarse_az_offset_path=coarse_az_offset_path,
-        output_dir=p1_stage_path,
-    )
 
-    coarse_coreg_slave_path = str(p1_stage_path / "coarse_coreg_slave.tif")
+    coarse_coreg_slave_path = str(
+        p1_stage_path / "coarse_resample_slc" / "freqA" / "HH" / "coregistered_secondary.slc"
+    )
+    coarse_coreg_slave_gtiff_path = str(p1_stage_path / "coarse_coreg_slave.tif")
     coarse_ok = run_coarse_resamp_isce3_v2(
         slave_slc_path=slave_slc,
         coarse_coreg_slave_path=coarse_coreg_slave_path,
+        coarse_coreg_slave_gtiff_path=coarse_coreg_slave_gtiff_path,
         radar_grid=slave_radar_grid,
         doppler=slave_doppler,
         ref_radar_grid=ref_radar_grid,
@@ -2545,110 +2957,169 @@ def _run_nisar_registration_chain(
     if not coarse_ok:
         raise RuntimeError("NISAR coarse resample failed")
 
+    range_res = float(context.master_rg_data.get("groundRangeResolution", 0.0) or 0.0)
+    azimuth_res = float(context.master_rg_data.get("azimuthResolution", 0.0) or 0.0)
+    effective_resolution = max(range_res, azimuth_res)
+    dense_plan = _select_strip_dense_match_plan(effective_resolution)
     dense_offsets_dir = p1_stage_path / "dense_offsets" / "freqA" / "HH"
-    dense_outputs = _run_nisar_dense_offsets(
-        reference_slc_path=master_slc,
-        secondary_slc_path=coarse_coreg_slave_path,
-        output_dir=dense_offsets_dir,
-        use_gpu=use_gpu,
-        gpu_id=gpu_id,
-    )
+    dense_offsets_dir.mkdir(parents=True, exist_ok=True)
+    gross_offset = (0.0, 0.0)
+    if coarse_az_offset_path and coarse_rg_offset_path:
+        try:
+            gross_offset = (
+                _estimate_offset_mean_from_raster(coarse_az_offset_path),
+                _estimate_offset_mean_from_raster(coarse_rg_offset_path),
+            )
+        except Exception:
+            gross_offset = (0.0, 0.0)
 
-    rubbersheet_dir = p1_stage_path / "rubbersheet_offsets" / "freqA" / "HH"
-    rubbersheet_outputs = _run_nisar_rubbersheet(
-        dense_offsets_dir=dense_offsets_dir,
-        coarse_range_envi=coarse_range_envi,
-        coarse_azimuth_envi=coarse_azimuth_envi,
-        output_dir=rubbersheet_dir,
-        ref_length=int(ref_radar_grid.length),
-        ref_width=int(ref_radar_grid.width),
-    )
-
-    fine_coreg_slave_path = str(p1_stage_path / "fine_coreg_slave.tif")
-    fine_ok = run_coarse_resamp_isce3_v2(
-        slave_slc_path=slave_slc,
-        coarse_coreg_slave_path=fine_coreg_slave_path,
-        radar_grid=slave_radar_grid,
-        doppler=slave_doppler,
-        ref_radar_grid=ref_radar_grid,
-        rg_offset_path=rubbersheet_outputs["range_offsets"],
-        az_offset_path=rubbersheet_outputs["azimuth_offsets"],
-        use_gpu=use_gpu,
-    )
-    if not fine_ok:
-        raise RuntimeError("NISAR fine resample failed")
-
-    range_offset_gtiff = _write_offset_raster(
-        p1_stage_path / "range.off.tif",
-        _read_raster_array(rubbersheet_outputs["range_offsets"], dtype=np.float64),
-    )
-    azimuth_offset_gtiff = _write_offset_raster(
-        p1_stage_path / "azimuth.off.tif",
-        _read_raster_array(rubbersheet_outputs["azimuth_offsets"], dtype=np.float64),
-    )
-    range_residual_gtiff = _write_offset_raster(
-        p1_stage_path / "range_residual.off.tif",
-        _read_raster_array(rubbersheet_outputs["resampled_range_offsets"], dtype=np.float64),
-    )
-    azimuth_residual_gtiff = _write_offset_raster(
-        p1_stage_path / "azimuth_residual.off.tif",
-        _read_raster_array(rubbersheet_outputs["resampled_azimuth_offsets"], dtype=np.float64),
-    )
-
-    registration_model = p1_stage_path / "registration_model.json"
-    registration_model.write_text(
-        json.dumps(
-            {
-                "source": "nisar-strip-registration-chain",
-                "use_gpu": bool(use_gpu),
-                "sequence": [
-                    "geo2rdr",
-                    "coarse_resample",
-                    "dense_offsets",
-                    "rubbersheet",
-                    "fine_resample",
-                ],
-                "coarse_geo2rdr_range_offsets": coarse_rg_offset_path,
-                "coarse_geo2rdr_azimuth_offsets": coarse_az_offset_path,
-                "dense_offsets_dir": str(dense_offsets_dir),
-                "rubbersheet_dir": str(rubbersheet_dir),
-                "range_offsets": range_offset_gtiff,
-                "azimuth_offsets": azimuth_offset_gtiff,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
+    row_offset = None
+    col_offset = None
+    dense_match_details = None
+    dense_source = "pycuampcor" if use_gpu else "cpu-dense-match"
+    dense_plan_record = {
+        "effective_resolution": float(effective_resolution),
+        "gross_offset": {
+            "azimuth": float(gross_offset[0]),
+            "range": float(gross_offset[1]),
+        },
+        **dense_plan,
+    }
+    (p1_stage_path / "dense_match_plan.json").write_text(
+        json.dumps(dense_plan_record, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+    try:
+        if use_gpu:
+            first_candidate = dense_plan["candidates"][0]
+            pycuampcor_kwargs: dict[str, object] = {}
+            use_gross_on_coarse_coreg = (
+                str(os.environ.get("D2SAR_DENSE_GROSS_ON_COARSE_COREG", "0"))
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if (
+                use_gross_on_coarse_coreg
+                and coarse_rg_offset_path is not None
+                and coarse_az_offset_path is not None
+            ):
+                try:
+                    full_shape = _strip_raster_shape(master_slc)
+                    if full_shape is not None:
+                        varying_cfg = _write_strip_varying_gross_offset_file(
+                            range_offset_path=coarse_rg_offset_path,
+                            azimuth_offset_path=coarse_az_offset_path,
+                            output_path=dense_offsets_dir / "pycuampcor_varying_gross_offsets.bin",
+                            full_shape=full_shape,
+                            window_size=tuple(first_candidate["window_size"]),
+                            search_range=tuple(first_candidate["search_range"]),
+                            skip=(32, 32),
+                        )
+                        pycuampcor_kwargs = {
+                            "gross_offset_filepath": varying_cfg.get("gross_offset_filepath"),
+                            "reference_start_pixel_down": varying_cfg.get(
+                                "reference_start_pixel_down"
+                            ),
+                            "reference_start_pixel_across": varying_cfg.get(
+                                "reference_start_pixel_across"
+                            ),
+                            "number_window_down": varying_cfg.get("number_window_down"),
+                            "number_window_across": varying_cfg.get("number_window_across"),
+                        }
+                        dense_plan_record["varying_gross_offsets"] = varying_cfg
+                        (p1_stage_path / "dense_match_plan.json").write_text(
+                            json.dumps(dense_plan_record, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                except Exception as exc:
+                    print(
+                        f"[P1] varying gross offsets unavailable for pycuampcor: {exc}",
+                        flush=True,
+                    )
+            row_offset, col_offset, dense_match_details = _run_strip_pycuampcor_dense_offsets(
+                master_slc_path=master_slc,
+                slave_slc_path=coarse_coreg_slave_path,
+                output_dir=dense_offsets_dir,
+                gpu_id=gpu_id,
+                return_details=True,
+                window_size=tuple(first_candidate["window_size"]),
+                search_range=tuple(first_candidate["search_range"]),
+                **pycuampcor_kwargs,
+            )
+        else:
+            row_offset, col_offset, dense_match_details = _run_strip_cpu_dense_offsets(
+                master_slc_path=master_slc,
+                slave_slc_path=coarse_coreg_slave_path,
+                output_dir=dense_offsets_dir,
+                return_details=True,
+                gross_offset=gross_offset,
+                window_candidates=dense_plan["candidates"],
+            )
+    except NotImplementedError:
+        row_offset = None
+        col_offset = None
+        dense_match_details = None
+    except Exception:
+        row_offset = None
+        col_offset = None
+        dense_match_details = None
+
+    registration_outputs = _run_with_silenced_journal(
+        p1_stage_path / "isce3_registration_journal.log",
+        lambda: _write_strip_registration_outputs(
+            stage_path=p1_stage_path,
+            slave_slc_path=slave_slc,
+            coarse_coreg_slave_path=coarse_coreg_slave_gtiff_path,
+            coarse_rg_offset_path=coarse_rg_offset_path,
+            coarse_az_offset_path=coarse_az_offset_path,
+            row_offset=row_offset,
+            col_offset=col_offset,
+            dense_match_details=dense_match_details,
+            source=dense_source if row_offset is not None and col_offset is not None else "coarse-resample-only",
+            use_gpu=use_gpu,
+            radar_grid=slave_radar_grid,
+            doppler=slave_doppler,
+            ref_radar_grid=ref_radar_grid,
+        ),
+    )
+
+    fine_coreg_slave_tif_path = registration_outputs["fine_coreg_slave"]
+    fine_coreg_slave_path = str(fine_coreg_slave_tif_path)
+    fine_coreg_slave_gtiff_path = str(fine_coreg_slave_tif_path)
+    registration_model = Path(registration_outputs["registration_model"])
+    range_offset_gtiff = str(registration_outputs["range_offsets"])
+    azimuth_offset_gtiff = str(registration_outputs["azimuth_offsets"])
+    range_residual_gtiff = str(registration_outputs["range_residual_offsets"])
+    azimuth_residual_gtiff = str(registration_outputs["azimuth_residual_offsets"])
 
     outputs = {
         "coarse_coreg_slave": coarse_coreg_slave_path,
         "fine_coreg_slave": fine_coreg_slave_path,
+        "coarse_coreg_slave_tif": coarse_coreg_slave_gtiff_path,
+        "fine_coreg_slave_tif": fine_coreg_slave_gtiff_path,
         "registration_model": str(registration_model),
         "range_offsets": range_offset_gtiff,
         "azimuth_offsets": azimuth_offset_gtiff,
         "range_residual_offsets": range_residual_gtiff,
         "azimuth_residual_offsets": azimuth_residual_gtiff,
         "dense_offsets_dir": str(dense_offsets_dir),
-        "rubbersheet_dir": str(rubbersheet_dir),
         "coarse_geo2rdr_range_offsets": coarse_rg_offset_path,
         "coarse_geo2rdr_azimuth_offsets": coarse_az_offset_path,
-        "coarse_geo2rdr_range_offsets_envi": coarse_range_envi,
-        "coarse_geo2rdr_azimuth_offsets_envi": coarse_azimuth_envi,
-        **dense_outputs,
-        **rubbersheet_outputs,
+        "dense_match_plan": str(p1_stage_path / "dense_match_plan.json"),
     }
 
     try:
         outputs["coarse_coreg_slave_png"] = _write_radar_amplitude_png(
-            coarse_coreg_slave_path,
+            coarse_coreg_slave_gtiff_path,
             context.pair_dir / "slave_coarse_coreg_fullres.png",
         )
     except Exception:
         pass
     try:
         outputs["fine_coreg_slave_png"] = _write_radar_amplitude_png(
-            fine_coreg_slave_path,
+            fine_coreg_slave_gtiff_path,
             context.pair_dir / "slave_fine_coreg_fullres.png",
         )
     except Exception:
@@ -2692,24 +3163,44 @@ def run_resample_stage(
 
     p1_stage_path = stage_dir(context.pair_dir, "p1")
     p1_stage_path.mkdir(parents=True, exist_ok=True)
+    progress = _StageProgress("p1")
 
-    result, backend_used, fallback_reason = run_stage_with_fallback(
-        stage_name="resample",
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        gpu_runner=lambda: _run_nisar_registration_chain(
-            context=context,
-            use_gpu=True,
+    def _gpu():
+        return _run_with_running_progress(
+            progress_reporter=progress,
+            backend="gpu",
+            detail="resample/registration",
+            func=lambda: _run_nisar_registration_chain(
+                context=context,
+                use_gpu=True,
+                gpu_id=gpu_id,
+                p1_stage_path=p1_stage_path,
+            ),
+        )
+
+    def _cpu():
+        return _run_with_running_progress(
+            progress_reporter=progress,
+            backend="cpu",
+            detail="resample/registration",
+            func=lambda: _run_nisar_registration_chain(
+                context=context,
+                use_gpu=False,
+                gpu_id=gpu_id,
+                p1_stage_path=p1_stage_path,
+            ),
+        )
+
+    try:
+        result, backend_used, fallback_reason = run_stage_with_fallback(
+            stage_name="resample",
+            gpu_mode=gpu_mode,
             gpu_id=gpu_id,
-            p1_stage_path=p1_stage_path,
-        ),
-        cpu_runner=lambda: _run_nisar_registration_chain(
-            context=context,
-            use_gpu=False,
-            gpu_id=gpu_id,
-            p1_stage_path=p1_stage_path,
-        ),
-    )
+            gpu_runner=_gpu,
+            cpu_runner=_cpu,
+        )
+    finally:
+        progress.close()
     _write_stage_outputs_record(
         output_dir=context.pair_dir,
         stage="p1",
@@ -2933,6 +3424,8 @@ def _run_crossmul_cpu(
     range_pixel_spacing: float | None,
     wavelength: float | None,
     flatten_starting_range_shift_m: float | None,
+    block_rows: int = ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
+    progress_reporter: _StageProgress | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     master_slc = _open_slc_as_complex(master_slc_path)
     slave_slc = _open_slc_as_complex(slave_slc_path)
@@ -2940,8 +3433,10 @@ def _run_crossmul_cpu(
         raise RuntimeError(
             f"shape mismatch for crossmul: master={master_slc.shape}, slave={slave_slc.shape}"
         )
-    interferogram = master_slc * np.conj(slave_slc)
+    interferogram = np.zeros(master_slc.shape, dtype=np.complex64)
 
+    range_offset = None
+    mask = None
     if flatten_raster and wavelength and range_pixel_spacing is not None:
         ds = gdal.Open(str(flatten_raster), gdal.GA_ReadOnly)
         if ds is None:
@@ -2958,21 +3453,898 @@ def _run_crossmul_cpu(
                     mask = _read_band_array(mask_ds.GetRasterBand(1), dtype=np.uint8).astype(np.uint8) != 0
                 finally:
                     mask_ds = None
-        phase = (
-            4.0
-            * np.pi
-            * (
-                float(range_pixel_spacing) * range_offset.astype(np.float32)
-                + float(flatten_starting_range_shift_m or 0.0)
+
+    total_blocks = max((int(master_slc.shape[0]) + int(block_rows) - 1) // int(block_rows), 1)
+    for row0 in range(0, master_slc.shape[0], block_rows):
+        rows = min(block_rows, master_slc.shape[0] - row0)
+        block = master_slc[row0 : row0 + rows] * np.conj(slave_slc[row0 : row0 + rows])
+        block = block.astype(np.complex64, copy=False)
+        if range_offset is not None:
+            block_offsets = range_offset[row0 : row0 + rows].astype(np.float32, copy=False)
+            phase = (
+                4.0
+                * np.pi
+                * (
+                    float(range_pixel_spacing) * block_offsets
+                    + float(flatten_starting_range_shift_m or 0.0)
+                )
+                / float(wavelength)
             )
-            / float(wavelength)
-        )
-        flatten_term = np.exp(-1j * phase.astype(np.float32)).astype(np.complex64)
-        interferogram = interferogram.astype(np.complex64, copy=False)
-        interferogram[mask] *= flatten_term[mask]
+            flatten_term = np.exp(-1j * phase.astype(np.float32)).astype(np.complex64)
+            block_mask = mask[row0 : row0 + rows] if mask is not None else None
+            if block_mask is None:
+                block *= flatten_term
+            elif np.any(block_mask):
+                block[block_mask] *= flatten_term[block_mask]
+        interferogram[row0 : row0 + rows] = block
+        if progress_reporter is not None:
+            progress_reporter.block(
+                backend="cpu",
+                current=(row0 // block_rows) + 1,
+                total=total_blocks,
+                detail="crossmul",
+            )
 
     coherence = _estimate_coherence(master_slc, slave_slc)
     return interferogram.astype(np.complex64), coherence
+
+
+def _copy_raster_to_envi_complex64(
+    src: str,
+    dst: str | Path,
+) -> str:
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.unlink(missing_ok=True)
+    Path(f"{dst}.hdr").unlink(missing_ok=True)
+
+    src_ds = gdal.Open(str(src), gdal.GA_ReadOnly)
+    if src_ds is None:
+        raise RuntimeError(f"failed to open source raster for ENVI copy: {src}")
+    try:
+        translated = gdal.Translate(
+            str(dst),
+            src_ds,
+            format="ENVI",
+            outputType=gdal.GDT_CFloat32,
+            creationOptions=["INTERLEAVE=BIP"],
+        )
+        if translated is None:
+            raise RuntimeError(f"gdal.Translate failed for {src} -> {dst}")
+        translated = None
+    finally:
+        src_ds = None
+    return str(dst)
+
+
+def _create_empty_dataset(
+    filename: str | Path,
+    width: int,
+    length: int,
+    bands: int,
+    dtype,
+    *,
+    interleave: str = "bip",
+    file_type: str = "ENVI",
+) -> None:
+    driver = gdal.GetDriverByName(file_type)
+    if driver is None:
+        raise RuntimeError(f"GDAL driver unavailable: {file_type}")
+    ds = driver.Create(
+        str(filename),
+        xsize=int(width),
+        ysize=int(length),
+        bands=int(bands),
+        eType=dtype,
+        options=[f"INTERLEAVE={interleave}"],
+    )
+    if ds is None:
+        raise RuntimeError(f"failed to create dataset: {filename}")
+    ds.FlushCache()
+    ds = None
+
+
+def _raster_shape(path: str | Path) -> tuple[int, int] | None:
+    ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+    if ds is None:
+        return None
+    try:
+        rows = int(ds.RasterYSize)
+        cols = int(ds.RasterXSize)
+    finally:
+        ds = None
+    if rows <= 0 or cols <= 0:
+        return None
+    return rows, cols
+
+
+def _plan_matching_grid(
+    *,
+    rows: int,
+    cols: int,
+    window_size: tuple[int, int],
+    search_range: tuple[int, int],
+    skip: tuple[int, int],
+    gross_offset: tuple[float, float] = (0.0, 0.0),
+    max_windows: int = 4096,
+    max_window_down: int = 60,
+    max_window_across: int = 40,
+) -> dict:
+    gross_az = int(np.rint(float(gross_offset[0] if gross_offset else 0.0)))
+    gross_rg = int(np.rint(float(gross_offset[1] if gross_offset else 0.0)))
+    margin_az = 2 * int(search_range[0]) + int(window_size[0]) + 2 * int(abs(gross_az))
+    margin_rg = 2 * int(search_range[1]) + int(window_size[1]) + 2 * int(abs(gross_rg))
+    skip_down = max(1, int(skip[0]))
+    skip_across = max(1, int(skip[1]))
+
+    def _counts(curr_skip_down: int, curr_skip_across: int) -> tuple[int, int]:
+        return (
+            max(1, (int(rows) - margin_az) // max(1, int(curr_skip_down))),
+            max(1, (int(cols) - margin_rg) // max(1, int(curr_skip_across))),
+        )
+
+    while True:
+        number_window_down, number_window_across = _counts(skip_down, skip_across)
+        if (
+            number_window_down <= int(max_window_down)
+            and number_window_across <= int(max_window_across)
+            and number_window_down * number_window_across <= int(max_windows)
+        ):
+            break
+        needs_down = number_window_down > int(max_window_down)
+        needs_across = number_window_across > int(max_window_across)
+        if needs_down and (number_window_down >= number_window_across or not needs_across):
+            skip_down += max(1, int(skip[0]))
+            continue
+        if needs_across:
+            skip_across += max(1, int(skip[1]))
+            continue
+        if number_window_down * number_window_across > int(max_windows):
+            if number_window_down >= number_window_across:
+                skip_down += max(1, int(skip[0]))
+            else:
+                skip_across += max(1, int(skip[1]))
+
+    start_down = int(abs(gross_az)) + int(search_range[0])
+    start_across = int(abs(gross_rg)) + int(search_range[1])
+    return {
+        "gross_az": gross_az,
+        "gross_rg": gross_rg,
+        "margin_az": int(margin_az),
+        "margin_rg": int(margin_rg),
+        "skip_down": int(skip_down),
+        "skip_across": int(skip_across),
+        "number_window_down": int(number_window_down),
+        "number_window_across": int(number_window_across),
+        "reference_start_pixel_down": int(start_down),
+        "reference_start_pixel_across": int(start_across),
+    }
+
+
+def _configure_ampcor_from_cfg(
+    ampcor,
+    *,
+    cfg: dict,
+    rows: int,
+    cols: int,
+    gross_offset_filepath: str | None = None,
+) -> dict:
+    window_size = (int(cfg["window_azimuth"]), int(cfg["window_range"]))
+    search_range = (int(cfg["half_search_azimuth"]), int(cfg["half_search_range"]))
+    skip = (int(cfg["skip_azimuth"]), int(cfg["skip_range"]))
+    planned_grid = _plan_matching_grid(
+        rows=int(rows),
+        cols=int(cols),
+        window_size=window_size,
+        search_range=search_range,
+        skip=skip,
+        gross_offset=(0.0, 0.0),
+        max_windows=2400,
+        max_window_down=60,
+        max_window_across=40,
+    )
+
+    ampcor.windowSizeHeight = window_size[0]
+    ampcor.windowSizeWidth = window_size[1]
+    ampcor.halfSearchRangeDown = search_range[0]
+    ampcor.halfSearchRangeAcross = search_range[1]
+    ampcor.skipSampleDown = int(planned_grid["skip_down"])
+    ampcor.skipSampleAcross = int(planned_grid["skip_across"])
+    ampcor.referenceStartPixelDownStatic = int(planned_grid["reference_start_pixel_down"])
+    ampcor.referenceStartPixelAcrossStatic = int(planned_grid["reference_start_pixel_across"])
+    ampcor.numberWindowDown = int(planned_grid["number_window_down"])
+    ampcor.numberWindowAcross = int(planned_grid["number_window_across"])
+    ampcor.algorithm = 0 if cfg["cross_correlation_domain"] == "frequency" else 1
+    ampcor.rawDataOversamplingFactor = int(cfg["slc_oversampling_factor"])
+    if cfg["deramping_method"] == "magnitude":
+        ampcor.derampMethod = 0
+    elif cfg["deramping_method"] == "complex":
+        ampcor.derampMethod = 1
+    else:
+        ampcor.derampMethod = 2
+    if cfg["deramping_axis"] == "azimuth":
+        ampcor.derampAxis = 0
+    elif cfg["deramping_axis"] == "range":
+        ampcor.derampAxis = 1
+    else:
+        ampcor.derampAxis = 2
+    ampcor.corrStatWindowSize = int(cfg["correlation_statistics_zoom"])
+    ampcor.corrSurfaceZoomInWindow = int(cfg["correlation_surface_zoom"])
+    ampcor.corrSurfaceOverSamplingFactor = int(cfg["correlation_surface_oversampling_factor"])
+    ampcor.corrSurfaceOverSamplingMethod = (
+        0 if cfg["correlation_surface_oversampling_method"] == "fft" else 1
+    )
+    ampcor.numberWindowAcrossInChunk = int(cfg["windows_batch_range"])
+    ampcor.numberWindowDownInChunk = int(cfg["windows_batch_azimuth"])
+    ampcor.nStreams = int(cfg["cuda_streams"])
+    ampcor.setupParams()
+    ampcor.setConstantGrossOffset(0, 0)
+    if gross_offset_filepath:
+        gross_offset = np.fromfile(gross_offset_filepath, dtype=np.int32)
+        windows_number = ampcor.numberWindowAcross * ampcor.numberWindowDown
+        if gross_offset.size != 2 * windows_number:
+            raise RuntimeError(
+                "The input gross offset does not match the offset width*offset length"
+            )
+        gross_offset = gross_offset.reshape(windows_number, 2)
+        ampcor.setVaryingGrossOffset(gross_offset[:, 0], gross_offset[:, 1])
+    ampcor.checkPixelInImageRange()
+    return planned_grid
+
+
+def _crossmul_isce3_gpu(
+    *,
+    master_slc_path: str,
+    slave_slc_path: str,
+    output_dir: Path,
+    gpu_id: int,
+    block_rows: int,
+    flatten_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    return _crossmul_isce3_gpu_subprocess(
+        master_slc_path=master_slc_path,
+        slave_slc_path=slave_slc_path,
+        output_dir=output_dir,
+        gpu_id=gpu_id,
+        block_rows=block_rows,
+        flatten_raster=flatten_raster,
+        range_pixel_spacing=range_pixel_spacing,
+        wavelength=wavelength,
+        flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+        progress_reporter=progress_reporter,
+    )
+
+
+def _run_crossmul_filter_gpu_pipeline(
+    *,
+    master_slc_path: str,
+    slave_slc_path: str,
+    output_dir: Path,
+    gpu_id: int,
+    block_rows: int,
+    flatten_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str | None]:
+    return _crossmul_filter_isce3_gpu_subprocess(
+        master_slc_path=master_slc_path,
+        slave_slc_path=slave_slc_path,
+        output_dir=output_dir,
+        gpu_id=gpu_id,
+        block_rows=block_rows,
+        flatten_raster=flatten_raster,
+        range_pixel_spacing=range_pixel_spacing,
+        wavelength=wavelength,
+        flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+        progress_reporter=progress_reporter,
+    )
+
+
+def _crossmul_isce3_gpu_subprocess(
+    *,
+    master_slc_path: str,
+    slave_slc_path: str,
+    output_dir: Path,
+    gpu_id: int,
+    block_rows: int,
+    flatten_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    output_dir = Path(output_dir)
+    p2_dir = stage_dir(output_dir, "p2")
+    p2_dir.mkdir(parents=True, exist_ok=True)
+
+    ifg_path = p2_dir / "cuda_interferogram.int"
+    coh_path = p2_dir / "cuda_coherence.bin"
+    helper = p2_dir / "cuda_crossmul_helper.py"
+    helper.write_text(
+        (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from osgeo import gdal\n"
+            "import isce3.core\n"
+            "import isce3.cuda.core\n"
+            "import isce3.cuda.signal\n"
+            "import isce3.io\n"
+            "\n"
+            "def _copy_raster_to_envi_complex64(src, dst):\n"
+            "    dst = Path(dst)\n"
+            "    dst.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    dst.unlink(missing_ok=True)\n"
+            "    Path(f'{dst}.hdr').unlink(missing_ok=True)\n"
+            "    src_ds = gdal.Open(str(src), gdal.GA_ReadOnly)\n"
+            "    if src_ds is None:\n"
+            "        raise RuntimeError(f'failed to open source raster for ENVI copy: {src}')\n"
+            "    try:\n"
+            "        translated = gdal.Translate(\n"
+            "            str(dst),\n"
+            "            src_ds,\n"
+            "            format='ENVI',\n"
+            "            outputType=gdal.GDT_CFloat32,\n"
+            "            creationOptions=['INTERLEAVE=BIP'],\n"
+            "        )\n"
+            "        if translated is None:\n"
+            "            raise RuntimeError(f'gdal.Translate failed for {src} -> {dst}')\n"
+            "        translated = None\n"
+            "    finally:\n"
+            "        src_ds = None\n"
+            "    return str(dst)\n"
+            "\n"
+            "master_slc_path, slave_slc_path, gpu_id, block_rows, ifg_path, coh_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m = sys.argv[1:]\n"
+            "gpu_id = int(gpu_id)\n"
+            "block_rows = int(block_rows)\n"
+            "flatten_raster = None if flatten_raster == '__NONE__' else flatten_raster\n"
+            "range_pixel_spacing = None if range_pixel_spacing == '__NONE__' else float(range_pixel_spacing)\n"
+            "wavelength = None if wavelength == '__NONE__' else float(wavelength)\n"
+            "flatten_starting_range_shift_m = None if flatten_starting_range_shift_m == '__NONE__' else float(flatten_starting_range_shift_m)\n"
+            "\n"
+            "input_dir = Path(ifg_path).parent / 'cuda_inputs'\n"
+            "input_dir.mkdir(parents=True, exist_ok=True)\n"
+            "master_local = _copy_raster_to_envi_complex64(master_slc_path, input_dir / 'master.slc')\n"
+            "slave_local = _copy_raster_to_envi_complex64(slave_slc_path, input_dir / 'slave.slc')\n"
+            "\n"
+            "device = isce3.cuda.core.Device(gpu_id)\n"
+            "isce3.cuda.core.set_device(device)\n"
+            "master_raster = isce3.io.Raster(str(master_local))\n"
+            "slave_raster = isce3.io.Raster(str(slave_local))\n"
+            "width = int(master_raster.width)\n"
+            "length = int(master_raster.length)\n"
+            "if int(slave_raster.width) != width or int(slave_raster.length) != length:\n"
+            "    raise RuntimeError(f'CUDA crossmul input dimensions differ: master={length}x{width}, slave={slave_raster.length}x{slave_raster.width}')\n"
+            "ifg_raster = isce3.io.Raster(str(ifg_path), width, length, 1, gdal.GDT_CFloat32, 'ENVI')\n"
+            "coh_raster = isce3.io.Raster(str(coh_path), width, length, 1, gdal.GDT_Float32, 'ENVI')\n"
+            "crossmul = isce3.cuda.signal.Crossmul()\n"
+            "crossmul.range_looks = 1\n"
+            "crossmul.az_looks = 1\n"
+            "crossmul.lines_per_block = block_rows\n"
+            "try:\n"
+            "    crossmul.set_dopplers(isce3.core.LUT1d(), isce3.core.LUT1d())\n"
+            "except Exception:\n"
+            "    pass\n"
+            "flatten_isce_raster = None\n"
+            "if flatten_raster is not None:\n"
+            "    if range_pixel_spacing is None or wavelength is None:\n"
+            "        raise ValueError('range_pixel_spacing and wavelength are required for CUDA crossmul flattening')\n"
+            "    crossmul.range_pixel_spacing = range_pixel_spacing\n"
+            "    crossmul.wavelength = wavelength\n"
+            "    crossmul.ref_sec_offset_starting_range_shift = float(flatten_starting_range_shift_m or 0.0)\n"
+            "    flatten_isce_raster = isce3.io.Raster(str(flatten_raster))\n"
+            "crossmul.crossmul(master_raster, slave_raster, ifg_raster, coh_raster, flatten_isce_raster)\n"
+        ),
+        encoding="utf-8",
+    )
+    py_compile.compile(str(helper), doraise=True)
+
+    cmd = [
+        sys.executable,
+        "-X",
+        "faulthandler",
+        str(helper),
+        str(master_slc_path),
+        str(slave_slc_path),
+        str(gpu_id),
+        str(block_rows),
+        str(ifg_path),
+        str(coh_path),
+        flatten_raster if flatten_raster is not None else "__NONE__",
+        str(range_pixel_spacing) if range_pixel_spacing is not None else "__NONE__",
+        str(wavelength) if wavelength is not None else "__NONE__",
+        (
+            str(flatten_starting_range_shift_m)
+            if flatten_starting_range_shift_m is not None
+            else "__NONE__"
+        ),
+    ]
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(Path(__file__).resolve().parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    start_time = datetime.now(timezone.utc)
+    if progress_reporter is not None:
+        progress_reporter.running(backend="gpu", detail="crossmul", elapsed=0.0, force=True)
+    while True:
+        try:
+            stdout_text, stderr_text = process.communicate(timeout=1.0)
+            break
+        except subprocess.TimeoutExpired:
+            if progress_reporter is not None:
+                progress_reporter.running(
+                    backend="gpu",
+                    detail="crossmul",
+                    elapsed=(datetime.now(timezone.utc) - start_time).total_seconds(),
+                )
+    class _Completed:
+        pass
+    result = _Completed()
+    result.returncode = process.returncode
+    result.stdout = stdout_text
+    result.stderr = stderr_text
+    if result.returncode != 0:
+        stdout_tail = "\n".join(result.stdout.strip().splitlines()[-20:])
+        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-40:])
+        raise RuntimeError(
+            "gpu crossmul subprocess failed "
+            f"with exit code {result.returncode}\nstdout:\n{stdout_tail}\nstderr:\n{stderr_tail}"
+        )
+
+    ifg_ds = gdal.Open(str(ifg_path), gdal.GA_ReadOnly)
+    coh_ds = gdal.Open(str(coh_path), gdal.GA_ReadOnly)
+    if ifg_ds is None or coh_ds is None:
+        raise RuntimeError("failed to open CUDA crossmul outputs")
+    try:
+        interferogram = _read_band_array(ifg_ds.GetRasterBand(1), dtype=np.complex64).astype(np.complex64)
+        coherence = _read_band_array(coh_ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
+    finally:
+        ifg_ds = None
+        coh_ds = None
+    return interferogram, coherence
+
+
+def _crossmul_filter_isce3_gpu_subprocess(
+    *,
+    master_slc_path: str,
+    slave_slc_path: str,
+    output_dir: Path,
+    gpu_id: int,
+    block_rows: int,
+    flatten_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str | None]:
+    output_dir = Path(output_dir)
+    p2_dir = stage_dir(output_dir, "p2")
+    p2_dir.mkdir(parents=True, exist_ok=True)
+
+    ifg_path = p2_dir / "cuda_interferogram.int"
+    coh_path = p2_dir / "cuda_coherence.bin"
+    filtered_path = p2_dir / "cuda_filtered_interferogram.int"
+    helper = p2_dir / "cuda_crossmul_filter_helper.py"
+    helper.write_text(
+        (
+            "import sys\n"
+            "import time\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "import numpy as np\n"
+            "from osgeo import gdal\n"
+            "import isce3.core\n"
+            "import isce3.cuda.core\n"
+            "import isce3.cuda.signal\n"
+            "import isce3.io\n"
+            "\n"
+            "def _copy_raster_to_envi_complex64(src, dst):\n"
+            "    dst = Path(dst)\n"
+            "    dst.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    dst.unlink(missing_ok=True)\n"
+            "    Path(f'{dst}.hdr').unlink(missing_ok=True)\n"
+            "    src_ds = gdal.Open(str(src), gdal.GA_ReadOnly)\n"
+            "    if src_ds is None:\n"
+            "        raise RuntimeError(f'failed to open source raster for ENVI copy: {src}')\n"
+            "    try:\n"
+            "        translated = gdal.Translate(\n"
+            "            str(dst), src_ds, format='ENVI', outputType=gdal.GDT_CFloat32,\n"
+            "            creationOptions=['INTERLEAVE=BIP'],\n"
+            "        )\n"
+            "        if translated is None:\n"
+            "            raise RuntimeError(f'gdal.Translate failed for {src} -> {dst}')\n"
+            "        translated = None\n"
+            "    finally:\n"
+            "        src_ds = None\n"
+            "    return str(dst)\n"
+            "\n"
+            "def _wait_for_min_file_size(path, expected_size, timeout=5.0, interval=0.1):\n"
+            "    deadline = time.time() + timeout\n"
+            "    target = Path(path)\n"
+            "    while time.time() < deadline:\n"
+            "        try:\n"
+            "            if target.stat().st_size >= expected_size:\n"
+            "                return\n"
+            "        except FileNotFoundError:\n"
+            "            pass\n"
+            "        time.sleep(interval)\n"
+            "    raise RuntimeError(\n"
+            "        f'output file not fully written in time: {path} expected>={expected_size}'\n"
+            "    )\n"
+            "\n"
+            "def _goldstein_filter_cpu(interferogram, alpha=0.5, window_size=32, step=None):\n"
+            "    if step is None:\n"
+            "        step = window_size // 2\n"
+            "    if step < 1:\n"
+            "        step = 1\n"
+            "    data = np.asarray(interferogram, dtype=np.complex64)\n"
+            "    rows, cols = data.shape\n"
+            "    hanning = np.outer(np.hanning(window_size), np.hanning(window_size)).astype(np.complex64)\n"
+            "    filtered = np.zeros_like(data, dtype=np.complex64)\n"
+            "    weight_sum = np.zeros((rows, cols), dtype=np.float64)\n"
+            "    for row_start in range(0, rows - window_size + 1, step):\n"
+            "        for col_start in range(0, cols - window_size + 1, step):\n"
+            "            window_data = data[row_start:row_start + window_size, col_start:col_start + window_size].copy()\n"
+            "            spectrum = np.fft.fft2(window_data * hanning)\n"
+            "            psd = np.abs(spectrum) ** 2\n"
+            "            weight = np.power(psd + 1.0e-10, alpha / 2.0)\n"
+            "            filtered_window = np.fft.ifft2(spectrum * weight)\n"
+            "            filtered[row_start:row_start + window_size, col_start:col_start + window_size] += filtered_window\n"
+            "            weight_sum[row_start:row_start + window_size, col_start:col_start + window_size] += 1.0\n"
+            "    weight_sum[weight_sum == 0] = 1.0\n"
+            "    return (filtered / weight_sum).astype(np.complex64)\n"
+            "\n"
+            "def _goldstein_filter_gpu(interferogram, alpha=0.5, window_size=32, step=None):\n"
+            "    try:\n"
+            "        import cupy as cp\n"
+            "    except Exception as exc:\n"
+            "        raise RuntimeError(f'cupy unavailable for combined gpu filter: {exc}')\n"
+            "    if step is None:\n"
+            "        step = window_size // 2\n"
+            "    if step < 1:\n"
+            "        step = 1\n"
+            "    arr = cp.asarray(np.asarray(interferogram, dtype=np.complex64))\n"
+            "    rows, cols = arr.shape\n"
+            "    hanning = cp.outer(cp.hanning(window_size), cp.hanning(window_size)).astype(cp.complex64)\n"
+            "    filtered = cp.zeros_like(arr, dtype=cp.complex64)\n"
+            "    weight_sum = cp.zeros((rows, cols), dtype=cp.float32)\n"
+            "    for row_start in range(0, rows - window_size + 1, step):\n"
+            "        for col_start in range(0, cols - window_size + 1, step):\n"
+            "            window_data = arr[row_start:row_start + window_size, col_start:col_start + window_size]\n"
+            "            spectrum = cp.fft.fft2(window_data * hanning)\n"
+            "            psd = cp.abs(spectrum) ** 2\n"
+            "            weight = cp.power(psd + 1.0e-10, alpha / 2.0)\n"
+            "            filtered_window = cp.fft.ifft2(spectrum * weight)\n"
+            "            filtered[row_start:row_start + window_size, col_start:col_start + window_size] += filtered_window\n"
+            "            weight_sum[row_start:row_start + window_size, col_start:col_start + window_size] += 1.0\n"
+            "    weight_sum = cp.where(weight_sum == 0, 1.0, weight_sum)\n"
+            "    result = (filtered / weight_sum).astype(cp.complex64)\n"
+            "    cp.cuda.runtime.deviceSynchronize()\n"
+            "    return cp.asnumpy(result)\n"
+            "\n"
+            "master_slc_path, slave_slc_path, gpu_id, block_rows, ifg_path, coh_path, filtered_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m = sys.argv[1:]\n"
+            "gpu_id = int(gpu_id)\n"
+            "block_rows = int(block_rows)\n"
+            "flatten_raster = None if flatten_raster == '__NONE__' else flatten_raster\n"
+            "range_pixel_spacing = None if range_pixel_spacing == '__NONE__' else float(range_pixel_spacing)\n"
+            "wavelength = None if wavelength == '__NONE__' else float(wavelength)\n"
+            "flatten_starting_range_shift_m = None if flatten_starting_range_shift_m == '__NONE__' else float(flatten_starting_range_shift_m)\n"
+            "input_dir = Path(ifg_path).parent / 'cuda_inputs'\n"
+            "input_dir.mkdir(parents=True, exist_ok=True)\n"
+            "master_local = _copy_raster_to_envi_complex64(master_slc_path, input_dir / 'master.slc')\n"
+            "slave_local = _copy_raster_to_envi_complex64(slave_slc_path, input_dir / 'slave.slc')\n"
+            "device = isce3.cuda.core.Device(gpu_id)\n"
+            "isce3.cuda.core.set_device(device)\n"
+            "master_raster = isce3.io.Raster(str(master_local))\n"
+            "slave_raster = isce3.io.Raster(str(slave_local))\n"
+            "width = int(master_raster.width)\n"
+            "length = int(master_raster.length)\n"
+            "if int(slave_raster.width) != width or int(slave_raster.length) != length:\n"
+            "    raise RuntimeError(f'CUDA crossmul input dimensions differ: master={length}x{width}, slave={slave_raster.length}x{slave_raster.width}')\n"
+            "ifg_raster = isce3.io.Raster(str(ifg_path), width, length, 1, gdal.GDT_CFloat32, 'ENVI')\n"
+            "coh_raster = isce3.io.Raster(str(coh_path), width, length, 1, gdal.GDT_Float32, 'ENVI')\n"
+            "crossmul = isce3.cuda.signal.Crossmul()\n"
+            "crossmul.range_looks = 1\n"
+            "crossmul.az_looks = 1\n"
+            "crossmul.lines_per_block = block_rows\n"
+            "try:\n"
+            "    crossmul.set_dopplers(isce3.core.LUT1d(), isce3.core.LUT1d())\n"
+            "except Exception:\n"
+            "    pass\n"
+            "flatten_isce_raster = None\n"
+            "if flatten_raster is not None:\n"
+            "    if range_pixel_spacing is None or wavelength is None:\n"
+            "        raise ValueError('range_pixel_spacing and wavelength are required for CUDA crossmul flattening')\n"
+            "    crossmul.range_pixel_spacing = range_pixel_spacing\n"
+            "    crossmul.wavelength = wavelength\n"
+            "    crossmul.ref_sec_offset_starting_range_shift = float(flatten_starting_range_shift_m or 0.0)\n"
+            "    flatten_isce_raster = isce3.io.Raster(str(flatten_raster))\n"
+            "crossmul.crossmul(master_raster, slave_raster, ifg_raster, coh_raster, flatten_isce_raster)\n"
+            "for raster in (ifg_raster, coh_raster, master_raster, slave_raster, flatten_isce_raster):\n"
+            "    if raster is not None:\n"
+            "        close_dataset = getattr(raster, 'close_dataset', None)\n"
+            "        if callable(close_dataset):\n"
+            "            close_dataset()\n"
+            "ifg_raster = None\n"
+            "coh_raster = None\n"
+            "master_raster = None\n"
+            "slave_raster = None\n"
+            "flatten_isce_raster = None\n"
+            "_wait_for_min_file_size(ifg_path, width * length * np.dtype(np.complex64).itemsize)\n"
+            "_wait_for_min_file_size(coh_path, width * length * np.dtype(np.float32).itemsize)\n"
+            "ifg_ds = gdal.Open(str(ifg_path), gdal.GA_ReadOnly)\n"
+            "if ifg_ds is None:\n"
+            "    raise RuntimeError('failed to open CUDA crossmul interferogram for filtering')\n"
+            "try:\n"
+            "    interferogram = ifg_ds.GetRasterBand(1).ReadAsArray().astype(np.complex64)\n"
+            "finally:\n"
+            "    ifg_ds = None\n"
+            "filter_backend = 'gpu'\n"
+            "filter_fallback_reason = None\n"
+            "try:\n"
+            "    filtered = _goldstein_filter_gpu(interferogram)\n"
+            "except Exception as exc:\n"
+            "    filter_backend = 'cpu'\n"
+            "    filter_fallback_reason = str(exc)\n"
+            "    sys.stderr.write(f'[p2 helper] GPU goldstein failed, falling back to CPU: {exc}\\n')\n"
+            "    filtered = _goldstein_filter_cpu(interferogram)\n"
+            "print('D2SAR_FILTER_INFO=' + json.dumps({'backend': filter_backend, 'fallback': filter_fallback_reason}), flush=True)\n"
+            "filtered_ds = gdal.GetDriverByName('ENVI').Create(str(filtered_path), width, length, 1, gdal.GDT_CFloat32)\n"
+            "if filtered_ds is None:\n"
+            "    raise RuntimeError(f'failed to create filtered interferogram raster: {filtered_path}')\n"
+            "filtered_ds.GetRasterBand(1).WriteArray(filtered.astype(np.complex64))\n"
+            "filtered_ds.FlushCache()\n"
+            "filtered_ds = None\n"
+        ),
+        encoding="utf-8",
+    )
+    py_compile.compile(str(helper), doraise=True)
+
+    cmd = [
+        sys.executable,
+        "-X",
+        "faulthandler",
+        str(helper),
+        str(master_slc_path),
+        str(slave_slc_path),
+        str(gpu_id),
+        str(block_rows),
+        str(ifg_path),
+        str(coh_path),
+        str(filtered_path),
+        flatten_raster if flatten_raster is not None else "__NONE__",
+        str(range_pixel_spacing) if range_pixel_spacing is not None else "__NONE__",
+        str(wavelength) if wavelength is not None else "__NONE__",
+        (
+            str(flatten_starting_range_shift_m)
+            if flatten_starting_range_shift_m is not None
+            else "__NONE__"
+        ),
+    ]
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(Path(__file__).resolve().parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    start_time = datetime.now(timezone.utc)
+    if progress_reporter is not None:
+        progress_reporter.running(
+            backend="gpu",
+            detail="crossmul+goldstein_filter",
+            elapsed=0.0,
+            force=True,
+        )
+    while True:
+        try:
+            stdout_text, stderr_text = process.communicate(timeout=1.0)
+            break
+        except subprocess.TimeoutExpired:
+            if progress_reporter is not None:
+                progress_reporter.running(
+                    backend="gpu",
+                    detail="crossmul+goldstein_filter",
+                    elapsed=(datetime.now(timezone.utc) - start_time).total_seconds(),
+                )
+    class _Completed:
+        pass
+    result = _Completed()
+    result.returncode = process.returncode
+    result.stdout = stdout_text
+    result.stderr = stderr_text
+    if result.returncode != 0:
+        stdout_tail = "\n".join(result.stdout.strip().splitlines()[-20:])
+        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-40:])
+        raise RuntimeError(
+            "gpu crossmul+filter subprocess failed "
+            f"with exit code {result.returncode}\nstdout:\n{stdout_tail}\nstderr:\n{stderr_tail}"
+        )
+
+    helper_filter_backend = "gpu"
+    helper_filter_fallback_reason = None
+    for line in reversed(result.stdout.splitlines()):
+        if not line.startswith("D2SAR_FILTER_INFO="):
+            continue
+        try:
+            payload = json.loads(line.split("=", 1)[1])
+        except Exception:
+            break
+        backend = str(payload.get("backend") or "gpu").strip().lower()
+        helper_filter_backend = "cpu" if backend == "cpu" else "gpu"
+        fallback_reason = payload.get("fallback")
+        if fallback_reason:
+            helper_filter_fallback_reason = str(fallback_reason)
+        break
+
+    ifg_ds = gdal.Open(str(ifg_path), gdal.GA_ReadOnly)
+    coh_ds = gdal.Open(str(coh_path), gdal.GA_ReadOnly)
+    filtered_ds = gdal.Open(str(filtered_path), gdal.GA_ReadOnly)
+    if ifg_ds is None or coh_ds is None or filtered_ds is None:
+        raise RuntimeError("failed to open CUDA crossmul/filter outputs")
+    try:
+        interferogram = _read_band_array(ifg_ds.GetRasterBand(1), dtype=np.complex64).astype(np.complex64)
+        coherence = _read_band_array(coh_ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
+        filtered_interferogram = _read_band_array(
+            filtered_ds.GetRasterBand(1),
+            dtype=np.complex64,
+        ).astype(np.complex64)
+    finally:
+        ifg_ds = None
+        coh_ds = None
+        filtered_ds = None
+    return (
+        interferogram,
+        coherence,
+        filtered_interferogram,
+        helper_filter_backend,
+        helper_filter_fallback_reason,
+    )
+
+
+def _run_crossmul_and_filter(
+    *,
+    master_slc_path: str,
+    slave_slc_path: str,
+    use_gpu: bool,
+    gpu_id: int,
+    output_dir: Path,
+    block_rows: int = ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
+    flatten_raster: str | None = None,
+    flatten_mask_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, str], str | None]:
+    fallback_reasons: list[str] = []
+    if use_gpu:
+        try:
+            (
+                interferogram,
+                coherence,
+                filtered_interferogram,
+                helper_filter_backend,
+                helper_filter_fallback_reason,
+            ) = _run_crossmul_filter_gpu_pipeline(
+                master_slc_path=master_slc_path,
+                slave_slc_path=slave_slc_path,
+                output_dir=output_dir,
+                gpu_id=gpu_id,
+                block_rows=block_rows,
+                flatten_raster=flatten_raster,
+                range_pixel_spacing=range_pixel_spacing,
+                wavelength=wavelength,
+                flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+                progress_reporter=progress_reporter,
+            )
+            combined_fallback_reason = None
+            if helper_filter_backend != "gpu" and helper_filter_fallback_reason:
+                combined_fallback_reason = (
+                    "combined_gpu_pipeline goldstein_filter->cpu: "
+                    f"{helper_filter_fallback_reason}"
+                )
+            return (
+                interferogram,
+                coherence,
+                filtered_interferogram,
+                {"crossmul": "gpu", "goldstein_filter": helper_filter_backend},
+                combined_fallback_reason,
+            )
+        except Exception as exc:
+            fallback_reasons.append(f"combined_gpu_pipeline: {exc}")
+
+    interferogram, coherence, crossmul_backend, crossmul_fallback_reason = _run_crossmul(
+        master_slc_path=master_slc_path,
+        slave_slc_path=slave_slc_path,
+        use_gpu=use_gpu,
+        gpu_id=gpu_id,
+        output_dir=output_dir,
+        block_rows=block_rows,
+        flatten_raster=flatten_raster,
+        flatten_mask_raster=flatten_mask_raster,
+        range_pixel_spacing=range_pixel_spacing,
+        wavelength=wavelength,
+        flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+        progress_reporter=progress_reporter,
+    )
+    if crossmul_fallback_reason:
+        fallback_reasons.append(f"crossmul: {crossmul_fallback_reason}")
+
+    filtered_interferogram, filter_backend, filter_fallback_reason = _run_goldstein_filter(
+        interferogram=interferogram,
+        use_gpu=use_gpu,
+        gpu_id=gpu_id,
+        progress_reporter=progress_reporter,
+    )
+    if filter_fallback_reason:
+        fallback_reasons.append(f"goldstein_filter: {filter_fallback_reason}")
+
+    return (
+        interferogram,
+        coherence,
+        filtered_interferogram,
+        {"crossmul": crossmul_backend, "goldstein_filter": filter_backend},
+        "; ".join(fallback_reasons) if fallback_reasons else None,
+    )
+
+
+def _run_crossmul(
+    *,
+    master_slc_path: str,
+    slave_slc_path: str,
+    use_gpu: bool,
+    gpu_id: int,
+    output_dir: Path,
+    block_rows: int = ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
+    flatten_raster: str | None = None,
+    flatten_mask_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+    progress_reporter: _StageProgress | None = None,
+) -> tuple[np.ndarray, np.ndarray, str, str | None]:
+    fallback_reason = None
+    if use_gpu:
+        try:
+            # Invalid offsets are already zeroed in flatten_raster, so the CUDA path can
+            # ignore the validity mask and still preserve "no-flatten" behavior there.
+            interferogram, coherence = _crossmul_isce3_gpu(
+                master_slc_path=master_slc_path,
+                slave_slc_path=slave_slc_path,
+                output_dir=output_dir,
+                gpu_id=gpu_id,
+                block_rows=block_rows,
+                flatten_raster=flatten_raster,
+                range_pixel_spacing=range_pixel_spacing,
+                wavelength=wavelength,
+                flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+                progress_reporter=progress_reporter,
+            )
+            return interferogram, coherence, "gpu", None
+        except Exception as exc:
+            fallback_reason = str(exc)
+
+    interferogram, coherence = _run_crossmul_cpu(
+        master_slc_path=master_slc_path,
+        slave_slc_path=slave_slc_path,
+        flatten_raster=flatten_raster,
+        flatten_mask_raster=flatten_mask_raster,
+        range_pixel_spacing=range_pixel_spacing,
+        wavelength=wavelength,
+        flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+        block_rows=block_rows,
+        progress_reporter=progress_reporter,
+    )
+    return interferogram, coherence, "cpu", fallback_reason
 
 
 def run_crossmul_stage(
@@ -2990,73 +4362,80 @@ def run_crossmul_stage(
     if cached_outputs is not None:
         return cached_outputs, "cache", None
 
-    def _run_impl(use_gpu: bool) -> dict:
-        master_slc = resolve_manifest_data_path(
-            context.master_manifest_path,
-            context.master_manifest["slc"]["path"],
-        )
-        slave_slc = resolve_manifest_data_path(
-            context.slave_manifest_path,
-            context.slave_manifest["slc"]["path"],
-        )
-        p1_record = load_stage_record(context.pair_dir, "p1") or {}
-        p1_outputs = p1_record.get("output_files")
-        registered_slave_slc = _select_registered_slave_slc(
-            p1_outputs,
-            slave_slc,
-            require_existing=True,
-        )
-        flatten_options = _build_crossmul_flatten_options(
-            output_dir=context.pair_dir,
-            p1_outputs=p1_outputs,
-            registered_slave_slc=registered_slave_slc,
-            radargrid_data=context.master_rg_data,
-            slave_radargrid_data=context.slave_rg_data,
-            acquisition_data=context.master_acq_data,
-        )
-        if use_gpu:
-            raise RuntimeError("manifest-based NISAR-style GPU crossmul is not enabled in strip_insar2")
-        interferogram, coherence = _run_crossmul_cpu(
+    master_slc = resolve_manifest_data_path(
+        context.master_manifest_path,
+        context.master_manifest["slc"]["path"],
+    )
+    slave_slc = resolve_manifest_data_path(
+        context.slave_manifest_path,
+        context.slave_manifest["slc"]["path"],
+    )
+    p1_record = load_stage_record(context.pair_dir, "p1") or {}
+    p1_outputs = p1_record.get("output_files")
+    registered_slave_slc = _select_registered_slave_slc(
+        p1_outputs,
+        slave_slc,
+        require_existing=True,
+    )
+    flatten_options = _build_crossmul_flatten_options(
+        output_dir=context.pair_dir,
+        p1_outputs=p1_outputs,
+        registered_slave_slc=registered_slave_slc,
+        radargrid_data=context.master_rg_data,
+        slave_radargrid_data=context.slave_rg_data,
+        acquisition_data=context.master_acq_data,
+    )
+    use_gpu = False
+    if gpu_mode != "cpu":
+        use_gpu = _default_gpu_check(True if gpu_mode == "gpu" else None, gpu_id)
+
+    progress = _StageProgress("p2")
+    try:
+        interferogram, coherence, filtered_interferogram, backends, fallback_reason = _run_crossmul_and_filter(
             master_slc_path=master_slc,
             slave_slc_path=registered_slave_slc,
+            use_gpu=use_gpu,
+            gpu_id=gpu_id,
+            output_dir=context.pair_dir,
+            block_rows=block_rows,
             flatten_raster=flatten_options.get("flatten_raster"),
             flatten_mask_raster=flatten_options.get("flatten_mask_raster"),
             range_pixel_spacing=flatten_options.get("range_pixel_spacing"),
             wavelength=flatten_options.get("wavelength"),
             flatten_starting_range_shift_m=flatten_options.get("flatten_starting_range_shift_m"),
+            progress_reporter=progress,
         )
-        filtered_interferogram = goldstein_filter(interferogram.astype(np.complex64))
-        output_files = {
-            "interferogram": _save_stage_array(context.pair_dir, "p2", "interferogram", interferogram),
-            "filtered_interferogram": _save_stage_array(
-                context.pair_dir, "p2", "filtered_interferogram", filtered_interferogram
-            ),
-            "coherence": _save_stage_array(context.pair_dir, "p2", "coherence", coherence),
-            "wrapped_phase_radar_png": _write_radar_wrapped_phase_png(
-                interferogram,
-                context.pair_dir / "wrapped_phase_radar.png",
-            ),
-        }
-        _add_flatten_outputs(output_files, flatten_options)
-        return output_files
-
-    result, backend_used, fallback_reason = run_stage_with_fallback(
-        stage_name="crossmul",
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        gpu_runner=lambda: _run_impl(True),
-        cpu_runner=lambda: _run_impl(False),
+    finally:
+        progress.close()
+    stage_backend = (
+        "gpu"
+        if backends.get("crossmul") == "gpu" and backends.get("goldstein_filter") == "gpu"
+        else "cpu"
     )
+    result = {
+        "interferogram": _save_stage_array(context.pair_dir, "p2", "interferogram", interferogram),
+        "filtered_interferogram": _save_stage_array(
+            context.pair_dir, "p2", "filtered_interferogram", filtered_interferogram
+        ),
+        "coherence": _save_stage_array(context.pair_dir, "p2", "coherence", coherence),
+        "crossmul_backend": backends.get("crossmul"),
+        "goldstein_filter_backend": backends.get("goldstein_filter"),
+        "wrapped_phase_radar_png": _write_radar_wrapped_phase_png(
+            interferogram,
+            context.pair_dir / "wrapped_phase_radar.png",
+        ),
+    }
+    _add_flatten_outputs(result, flatten_options)
     _write_stage_outputs_record(
         output_dir=context.pair_dir,
         stage="p2",
         master_manifest_path=context.master_manifest_path,
         slave_manifest_path=context.slave_manifest_path,
-        backend_used=backend_used,
+        backend_used=stage_backend,
         output_files=result,
         fallback_reason=fallback_reason,
     )
-    return result, backend_used, fallback_reason
+    return result, stage_backend, fallback_reason
 
 
 def _build_icu_unwrapper():
@@ -3127,35 +4506,70 @@ def _unwrap_with_snaphu(
     interferogram: np.ndarray,
     coherence: np.ndarray,
     scratch_dir: Path,
+    config_overrides: dict | None = None,
 ) -> np.ndarray:
     import snaphu
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
+    cfg = dict(SNAPHU_DEFAULTS)
+    if config_overrides:
+        cfg.update(config_overrides)
+
+    # Dynamic tiling: if image > 5000x5000, use 2x2 tiles with 600 overlap
+    rows, cols = interferogram.shape
+    if rows > 5000 and cols > 5000:
+        cfg["ntiles"] = (2, 2)
+        cfg["tile_overlap"] = (600, 600)
+        print(f"[SNAPHU] Large image detected ({rows}x{cols}), using 2x2 tiles with 600 overlap")
+
     unw = np.zeros(interferogram.shape, dtype=np.float32)
     conncomp = np.zeros(interferogram.shape, dtype=np.uint32)
     snaphu.unwrap(
         interferogram.astype(np.complex64),
         coherence.astype(np.float32),
-        SNAPHU_DEFAULTS["nlooks"],
+        cfg["nlooks"],
         unw=unw,
         conncomp=conncomp,
-        cost=SNAPHU_DEFAULTS["cost_mode"],
-        init=SNAPHU_DEFAULTS["initialization_method"],
-        min_conncomp_frac=SNAPHU_DEFAULTS["min_conncomp_frac"],
-        phase_grad_window=SNAPHU_DEFAULTS["phase_grad_window"],
-        ntiles=SNAPHU_DEFAULTS["ntiles"],
-        tile_overlap=SNAPHU_DEFAULTS["tile_overlap"],
-        nproc=SNAPHU_DEFAULTS["nproc"],
-        tile_cost_thresh=SNAPHU_DEFAULTS["tile_cost_thresh"],
-        min_region_size=SNAPHU_DEFAULTS["min_region_size"],
-        single_tile_reoptimize=SNAPHU_DEFAULTS["single_tile_reoptimize"],
-        regrow_conncomps=SNAPHU_DEFAULTS["regrow_conncomps"],
+        cost=cfg["cost_mode"],
+        init=cfg["initialization_method"],
+        min_conncomp_frac=cfg["min_conncomp_frac"],
+        phase_grad_window=cfg["phase_grad_window"],
+        ntiles=cfg["ntiles"],
+        tile_overlap=cfg["tile_overlap"],
+        nproc=cfg["nproc"],
+        tile_cost_thresh=cfg["tile_cost_thresh"],
+        min_region_size=cfg["min_region_size"],
+        single_tile_reoptimize=cfg["single_tile_reoptimize"],
+        regrow_conncomps=cfg["regrow_conncomps"],
         scratchdir=scratch_dir,
         delete_scratch=True,
     )
     if not np.any(np.isfinite(unw)):
         raise RuntimeError("SNAPHU produced no finite pixels")
     return unw.astype(np.float32)
+
+
+def _unwrap_with_snaphu_profiles(
+    interferogram: np.ndarray,
+    coherence: np.ndarray,
+    scratch_dir: Path,
+) -> tuple[np.ndarray, str | None]:
+    errors: list[str] = []
+    for profile_name, overrides in SNAPHU_RETRY_PROFILES:
+        try:
+            result = _unwrap_with_snaphu(
+                interferogram,
+                coherence,
+                scratch_dir / profile_name,
+                config_overrides=overrides,
+            )
+            fallback_reason = None
+            if profile_name != "default":
+                fallback_reason = f"SNAPHU profile={profile_name}"
+            return result, fallback_reason
+        except Exception as exc:
+            errors.append(f"{profile_name}: {exc}")
+    raise RuntimeError(f"SNAPHU failed across profiles: {'; '.join(errors)}")
 
 
 def run_unwrap_stage(
@@ -3178,14 +4592,27 @@ def run_unwrap_stage(
         interferogram = _load_cached_array(context.pair_dir, "p2", "interferogram")
     coherence = _load_cached_array(context.pair_dir, "p2", "coherence")
 
+    fallback_reason = None
     with tempfile.TemporaryDirectory(prefix="strip_insar2_unwrap_", dir=str(context.pair_dir)) as tmpdir:
         scratch = Path(tmpdir)
-        if unwrap_method == "icu":
-            unwrapped_phase = _unwrap_with_icu(interferogram, coherence, scratch)
-        elif unwrap_method == "snaphu":
-            unwrapped_phase = _unwrap_with_snaphu(interferogram, coherence, scratch)
-        else:
+        if unwrap_method != "icu":
             raise ValueError(f"unsupported unwrap method: {unwrap_method}")
+        try:
+            unwrapped_phase = _unwrap_with_icu(interferogram, coherence, scratch / "icu")
+        except Exception as icu_exc:
+            try:
+                unwrapped_phase, snaphu_fallback = _unwrap_with_snaphu_profiles(
+                    interferogram,
+                    coherence,
+                    scratch / "snaphu",
+                )
+                fallback_reason = f"ICU failed, fell back to SNAPHU: {icu_exc}"
+                if snaphu_fallback:
+                    fallback_reason += f"; {snaphu_fallback}"
+            except Exception as snaphu_exc:
+                raise RuntimeError(
+                    f"ICU failed ({icu_exc}); SNAPHU fallback also failed ({snaphu_exc})"
+                ) from snaphu_exc
 
     output_files = {
         "unwrapped_phase": _save_stage_array(context.pair_dir, "p3", "unwrapped_phase", unwrapped_phase)
@@ -3197,8 +4624,9 @@ def run_unwrap_stage(
         slave_manifest_path=context.slave_manifest_path,
         backend_used="cpu",
         output_files=output_files,
+        fallback_reason=fallback_reason,
     )
-    return output_files, "cpu", None
+    return output_files, "cpu", fallback_reason
 
 
 def compute_los_displacement(unwrapped_phase: np.ndarray, wavelength: float) -> np.ndarray:
@@ -3244,7 +4672,7 @@ def write_insar_hdf(
     wavelength: float,
     unwrap_method: str,
     output_h5: str,
-    block_rows: int = 256,
+    block_rows: int = ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
     filtered_interferogram: np.ndarray | None = None,
 ) -> str:
     master_amp = _compute_slc_amplitude(master_slc_path)
@@ -3327,8 +4755,10 @@ def write_primary_product(
         block_rows=block_rows,
         filtered_interferogram=filtered_interferogram,
     )
+    progress = _StageProgress("p5")
 
     def _gpu():
+        progress.running(backend="gpu", detail="rdr2geo/topo", elapsed=0.0, force=True)
         return append_topo_coordinates_hdf(
             str(context.master_manifest_path),
             context.resolved_dem,
@@ -3337,6 +4767,7 @@ def write_primary_product(
             orbit_interp=context.orbit_interp,
             use_gpu=True,
             gpu_id=gpu_id,
+            progress_reporter=progress,
         )
 
     def _cpu():
@@ -3347,15 +4778,19 @@ def write_primary_product(
             block_rows=block_rows,
             orbit_interp=context.orbit_interp,
             use_gpu=False,
+            progress_reporter=progress,
         )
 
-    _, backend_used, fallback_reason = run_stage_with_fallback(
-        stage_name="coordinates",
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        gpu_runner=_gpu,
-        cpu_runner=_cpu,
-    )
+    try:
+        _, backend_used, fallback_reason = run_stage_with_fallback(
+            stage_name="coordinates",
+            gpu_mode=gpu_mode,
+            gpu_id=gpu_id,
+            gpu_runner=_gpu,
+            cpu_runner=_cpu,
+        )
+    finally:
+        progress.close()
     append_utm_coordinates_hdf(
         output_h5,
         str(context.master_manifest_path),
@@ -3383,7 +4818,7 @@ def process_strip_insar2(
     gpu_id: int = 0,
     unwrap_method: str = "icu",
     resolution_meters: float = 20.0,
-    block_rows: int = 256,
+    block_rows: int | None = None,
     dem_path: str | None = None,
     dem_cache_dir: str | None = None,
     dem_margin_deg: float = 0.2,
@@ -3400,16 +4835,21 @@ def process_strip_insar2(
     stage_backends: dict[str, str] = {}
     fallback_reasons: dict[str, str] = {}
 
+    geometry_block_rows, crossmul_block_rows = _resolve_stage_block_rows(block_rows)
+
+    _log_stage_status("p0", "START")
     _, backend_used, fallback_reason = run_geo2rdr_stage(
         context,
         gpu_mode=gpu_mode,
         gpu_id=gpu_id,
-        block_rows=block_rows,
+        block_rows=geometry_block_rows,
     )
     stage_backends["geo2rdr"] = backend_used
     if fallback_reason:
         fallback_reasons["geo2rdr"] = fallback_reason
+    _log_stage_status("p0", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
+    _log_stage_status("p1", "START")
     p1_outputs, backend_used, fallback_reason = run_resample_stage(
         context,
         gpu_mode=gpu_mode,
@@ -3418,48 +4858,58 @@ def process_strip_insar2(
     stage_backends["resample"] = backend_used
     if fallback_reason:
         fallback_reasons["resample"] = fallback_reason
+    _log_stage_status("p1", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
+    _log_stage_status("p2", "START")
     _, backend_used, fallback_reason = run_crossmul_stage(
         context,
         gpu_mode=gpu_mode,
         gpu_id=gpu_id,
-        block_rows=block_rows,
+        block_rows=crossmul_block_rows,
     )
     stage_backends["crossmul"] = backend_used
     if fallback_reason:
         fallback_reasons["crossmul"] = fallback_reason
+    _log_stage_status("p2", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
+    _log_stage_status("p3", "START")
     _, backend_used, fallback_reason = run_unwrap_stage(
         context,
         unwrap_method=unwrap_method,
-        block_rows=block_rows,
+        block_rows=geometry_block_rows,
     )
     stage_backends["unwrap"] = backend_used
     if fallback_reason:
         fallback_reasons["unwrap"] = fallback_reason
+    _log_stage_status("p3", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
+    _log_stage_status("p4", "START")
     _, backend_used, fallback_reason = run_los_stage(context)
     stage_backends["los"] = backend_used
     if fallback_reason:
         fallback_reasons["los"] = fallback_reason
+    _log_stage_status("p4", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
+    _log_stage_status("p5", "START")
     output_h5, backend_used, fallback_reason = write_primary_product(
         context,
         p1_outputs=p1_outputs,
         gpu_mode=gpu_mode,
         gpu_id=gpu_id,
-        block_rows=block_rows,
+        block_rows=geometry_block_rows,
         unwrap_method=unwrap_method,
     )
     stage_backends["product"] = backend_used
     if fallback_reason:
         fallback_reasons["product"] = fallback_reason
+    _log_stage_status("p5", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
+    _log_stage_status("p6", "START")
     exported = export_insar_products(
         input_h5=output_h5,
         output_paths=context.output_paths,
         resolution_meters=resolution_meters,
-        block_rows=min(block_rows, 64),
+        block_rows=min(geometry_block_rows, 64),
         generate_kml=not no_kml,
     )
     _write_custom_stage_record(
@@ -3472,6 +4922,7 @@ def process_strip_insar2(
         fallback_reason=None,
         upstream_stage_dependencies=["p5"],
     )
+    _log_stage_status("p6", "DONE", backend_used="cpu")
 
     return {
         "pair_name": context.pair_name,
@@ -3501,29 +4952,42 @@ def main() -> None:
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--gpu-mode", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--gpu-id", type=int, default=0)
-    parser.add_argument("--unwrap-method", choices=["icu", "snaphu"], default="icu")
+    parser.add_argument("--unwrap-method", choices=["icu"], default="icu")
     parser.add_argument("--resolution", type=float, default=20.0)
-    parser.add_argument("--block-rows", type=int, default=256)
+    parser.add_argument("--block-rows", type=int, default=None)
     parser.add_argument("--dem-path")
     parser.add_argument("--dem-cache-dir")
     parser.add_argument("--dem-margin-deg", type=float, default=0.2)
     parser.add_argument("--no-kml", action="store_true")
     args = parser.parse_args()
 
-    result = process_strip_insar2(
-        args.master_json,
-        args.slave_json,
-        output_root=args.output_root,
-        gpu_mode=args.gpu_mode,
-        gpu_id=args.gpu_id,
-        unwrap_method=args.unwrap_method,
-        resolution_meters=args.resolution,
-        block_rows=args.block_rows,
-        dem_path=args.dem_path,
-        dem_cache_dir=args.dem_cache_dir,
-        dem_margin_deg=args.dem_margin_deg,
-        no_kml=args.no_kml,
-    )
+    try:
+        result = process_strip_insar2(
+            args.master_json,
+            args.slave_json,
+            output_root=args.output_root,
+            gpu_mode=args.gpu_mode,
+            gpu_id=args.gpu_id,
+            unwrap_method=args.unwrap_method,
+            resolution_meters=args.resolution,
+            block_rows=args.block_rows,
+            dem_path=args.dem_path,
+            dem_cache_dir=args.dem_cache_dir,
+            dem_margin_deg=args.dem_margin_deg,
+            no_kml=args.no_kml,
+        )
+    except Exception as exc:
+        show_traceback = str(os.environ.get("D2SAR_STRIP_INSAR2_TRACEBACK", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if show_traceback:
+            traceback.print_exc()
+        else:
+            print(f"[strip_insar2] ERROR: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

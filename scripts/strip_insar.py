@@ -2833,7 +2833,9 @@ def _run_geo2rdr(
         # Merge into single output TIFF
         out_tif = str(output_dir / f"geo2rdr_{'master' if is_master else 'slave'}.tif")
         _merge_tiffs(
-            [str(tmp_dir / p) for p in ["lon.tif", "lat.tif", "hgt.tif"]], out_tif
+            [str(tmp_dir / p) for p in ["lon.tif", "lat.tif", "hgt.tif"]],
+            out_tif,
+            dtype=gdal.GDT_Float64,
         )
         set_epsg_4326(out_tif)
         return out_tif
@@ -3447,7 +3449,12 @@ def _make_raster(
     return isce3.io.Raster(path, width, length, 1, dtype, "GTiff")
 
 
-def _merge_tiffs(input_tifs: list[str], output_tif: str):
+def _merge_tiffs(
+    input_tifs: list[str],
+    output_tif: str,
+    *,
+    dtype: int = gdal.GDT_Float32,
+):
     """Merge multiple single-band TIFFs into a multi-band TIFF."""
     from osgeo import gdal
 
@@ -3478,7 +3485,7 @@ def _merge_tiffs(input_tifs: list[str], output_tif: str):
             width,
             height,
             len(src_datasets),
-            gdal.GDT_Float32,
+            dtype,
             options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
         )
         if out_ds is None:
@@ -3497,7 +3504,7 @@ def _merge_tiffs(input_tifs: list[str], output_tif: str):
                     nrows,
                     buf_xsize=width,
                     buf_ysize=nrows,
-                    buf_type=gdal.GDT_Float32,
+                    buf_type=dtype,
                 )
                 if chunk is None:
                     raise RuntimeError(f"failed to read block from input TIFF: {input_tifs[band_index - 1]}")
@@ -3509,7 +3516,7 @@ def _merge_tiffs(input_tifs: list[str], output_tif: str):
                     chunk,
                     buf_xsize=width,
                     buf_ysize=nrows,
-                    buf_type=gdal.GDT_Float32,
+                    buf_type=dtype,
                 )
             dst_band.FlushCache()
         out_ds.FlushCache()

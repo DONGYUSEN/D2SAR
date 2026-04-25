@@ -1062,9 +1062,9 @@ def append_topo_coordinates_hdf(
                 "GTiff",
             )
 
-        x_raster = make_raster("x")
-        y_raster = make_raster("y")
-        z_raster = make_raster("z")
+        x_raster = make_raster("x", gdal.GDT_Float64)
+        y_raster = make_raster("y", gdal.GDT_Float64)
+        z_raster = make_raster("z", gdal.GDT_Float64)
         inc_raster = make_raster("inc")
         hdg_raster = make_raster("hdg")
         local_inc_raster = make_raster("localInc")
@@ -1683,10 +1683,38 @@ def write_wrapped_phase_png(
         block_rows=block_rows,
     )
     rgb = np.zeros((*phase.shape, 3), dtype=np.uint8)
+    value = np.ones(phase.shape, dtype=np.float64)
+    try:
+        avg_amplitude, _ = accumulate_utm_grid(
+            input_h5,
+            dataset_name="avg_amplitude",
+            target_width=phase.shape[1],
+            target_height=phase.shape[0],
+            block_rows=block_rows,
+        )
+        avg_amplitude, _ = prepare_display_grid(
+            avg_amplitude,
+            confidence_interval_pct=98.0,
+        )
+        amp_valid = np.isfinite(avg_amplitude) & (avg_amplitude > 0)
+        if np.any(amp_valid):
+            amp_db = 10.0 * np.log10(avg_amplitude[amp_valid])
+            p2 = float(np.percentile(amp_db, 2))
+            p98 = float(np.percentile(amp_db, 98))
+            scaled = np.clip((amp_db - p2) / (p98 - p2 + 1.0e-9), 0.0, 1.0)
+            value[:] = 0.15
+            value[amp_valid] = np.clip(scaled, 0.15, 1.0)
+    except Exception:
+        pass
     valid = np.isfinite(phase)
     if np.any(valid):
         hue = ((phase[valid] + np.pi) / (2.0 * np.pi)).astype(np.float64)
-        colors = np.array([colorsys.hsv_to_rgb(float(h), 1.0, 1.0) for h in hue])
+        colors = np.array(
+            [
+                colorsys.hsv_to_rgb(float(h), 1.0, float(v))
+                for h, v in zip(hue, value[valid], strict=False)
+            ]
+        )
         rgb[valid] = (colors * 255.0).astype(np.uint8)
     Image.fromarray(rgb, mode="RGB").save(output_png)
     return str(output_png)

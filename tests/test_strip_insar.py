@@ -14,6 +14,8 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import strip_insar
+import common_processing
+import insar_registration
 
 from strip_insar import (
     detect_sensor_from_manifest,
@@ -203,6 +205,198 @@ class StripInSARTests(unittest.TestCase):
             all(dtype == strip_insar.gdal.GDT_Float64 for _name, dtype in topo_rasters),
             topo_rasters,
         )
+
+    def test_run_geo2rdr_merges_topo_tiff_as_float64(self):
+        class FakeRaster:
+            def close_dataset(self):
+                pass
+
+        class FakeTopo:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def topo(self, *args, **kwargs):
+                return None
+
+        class FakeGrid:
+            def __init__(self, width=16, length=8):
+                self.width = width
+                self.length = length
+
+        class FakeSRS:
+            def ImportFromEPSG(self, _epsg):
+                return None
+
+            def SetAxisMappingStrategy(self, _strategy):
+                return None
+
+            def ExportToWkt(self):
+                return "EPSG:4326"
+
+        class FakeDataset:
+            def SetProjection(self, _wkt):
+                return None
+
+            def FlushCache(self):
+                return None
+
+        fake_isce3 = types.SimpleNamespace(
+            io=types.SimpleNamespace(Raster=mock.Mock(return_value=FakeRaster())),
+            geometry=types.SimpleNamespace(Rdr2Geo=FakeTopo),
+            core=types.SimpleNamespace(
+                Ellipsoid=mock.Mock(return_value=object()),
+                LUT2d=mock.Mock(return_value=object()),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "out"
+            with (
+                mock.patch("strip_insar._load_master_metadata", side_effect=[
+                    ({}, {}, {}, {}, {}),
+                    ({}, {}, {}, {}, {}),
+                ]),
+                mock.patch("strip_insar.construct_orbit", return_value=object()),
+                mock.patch("strip_insar.construct_radar_grid", side_effect=[
+                    FakeGrid(),
+                    FakeGrid(),
+                ]),
+                mock.patch("strip_insar._construct_doppler_if_possible", return_value=None),
+                mock.patch("strip_insar._make_raster", return_value=FakeRaster()),
+                mock.patch("strip_insar._merge_tiffs") as mock_merge_tiffs,
+                mock.patch("strip_insar.gdal.BuildVRT", return_value=FakeDataset()),
+                mock.patch("strip_insar.gdal.Open", return_value=FakeDataset()),
+                mock.patch("strip_insar.osr.SpatialReference", return_value=FakeSRS()),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "isce3": fake_isce3,
+                        "isce3.io": fake_isce3.io,
+                        "isce3.core": fake_isce3.core,
+                        "isce3.geometry": fake_isce3.geometry,
+                    },
+                ),
+                mock.patch.object(strip_insar, "isce3", fake_isce3, create=True),
+            ):
+                _run_geo2rdr(
+                    master_manifest_path="/tmp/master.json",
+                    slave_manifest_path="/tmp/slave.json",
+                    dem_path="/tmp/dem.tif",
+                    orbit_interp="Legendre",
+                    use_gpu=False,
+                    gpu_id=0,
+                    output_dir=out_dir,
+                )
+
+        self.assertEqual(mock_merge_tiffs.call_count, 2)
+        for call in mock_merge_tiffs.call_args_list:
+            self.assertEqual(call.kwargs.get("dtype"), strip_insar.gdal.GDT_Float64)
+
+    def test_common_processing_append_topo_coordinates_uses_float64_xyz(self):
+        class FakeRaster:
+            created = []
+
+            def __init__(self, *args, **kwargs):
+                if len(args) >= 6:
+                    FakeRaster.created.append((Path(args[0]).name, args[4]))
+
+            def close_dataset(self):
+                pass
+
+        class FakeTopo:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def topo(self, *args, **kwargs):
+                raise RuntimeError("stop_after_raster_creation")
+
+        class FakeGrid:
+            def __init__(self, width=16, length=8):
+                self.width = width
+                self.length = length
+
+        fake_isce3 = types.SimpleNamespace(
+            io=types.SimpleNamespace(Raster=FakeRaster),
+            geometry=types.SimpleNamespace(Rdr2Geo=FakeTopo),
+            core=types.SimpleNamespace(
+                Ellipsoid=mock.Mock(return_value=object()),
+                LUT2d=mock.Mock(return_value=object()),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps({"metadata": {}}), encoding="utf-8")
+            output_h5 = root / "out.h5"
+
+            radargrid_path = root / "radargrid.json"
+            orbit_path = root / "orbit.json"
+            acquisition_path = root / "acquisition.json"
+            radargrid_path.write_text(json.dumps({"numberOfColumns": 16, "numberOfRows": 8}), encoding="utf-8")
+            orbit_path.write_text(json.dumps({}), encoding="utf-8")
+            acquisition_path.write_text(json.dumps({}), encoding="utf-8")
+
+            def fake_resolve(_manifest_path, _manifest, key):
+                return str(
+                    {
+                        "radargrid": radargrid_path,
+                        "orbit": orbit_path,
+                        "acquisition": acquisition_path,
+                    }[key]
+                )
+
+            FakeRaster.created = []
+            with (
+                mock.patch("common_processing.resolve_manifest_metadata_path", side_effect=fake_resolve),
+                mock.patch("common_processing.choose_orbit_interp", return_value="Legendre"),
+                mock.patch("common_processing.construct_orbit", return_value=object()),
+                mock.patch("common_processing.construct_radar_grid", return_value=FakeGrid()),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "isce3": fake_isce3,
+                        "isce3.io": fake_isce3.io,
+                        "isce3.core": fake_isce3.core,
+                        "isce3.geometry": fake_isce3.geometry,
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "stop_after_raster_creation"),
+            ):
+                common_processing.append_topo_coordinates_hdf(
+                    manifest_path=str(manifest_path),
+                    dem_path="/tmp/dem.tif",
+                    output_h5=str(output_h5),
+                    block_rows=8,
+                    use_gpu=False,
+                )
+
+        topo_rasters = [
+            (name, dtype)
+            for name, dtype in FakeRaster.created
+            if name in {"x.tif", "y.tif", "z.tif"}
+        ]
+        self.assertEqual(len(topo_rasters), 3)
+        self.assertTrue(
+            all(dtype == common_processing.gdal.GDT_Float64 for _name, dtype in topo_rasters),
+            topo_rasters,
+        )
+
+    def test_insar_registration_write_offset_raster_preserves_float64(self):
+        from osgeo import gdal
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "range.off.tif"
+            data = np.array([[1.25, 2.5], [3.75, 4.125]], dtype=np.float64)
+            insar_registration._write_offset_raster(path, data)
+
+            ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+            self.assertIsNotNone(ds)
+            self.assertEqual(ds.GetRasterBand(1).DataType, gdal.GDT_Float64)
+            out = ds.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            ds = None
+
+        np.testing.assert_allclose(out, data)
 
     def test_detect_sensor_rejects_unknown(self):
         with tempfile.TemporaryDirectory() as tmpdir:

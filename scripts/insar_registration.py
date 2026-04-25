@@ -723,32 +723,42 @@ def run_cpu_dense_offsets(
             slave_cleanup()
 
 
-def _write_offset_raster(path: Path, data: np.ndarray | None) -> str:
+def _write_offset_raster(
+    path: Path,
+    data: np.ndarray | None,
+    *,
+    dtype: int | None = None,
+) -> str:
     """Write offset raster. If data is None, creates a 1x1 zero raster (legacy/caller must handle size mismatch)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if dtype is None:
+        dtype = gdal.GDT_Float32
+        if data is not None and np.asarray(data).dtype == np.dtype(np.float64):
+            dtype = gdal.GDT_Float64
+    np_dtype = np.float64 if dtype == gdal.GDT_Float64 else np.float32
     if data is None:
-        ds = gdal.GetDriverByName("GTiff").Create(str(path), 1, 1, 1, gdal.GDT_Float32)
+        ds = gdal.GetDriverByName("GTiff").Create(str(path), 1, 1, 1, dtype)
         ds.GetRasterBand(1).WriteRaster(
             0,
             0,
             1,
             1,
-            np.zeros((1, 1), dtype=np.float32).tobytes(),
+            np.zeros((1, 1), dtype=np_dtype).tobytes(),
             buf_xsize=1,
             buf_ysize=1,
-            buf_type=gdal.GDT_Float32,
+            buf_type=dtype,
         )
         ds = None
         return str(path)
     rows, cols = data.shape
     ds = gdal.GetDriverByName("GTiff").Create(
-        str(path), cols, rows, 1, gdal.GDT_Float32, options=["COMPRESS=LZW", "TILED=YES"]
+        str(path), cols, rows, 1, dtype, options=["COMPRESS=LZW", "TILED=YES"]
     )
     band = ds.GetRasterBand(1)
     block_rows = 512
     for row0 in range(0, rows, block_rows):
         nrows = min(block_rows, rows - row0)
-        block = np.ascontiguousarray(data[row0 : row0 + nrows, :], dtype=np.float32)
+        block = np.ascontiguousarray(data[row0 : row0 + nrows, :], dtype=np_dtype)
         band.WriteRaster(
             0,
             row0,
@@ -757,7 +767,7 @@ def _write_offset_raster(path: Path, data: np.ndarray | None) -> str:
             block.tobytes(),
             buf_xsize=cols,
             buf_ysize=nrows,
-            buf_type=gdal.GDT_Float32,
+            buf_type=dtype,
         )
     band.FlushCache()
     ds = None
@@ -2014,6 +2024,7 @@ def run_resamp_isce3_v2(
                 block_size_az=block_size_az,
                 block_size_rg=block_size_rg,
                 fill_value=np.complex64(0.0 + 0.0j),
+                quiet=True,
                 with_gpu=use_gpu,
             )
             del writer
@@ -2710,8 +2721,20 @@ def write_registration_outputs(
         final_row_offset[~coarse_valid_mask] = GEO2RDR_OFFSET_NODATA
         final_col_offset[~coarse_valid_mask] = GEO2RDR_OFFSET_NODATA
 
-    rg_offset_path = Path(_write_offset_raster(stage_path / "range.off.tif", final_col_offset))
-    az_offset_path = Path(_write_offset_raster(stage_path / "azimuth.off.tif", final_row_offset))
+    rg_offset_path = Path(
+        _write_offset_raster(
+            stage_path / "range.off.tif",
+            np.asarray(final_col_offset, dtype=np.float64),
+            dtype=gdal.GDT_Float64,
+        )
+    )
+    az_offset_path = Path(
+        _write_offset_raster(
+            stage_path / "azimuth.off.tif",
+            np.asarray(final_row_offset, dtype=np.float64),
+            dtype=gdal.GDT_Float64,
+        )
+    )
 
     if dense_model_diagnostics is not None:
         (stage_path / "dense_model_diagnostics.json").write_text(

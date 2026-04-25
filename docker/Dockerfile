@@ -149,6 +149,7 @@ RUN python3 -m pip install --upgrade --no-cache-dir \
         "numpy>=1.26,<2" \
         "scipy>=1.11,<1.14" \
         "matplotlib>=3.8,<3.10" \
+        cupy-cuda12x \
         h5py \
         numba \
         pydantic \
@@ -168,7 +169,8 @@ RUN python3 -m pip install --upgrade --no-cache-dir \
         snaphu \
         pytest \
         scikit-build-core \
-        pysolid
+        pysolid && \
+    python3 -c "import cupy; print('cupy:', cupy.__version__)"
 
 RUN python3 -m pip install --prefix=/opt/isce3 backoff requests
 

@@ -75,6 +75,47 @@ class StripInsarExportTests(unittest.TestCase):
             pixels = [tuple(px) for px in np.array(img).reshape(-1, 3)]
             self.assertGreater(len(set(pixels)), 1)
 
+    def test_write_wrapped_phase_png_uses_avg_amplitude_for_value_channel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            h5_path = Path(tmpdir) / "insar_value.h5"
+            with h5py.File(h5_path, "w") as f:
+                f.attrs["utm_epsg"] = 32648
+                f.create_dataset(
+                    "utm_x",
+                    data=np.array(
+                        [[500000.0, 500010.0], [500000.0, 500010.0]],
+                        dtype=np.float32,
+                    ),
+                )
+                f.create_dataset(
+                    "utm_y",
+                    data=np.array(
+                        [[3300000.0, 3300000.0], [3299990.0, 3299990.0]],
+                        dtype=np.float32,
+                    ),
+                )
+                f.create_dataset(
+                    "avg_amplitude",
+                    data=np.array([[1.0, 2.0], [4.0, 8.0]], dtype=np.float32),
+                )
+                f.create_dataset(
+                    "interferogram",
+                    data=np.ones((2, 2), dtype=np.complex64),
+                )
+
+            png_path = Path(tmpdir) / "wrapped_value.png"
+            write_wrapped_phase_png(
+                str(h5_path),
+                str(png_path),
+                dataset_name="interferogram",
+                target_width=2,
+                target_height=2,
+            )
+
+            img = np.array(Image.open(png_path).convert("RGB"), dtype=np.uint8)
+            pixel_sums = img.sum(axis=2)
+            self.assertGreater(len(set(int(v) for v in pixel_sums.reshape(-1))), 1)
+
     def test_write_wrapped_phase_geotiff_prefers_strongest_sample_per_cell(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             h5_path = Path(tmpdir) / "insar_overlap.h5"
