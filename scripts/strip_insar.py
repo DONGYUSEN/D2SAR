@@ -317,8 +317,12 @@ class ICUUnwrapper(PhaseUnwrapper):
         ccl_ds = None
         if connected_components is None or not np.any(connected_components):
             raise RuntimeError("ICU unwrapping produced no connected component labels")
+        # Zero-valued unwrapped phase is valid after flattening in quiet areas.
+        # Use connected-component labels, not phase magnitude, to determine validity.
+        result = result.astype(np.float32, copy=False)
+        result[connected_components == 0] = np.nan
         finite_result = result[np.isfinite(result)]
-        if finite_result.size == 0 or not np.any(finite_result != 0.0):
+        if finite_result.size == 0:
             raise RuntimeError("ICU unwrapping produced an empty unwrapped phase")
 
         return result
@@ -362,7 +366,7 @@ class ICUUnwrapper(PhaseUnwrapper):
                     )
                     continue
 
-                tile_valid = np.isfinite(tile_unw) & (tile_unw != 0.0)
+                tile_valid = np.isfinite(tile_unw)
                 if not np.any(tile_valid):
                     continue
 
@@ -2776,19 +2780,19 @@ def _run_geo2rdr(
         # Explicit raster outputs are more stable here than the workdir overload.
         lon_raster = _make_raster(
             str(tmp_dir / "lon.tif"),
-            gdal.GDT_Float32,
+            gdal.GDT_Float64,
             radar_grid.width,
             radar_grid.length,
         )
         lat_raster = _make_raster(
             str(tmp_dir / "lat.tif"),
-            gdal.GDT_Float32,
+            gdal.GDT_Float64,
             radar_grid.width,
             radar_grid.length,
         )
         hgt_raster = _make_raster(
             str(tmp_dir / "hgt.tif"),
-            gdal.GDT_Float32,
+            gdal.GDT_Float64,
             radar_grid.width,
             radar_grid.length,
         )
@@ -3086,12 +3090,16 @@ def _detect_geo2rdr_offset_mode(
     valid &= sample <= 1.0e5
 
     valid_count = int(np.count_nonzero(valid))
-    if valid_count < 64:
+    # For tiny diagnostic rasters, require enough valid samples to make a
+    # decision but do not force the full-sized threshold used for real scenes.
+    min_valid_samples = min(64, max(6, sample.size))
+    if valid_count < min_valid_samples:
         return {
             "mode": "unknown",
             "should_subtract": True,
             "reason": "insufficient_valid_samples",
             "valid_samples": valid_count,
+            "required_valid_samples": int(min_valid_samples),
             "confidence": 0.0,
         }
 
@@ -3106,6 +3114,31 @@ def _detect_geo2rdr_offset_mode(
     centered_vals = vals - float(np.mean(vals))
     denom = float(np.dot(centered_idx, centered_idx))
     slope = float(np.dot(centered_idx, centered_vals) / denom) if denom > 0.0 else float("nan")
+
+    # Small diagnostic rasters can contain nearly constant relative offsets,
+    # especially for azimuth. In that case subtracting the master index
+    # injects most of the observed variation, so prefer "relative".
+    if (
+        np.isfinite(slope)
+        and abs(slope) < 0.2
+        and mean_abs_vals < 500.0
+        and std_vals < max(1.0, std_residual * 0.25)
+    ):
+        return {
+            "axis": axis_name,
+            "mode": "relative",
+            "should_subtract": False,
+            "confidence": 1.0,
+            "valid_samples": valid_count,
+            "slope_vs_master_index": slope,
+            "mean_abs_value": mean_abs_vals,
+            "mean_abs_value_minus_master_index": mean_abs_residual,
+            "std_value": std_vals,
+            "std_value_minus_master_index": std_residual,
+            "vote_absolute": 0,
+            "vote_relative": 3,
+            "reason": "low_variance_relative_offsets",
+        }
 
     absolute_votes = 0
     relative_votes = 0

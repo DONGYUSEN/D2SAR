@@ -3,6 +3,7 @@ import numpy as np
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -12,6 +13,7 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import strip_insar
 
 from strip_insar import (
     detect_sensor_from_manifest,
@@ -32,6 +34,7 @@ from strip_insar import (
     _convert_geo2rdr_abs_to_relative_offsets,
     _write_radar_wrapped_phase_png,
     _estimate_coherence_from_complex_slcs,
+    _run_geo2rdr,
 )
 from insar_filtering import goldstein_filter
 from insar_registration import (
@@ -100,6 +103,105 @@ class StripInSARTests(unittest.TestCase):
         np.testing.assert_allclose(
             _sanitize_geo2rdr_offset_array(arr),
             np.array([[1.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        )
+
+    def test_run_geo2rdr_writes_topo_lon_lat_hgt_as_float64(self):
+        class FakeRaster:
+            def close_dataset(self):
+                pass
+
+        class FakeTopo:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def topo(self, *args, **kwargs):
+                return None
+
+        class FakeGrid:
+            def __init__(self, width=16, length=8):
+                self.width = width
+                self.length = length
+
+        class FakeSRS:
+            def ImportFromEPSG(self, _epsg):
+                return None
+
+            def SetAxisMappingStrategy(self, _strategy):
+                return None
+
+            def ExportToWkt(self):
+                return "EPSG:4326"
+
+        class FakeDataset:
+            def SetProjection(self, _wkt):
+                return None
+
+            def FlushCache(self):
+                return None
+
+        created = []
+
+        def fake_make_raster(path, dtype, width, length):
+            created.append((Path(path).name, dtype, width, length))
+            return FakeRaster()
+
+        fake_isce3 = types.SimpleNamespace(
+            io=types.SimpleNamespace(Raster=mock.Mock(return_value=FakeRaster())),
+            geometry=types.SimpleNamespace(Rdr2Geo=FakeTopo),
+            core=types.SimpleNamespace(
+                Ellipsoid=mock.Mock(return_value=object()),
+                LUT2d=mock.Mock(return_value=object()),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "out"
+            with (
+                mock.patch("strip_insar._load_master_metadata", side_effect=[
+                    ({}, {}, {}, {}, {}),
+                    ({}, {}, {}, {}, {}),
+                ]),
+                mock.patch("strip_insar.construct_orbit", return_value=object()),
+                mock.patch("strip_insar.construct_radar_grid", side_effect=[
+                    FakeGrid(),
+                    FakeGrid(),
+                ]),
+                mock.patch("strip_insar._construct_doppler_if_possible", return_value=None),
+                mock.patch("strip_insar._make_raster", side_effect=fake_make_raster),
+                mock.patch("strip_insar._merge_tiffs"),
+                mock.patch("strip_insar.gdal.BuildVRT", return_value=FakeDataset()),
+                mock.patch("strip_insar.gdal.Open", return_value=FakeDataset()),
+                mock.patch("strip_insar.osr.SpatialReference", return_value=FakeSRS()),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "isce3": fake_isce3,
+                        "isce3.io": fake_isce3.io,
+                        "isce3.core": fake_isce3.core,
+                        "isce3.geometry": fake_isce3.geometry,
+                    },
+                ),
+                mock.patch.object(strip_insar, "isce3", fake_isce3, create=True),
+            ):
+                _run_geo2rdr(
+                    master_manifest_path="/tmp/master.json",
+                    slave_manifest_path="/tmp/slave.json",
+                    dem_path="/tmp/dem.tif",
+                    orbit_interp="Legendre",
+                    use_gpu=False,
+                    gpu_id=0,
+                    output_dir=out_dir,
+                )
+
+        topo_rasters = [
+            (name, dtype)
+            for name, dtype, _width, _length in created
+            if name in {"lon.tif", "lat.tif", "hgt.tif"}
+        ]
+        self.assertEqual(len(topo_rasters), 6)
+        self.assertTrue(
+            all(dtype == strip_insar.gdal.GDT_Float64 for _name, dtype in topo_rasters),
+            topo_rasters,
         )
 
     def test_detect_sensor_rejects_unknown(self):
@@ -243,7 +345,7 @@ class StripInSARTests(unittest.TestCase):
             mock.patch("isce3.io.Raster", FakeRaster),
             mock.patch("isce3.unwrap.ICU") as mock_icu,
             self.assertRaisesRegex(RuntimeError, "valid pixels|connected component"),
-        ):
+            ):
             mock_icu.return_value.unwrap.return_value = None
             ICUUnwrapper().unwrap(
                 np.ones((4, 5), dtype=np.complex64),
@@ -253,6 +355,107 @@ class StripInSARTests(unittest.TestCase):
                 "/tmp/dem.tif",
                 tempfile.mkdtemp(),
             )
+
+    def test_icu_unwrapper_accepts_zero_phase_when_connected_components_exist(self):
+        class FakeBand:
+            def __init__(self, data=None):
+                self.data = data
+
+            def WriteArray(self, data):
+                self.data = data
+
+            def ReadAsArray(self):
+                return self.data
+
+        class FakeDataset:
+            def __init__(self, data=None):
+                self.band = FakeBand(data)
+
+            def GetRasterBand(self, _):
+                return self.band
+
+        class FakeDriver:
+            def Create(self, *args, **kwargs):
+                return FakeDataset()
+
+        class FakeRaster:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def close_dataset(self):
+                pass
+
+        fake_unw = np.zeros((4, 5), dtype=np.float32)
+        fake_ccl = np.ones((4, 5), dtype=np.uint8)
+
+        def fake_open(path):
+            if str(path).endswith("unw.int"):
+                return FakeDataset(fake_unw)
+            if str(path).endswith("ccl.cc"):
+                return FakeDataset(fake_ccl)
+            return FakeDataset()
+
+        fake_gdal = mock.Mock()
+        fake_gdal.GDT_CFloat32 = object()
+        fake_gdal.GDT_Float32 = object()
+        fake_gdal.GDT_Byte = object()
+        fake_gdal.GetDriverByName.return_value = FakeDriver()
+        fake_gdal.Open.side_effect = fake_open
+
+        fake_icu = mock.Mock()
+        fake_icu.unwrap.return_value = None
+        fake_io_module = types.SimpleNamespace(Raster=FakeRaster)
+        fake_unwrap_module = types.SimpleNamespace(ICU=mock.Mock(return_value=fake_icu))
+        import isce3
+
+        with (
+            mock.patch("osgeo.gdal.GetDriverByName", fake_gdal.GetDriverByName),
+            mock.patch("osgeo.gdal.Open", fake_gdal.Open),
+            mock.patch("osgeo.gdal.GDT_CFloat32", fake_gdal.GDT_CFloat32, create=True),
+            mock.patch("osgeo.gdal.GDT_Float32", fake_gdal.GDT_Float32, create=True),
+            mock.patch("osgeo.gdal.GDT_Byte", fake_gdal.GDT_Byte, create=True),
+            mock.patch.dict(sys.modules, {"isce3.io": fake_io_module, "isce3.unwrap": fake_unwrap_module}),
+            mock.patch.object(isce3, "io", fake_io_module, create=True),
+            mock.patch.object(isce3, "unwrap", fake_unwrap_module, create=True),
+            mock.patch("strip_insar._write_band_array", side_effect=lambda band, data, *a, **k: setattr(band, "data", data)),
+            mock.patch("strip_insar._read_band_array", side_effect=lambda band, *a, **k: np.array(band.data, copy=True)),
+        ):
+            result = ICUUnwrapper().unwrap(
+                np.ones((4, 5), dtype=np.complex64),
+                np.ones((4, 5), dtype=np.float32),
+                object(),
+                object(),
+                "/tmp/dem.tif",
+                tempfile.mkdtemp(),
+            )
+
+        np.testing.assert_allclose(result, fake_unw)
+
+    def test_icu_unwrapper_tiled_path_accepts_zero_phase_tiles(self):
+        unwrapper = ICUUnwrapper()
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(
+                unwrapper,
+                "_unwrap_once",
+                side_effect=lambda interferogram, coherence, output_dir: np.zeros(
+                    interferogram.shape, dtype=np.float32
+                ),
+            ),
+            mock.patch.dict("os.environ", {"D2SAR_ICU_TILE_SIZE": "256", "D2SAR_ICU_TILE_OVERLAP": "0"}),
+        ):
+            result = unwrapper.unwrap(
+                np.ones((300, 300), dtype=np.complex64),
+                np.ones((300, 300), dtype=np.float32),
+                object(),
+                object(),
+                "/tmp/dem.tif",
+                tmpdir,
+            )
+
+        self.assertEqual(result.shape, (300, 300))
+        self.assertTrue(np.all(result == 0.0))
 
     def test_icu_unwrapper_falls_back_to_tiled_unwrap(self):
         unwrapper = ICUUnwrapper()
