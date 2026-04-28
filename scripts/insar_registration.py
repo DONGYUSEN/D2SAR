@@ -1779,6 +1779,13 @@ def _input_path_available(path: str | Path) -> bool:
     return _is_vsi_path(path_str) or Path(path_str).exists()
 
 
+def _resample_reader_path(input_slc_path: str | Path) -> str:
+    path_str = str(input_slc_path)
+    if _is_vsi_path(path_str):
+        return path_str
+    return str(Path(path_str))
+
+
 def _maybe_convert_complex_int16(path: str) -> tuple[str, callable | None]:
     try:
         src_ds = gdal.Open(path, gdal.GA_ReadOnly)
@@ -1890,6 +1897,7 @@ def _copy_raster(src: str, dst: Path) -> str:
 def _copy_raster_to_envi_complex64(
     src: str,
     dst: str | Path,
+    slc_metadata: dict | None = None,
 ) -> str:
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1908,16 +1916,65 @@ def _copy_raster_to_envi_complex64(
         if src_ds is None:
             raise RuntimeError(f"failed to open source raster for ENVI copy: {src}")
         try:
-            translated = gdal.Translate(
+            cols = int(src_ds.RasterXSize)
+            rows = int(src_ds.RasterYSize)
+            out_ds = gdal.GetDriverByName("ENVI").Create(
                 str(dst),
-                src_ds,
-                format="ENVI",
-                outputType=gdal.GDT_CFloat32,
-                creationOptions=["INTERLEAVE=BIP"],
+                cols,
+                rows,
+                1,
+                gdal.GDT_CFloat32,
+                options=["INTERLEAVE=BIP"],
             )
-            if translated is None:
-                raise RuntimeError(f"gdal.Translate failed for {src} -> {dst}")
-            translated = None
+            if out_ds is None:
+                raise RuntimeError(f"failed to create ENVI complex raster: {dst}")
+
+            band1 = src_ds.GetRasterBand(1)
+            band1_is_complex = np.issubdtype(
+                _gdal_dtype_to_numpy(band1.DataType), np.complexfloating
+            )
+            band2 = src_ds.GetRasterBand(2) if src_ds.RasterCount >= 2 else None
+            storage_layout = str((slc_metadata or {}).get("storage_layout", "")).lower()
+            force_two_band_iq = storage_layout == "two_band_iq"
+            if force_two_band_iq and band2 is None:
+                raise RuntimeError(
+                    f"SLC metadata declares two_band_iq but raster has {src_ds.RasterCount} band(s): {src}"
+                )
+
+            block_rows = 512
+            out_band = out_ds.GetRasterBand(1)
+            for row0 in range(0, rows, block_rows):
+                nrows = min(block_rows, rows - row0)
+                if (band1_is_complex and not force_two_band_iq) or band2 is None:
+                    data = _read_band_array(
+                        band1,
+                        0,
+                        row0,
+                        cols,
+                        nrows,
+                        dtype=np.complex64,
+                    ).astype(np.complex64, copy=False)
+                else:
+                    real = _read_band_array(
+                        band1,
+                        0,
+                        row0,
+                        cols,
+                        nrows,
+                        dtype=np.float32,
+                    )
+                    imag = _read_band_array(
+                        band2,
+                        0,
+                        row0,
+                        cols,
+                        nrows,
+                        dtype=np.float32,
+                    )
+                    data = (real + 1j * imag).astype(np.complex64, copy=False)
+                out_band.WriteArray(data, 0, row0)
+            out_ds.FlushCache()
+            out_ds = None
         finally:
             src_ds = None
         return str(dst)
@@ -1929,6 +1986,7 @@ def _copy_raster_to_envi_complex64(
 def _materialize_ampcor_input(
     src: str,
     dst_base: str | Path,
+    slc_metadata: dict | None = None,
 ) -> str:
     """Materialize a complex64 raster for Ampcor input.
 
@@ -1936,7 +1994,7 @@ def _materialize_ampcor_input(
     runtime GDAL build does not provide ENVI support.
     """
     try:
-        return _copy_raster_to_envi_complex64(src, dst_base)
+        return _copy_raster_to_envi_complex64(src, dst_base, slc_metadata=slc_metadata)
     except Exception:
         dst_base = Path(dst_base)
         tif_path = dst_base.with_suffix(".tif")
@@ -2003,7 +2061,7 @@ def run_resamp_isce3_v2(
         if writer is None:
             return False, "isce3-v2-resample_slc_blocks writer allocation failed"
 
-        reader_path = str(Path(input_slc_path))
+        reader_path = _resample_reader_path(input_slc_path)
         if use_gpu:
             local_path, cleanup_cb = _extract_to_temp_tiff(reader_path)
         else:
@@ -2256,6 +2314,8 @@ def run_pycuampcor_dense_offsets(
     *,
     master_slc_path: str,
     slave_slc_path: str,
+    master_slc_metadata: dict | None = None,
+    slave_slc_metadata: dict | None = None,
     output_dir: str | Path,
     gpu_id: int = 0,
     window_size: tuple[int, int] = (64, 64),
@@ -2298,8 +2358,16 @@ def run_pycuampcor_dense_offsets(
         out_dir.mkdir(parents=True, exist_ok=True)
         reference_slc_path = out_dir / "reference.slc"
         secondary_slc_path = out_dir / "secondary.slc"
-        master_local = _materialize_ampcor_input(master_slc_path, reference_slc_path)
-        slave_local = _materialize_ampcor_input(slave_slc_path, secondary_slc_path)
+        master_local = _materialize_ampcor_input(
+            master_slc_path,
+            reference_slc_path,
+            slc_metadata=master_slc_metadata,
+        )
+        slave_local = _materialize_ampcor_input(
+            slave_slc_path,
+            secondary_slc_path,
+            slc_metadata=slave_slc_metadata,
+        )
         if not Path(master_local).exists() or not Path(slave_local).exists():
             return (None, None, None) if return_details else (None, None)
         payload = {

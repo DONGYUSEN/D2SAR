@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 import shutil
 import sys
 import xml.etree.ElementTree as ET
@@ -28,6 +29,7 @@ class LutanImporter:
         self.radar_grid = {}
         self.doppler_data = {}
         self.scene_data = {}
+        self.raw_orbit_data = {}
 
     def _prepare_input_path(self) -> None:
         if self.product_path.is_dir():
@@ -150,12 +152,13 @@ class LutanImporter:
         return str(Path(member_name).resolve())
 
     def _relative_to_output(self, output_dir: Path, path_value: str | Path) -> str:
-        path_value = Path(path_value)
-        if not path_value.is_absolute():
-            path_value = path_value.resolve()
-        if self.is_zip or self.is_tar:
-            return str(path_value)
-        return os.path.relpath(str(path_value), str(output_dir.resolve()))
+        path_str = str(path_value)
+        if path_str.startswith("/vsizip/") or path_str.startswith("/vsitar/"):
+            return path_str
+        path_obj = Path(path_value)
+        if not path_obj.is_absolute():
+            path_obj = path_obj.resolve()
+        return str(path_obj)
 
     def _manifest_ref(
         self, output_dir: Path, path_value: str | Path, member: str | None = None
@@ -329,6 +332,73 @@ class LutanImporter:
             "stateVectors": state_vectors,
         }
 
+    def _smooth_orbit_for_import(self, orbit: dict[str, Any]) -> dict[str, Any]:
+        from orbit_smooth import orbit_smooth
+
+        state_vectors = orbit.get("stateVectors", [])
+        if len(state_vectors) < 8:
+            smoothed = copy.deepcopy(orbit)
+            smoothed["smoothed"] = False
+            smoothed["smoothing"] = {
+                "algorithm": "isce2-lutan1-orbit-filter",
+                "status": "skipped-insufficient-state-vectors",
+                "state_vector_count": len(state_vectors),
+            }
+            return smoothed
+
+        import numpy as np
+
+        gps_times = np.array([float(sv["gpsTime"]) for sv in state_vectors], dtype=np.float64)
+        t_rel = gps_times - gps_times[0]
+        pos = np.array(
+            [[sv["posX"], sv["posY"], sv["posZ"]] for sv in state_vectors],
+            dtype=np.float64,
+        )
+        vel = np.array(
+            [[sv["velX"], sv["velY"], sv["velZ"]] for sv in state_vectors],
+            dtype=np.float64,
+        )
+
+        degree = 5
+        sigma = 4.0
+        max_iter = 3
+        ignore_start = -1
+        ignore_end = -1
+        pos_f, vel_f, info = orbit_smooth(
+            t_rel,
+            pos,
+            vel,
+            degree=degree,
+            sigma=sigma,
+            max_iter=max_iter,
+            ignore_start=ignore_start,
+            ignore_end=ignore_end,
+        )
+
+        smoothed = copy.deepcopy(orbit)
+        for idx, sv in enumerate(smoothed["stateVectors"]):
+            sv["posX"] = float(pos_f[idx, 0])
+            sv["posY"] = float(pos_f[idx, 1])
+            sv["posZ"] = float(pos_f[idx, 2])
+            sv["velX"] = float(vel_f[idx, 0])
+            sv["velY"] = float(vel_f[idx, 1])
+            sv["velZ"] = float(vel_f[idx, 2])
+
+        smoothed["smoothed"] = True
+        smoothed["smoothing"] = {
+            "algorithm": "isce2-lutan1-orbit-filter",
+            "status": "applied",
+            "degree": degree,
+            "sigma": sigma,
+            "max_iter": max_iter,
+            "ignore_start": info.get("ignore_start"),
+            "ignore_end": info.get("ignore_end"),
+            "n_outliers": info.get("n_outliers", 0),
+            "methods": info.get("methods", []),
+            "used_spline": info.get("used_spline", False),
+        }
+        return smoothed
+
     def extract_doppler(self, root: ET.Element) -> dict[str, Any]:
         doppler_elem = root.find("processing/doppler")
         centroid = doppler_elem.find("dopplerCentroid")
@@ -462,7 +532,17 @@ class LutanImporter:
             "incidenceAngleCenter": scene_info["sceneCenterCoord"]["incidenceAngle"],
         }
 
-        self.orbit_data = orbit
+        self.raw_orbit_data = copy.deepcopy(orbit)
+        print("[LutanImporter] Smoothing orbit with ISCE2-compatible Lutan1 filter...")
+        self.orbit_data = self._smooth_orbit_for_import(orbit)
+        smoothing = self.orbit_data.get("smoothing", {})
+        print(
+            "[LutanImporter] Orbit smoothing "
+            f"status={smoothing.get('status')} "
+            f"n_outliers={smoothing.get('n_outliers', 0)} "
+            f"ignore_start={smoothing.get('ignore_start')} "
+            f"ignore_end={smoothing.get('ignore_end')}"
+        )
         self.radar_grid = {
             "numberOfRows": image_info["numberOfRows"],
             "numberOfColumns": image_info["numberOfColumns"],
@@ -520,6 +600,10 @@ class LutanImporter:
         with open(orbit_file, "w", encoding="utf-8") as f:
             json.dump(self.orbit_data, f, indent=2, ensure_ascii=False)
 
+        raw_orbit_file = metadata_dir / "orbit.raw.json"
+        with open(raw_orbit_file, "w", encoding="utf-8") as f:
+            json.dump(self.raw_orbit_data, f, indent=2, ensure_ascii=False)
+
         radargrid_file = metadata_dir / "radargrid.json"
         with open(radargrid_file, "w", encoding="utf-8") as f:
             json.dump(self.radar_grid, f, indent=2, ensure_ascii=False)
@@ -547,12 +631,18 @@ class LutanImporter:
                 "path": slc_ref,
                 "format": "TIFF",
                 "complex": True,
+                "sample_format": "iq_int16",
+                "storage_layout": "two_band_iq",
+                "complex_band_count": 1,
+                "band_mapping": {"real": 1, "imag": 2},
+                "processing_format": "single_band_cfloat32",
                 "rows": self.radar_grid["numberOfRows"],
                 "columns": self.radar_grid["numberOfColumns"],
             },
             "metadata": {
                 "acquisition": self._relative_to_output(output_path, acquisition_file),
                 "orbit": self._relative_to_output(output_path, orbit_file),
+                "orbit_raw": self._relative_to_output(output_path, raw_orbit_file),
                 "radargrid": self._relative_to_output(output_path, radargrid_file),
                 "doppler": self._relative_to_output(output_path, doppler_file),
                 "scene": self._relative_to_output(output_path, scene_file),
@@ -569,10 +659,6 @@ class LutanImporter:
             manifest["ancillary"]["incidenceXML"] = self._manifest_ref(
                 output_path, str(self.product_path.resolve()), self.incidence_xml
             )
-        if self.rpc_file:
-            manifest["ancillary"]["rpc"] = self._manifest_ref(
-                output_path, str(self.product_path.resolve()), self.rpc_file
-            )
         if self.meta_xml:
             manifest["ancillary"]["metaXML"] = self._manifest_ref(
                 output_path, str(self.product_path.resolve()), self.meta_xml
@@ -588,6 +674,7 @@ class LutanImporter:
         print(f"  manifest: {manifest_file}")
         print(f"  acquisition: {acquisition_file}")
         print(f"  orbit: {orbit_file}")
+        print(f"  orbit_raw: {raw_orbit_file}")
         print(f"  radargrid: {radargrid_file}")
         print(f"  doppler: {doppler_file}")
         print(f"  scene: {scene_file}")

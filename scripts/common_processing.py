@@ -175,6 +175,84 @@ def resolve_manifest_data_path(manifest_path: str | Path, entry) -> str | None:
                 return str(candidate)
         return resolved
 
+    def _find_archive_candidate(path_str: str) -> str:
+        path_obj = Path(path_str)
+        candidates: list[Path] = [path_obj]
+        name = path_obj.name
+        if name:
+            candidates.extend(
+                [
+                    manifest_dir / name,
+                    manifest_dir / "temp" / name,
+                    manifest_dir.parent / name,
+                    manifest_dir.parent / "temp" / name,
+                    Path.cwd() / name,
+                    Path("/results") / name,
+                    Path("/work") / name,
+                    Path("/tmp") / name,
+                    Path("/temp") / name,
+                ]
+            )
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return str(candidate.resolve())
+            except Exception:
+                continue
+        return path_str
+
+    def _normalize_vsi_archive_path(vsi_path: str) -> str:
+        def _split_archive_member(path: str, storage: str) -> tuple[str, str] | None:
+            lower = path.lower()
+            if storage == "tar":
+                markers = (".tar.gz/", ".tgz/", ".tar/")
+            else:
+                markers = (".zip/",)
+            for marker in markers:
+                idx = lower.find(marker)
+                if idx < 0:
+                    continue
+                archive_end = idx + len(marker) - 1
+                archive = path[:archive_end]
+                member = path[archive_end + 1 :]
+                if archive and member:
+                    return archive, member
+            return None
+
+        if vsi_path.startswith("/vsitar/"):
+            prefix = "/vsitar/"
+            storage = "tar"
+        elif vsi_path.startswith("/vsizip/"):
+            prefix = "/vsizip/"
+            storage = "zip"
+        else:
+            return vsi_path
+
+        remainder = vsi_path[len(prefix) :]
+        split = _split_archive_member(remainder, storage)
+        if split is None:
+            return vsi_path
+        archive_part, member = split
+
+        archive_path = Path(archive_part)
+        if archive_path.is_absolute():
+            resolved_archive = str(archive_path)
+        else:
+            candidate = (manifest_dir / archive_path).resolve()
+            if candidate.exists():
+                resolved_archive = str(candidate)
+            else:
+                rooted_candidate = _remap_legacy_absolute_path("/" + archive_part.lstrip("/"))
+                if Path(rooted_candidate).exists():
+                    resolved_archive = rooted_candidate
+                else:
+                    resolved_archive = str(candidate)
+        if not Path(resolved_archive).exists():
+            resolved_archive = _remap_legacy_absolute_path(resolved_archive)
+        if not Path(resolved_archive).exists():
+            resolved_archive = _find_archive_candidate(resolved_archive)
+        return f"{prefix}{resolved_archive}/{member}"
+
     if entry is None:
         return None
     manifest_dir = Path(manifest_path).parent.resolve()
@@ -192,11 +270,15 @@ def resolve_manifest_data_path(manifest_path: str | Path, entry) -> str | None:
             member = entry.get("member")
             if not member:
                 raise ValueError(f"tar manifest entry missing member: {entry}")
+            if not Path(resolved).exists():
+                resolved = _find_archive_candidate(resolved)
             return f"/vsitar/{resolved}/{member}"
         if entry.get("storage") == "zip":
             member = entry.get("member")
             if not member:
                 raise ValueError(f"zip manifest entry missing member: {entry}")
+            if not Path(resolved).exists():
+                resolved = _find_archive_candidate(resolved)
             resolved_path = Path(resolved)
             if resolved_path.suffix == ".zip":
                 zip_stem = resolved_path.stem
@@ -206,9 +288,9 @@ def resolve_manifest_data_path(manifest_path: str | Path, entry) -> str | None:
         return resolved
     entry = str(entry)
     if entry.startswith("/vsitar/"):
-        return entry
+        return _normalize_vsi_archive_path(entry)
     if entry.startswith("/vsizip/"):
-        return entry
+        return _normalize_vsi_archive_path(entry)
     entry_path = Path(entry)
     resolved = str(entry_path if entry_path.is_absolute() else (manifest_dir / entry_path))
     if not Path(resolved).exists():
@@ -1403,6 +1485,121 @@ def prepare_display_grid(
     return cleaned, info
 
 
+def _stretch_source_grid_for_png(
+    input_h5: str,
+    dataset_name: str,
+    stretch_percent: float = 5.0,
+) -> np.ndarray:
+    with h5py.File(input_h5, "r") as f:
+        data = f[dataset_name][:]
+    data = np.asarray(data, dtype=np.float32)
+    display = np.full(data.shape, np.nan, dtype=np.float32)
+    valid = np.isfinite(data)
+    if dataset_name in {"slc_amplitude", "avg_amplitude", "coherence"}:
+        valid &= data > 0
+    if not np.any(valid):
+        return display
+    lower_pct = float(np.clip(stretch_percent, 0.0, 50.0))
+    upper_pct = 100.0 - lower_pct
+    vals = data[valid].astype(np.float64)
+    lower = float(np.percentile(vals, lower_pct))
+    upper = float(np.percentile(vals, upper_pct))
+    if upper <= lower:
+        display[valid] = 255.0
+        return display
+    scaled = np.clip((data[valid] - lower) / (upper - lower), 0.0, 1.0)
+    display[valid] = (scaled * 255.0).astype(np.float32)
+    return display
+
+
+def _accumulate_source_grid_to_utm(
+    input_h5: str,
+    source_grid: np.ndarray,
+    target_width: int,
+    target_height: int | None = None,
+    block_rows: int = 64,
+) -> tuple[np.ndarray, dict]:
+    input_h5 = Path(input_h5)
+    with h5py.File(input_h5, "r") as f:
+        x_ds = f["utm_x"]
+        y_ds = f["utm_y"]
+        length, width = source_grid.shape
+        if x_ds.shape != source_grid.shape or y_ds.shape != source_grid.shape:
+            raise RuntimeError(
+                f"source grid shape {source_grid.shape} does not match UTM coordinate grids"
+            )
+        utm_epsg = int(f.attrs["utm_epsg"])
+        x_min = np.inf
+        x_max = -np.inf
+        y_min = np.inf
+        y_max = -np.inf
+        for row0 in range(0, length, block_rows):
+            rows = min(block_rows, length - row0)
+            x = x_ds[row0 : row0 + rows, :]
+            y = y_ds[row0 : row0 + rows, :]
+            valid = np.isfinite(x) & np.isfinite(y)
+            if np.any(valid):
+                x_min = min(x_min, float(np.nanmin(x[valid])))
+                x_max = max(x_max, float(np.nanmax(x[valid])))
+                y_min = min(y_min, float(np.nanmin(y[valid])))
+                y_max = max(y_max, float(np.nanmax(y[valid])))
+        aspect = (y_max - y_min) / max(x_max - x_min, 1e-9)
+        if target_height is None:
+            target_height = max(1, int(round(target_width * aspect)))
+        else:
+            target_height = max(1, target_height)
+        sums = np.zeros((target_height, target_width), dtype=np.float64)
+        counts = np.zeros((target_height, target_width), dtype=np.uint32)
+        for row0 in range(0, length, block_rows):
+            rows = min(block_rows, length - row0)
+            x = x_ds[row0 : row0 + rows, :]
+            y = y_ds[row0 : row0 + rows, :]
+            data = source_grid[row0 : row0 + rows, :]
+            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(data)
+            if not np.any(valid):
+                continue
+            x_valid = x[valid]
+            y_valid = y[valid]
+            vals = data[valid].astype(np.float64)
+            col = np.clip(
+                (
+                    (x_valid - x_min)
+                    / max(x_max - x_min, 1e-9)
+                    * (target_width - 1)
+                ).astype(np.int32),
+                0,
+                target_width - 1,
+            )
+            row = np.clip(
+                (
+                    (y_max - y_valid)
+                    / max(y_max - y_min, 1e-9)
+                    * (target_height - 1)
+                ).astype(np.int32),
+                0,
+                target_height - 1,
+            )
+            flat_idx = row * target_width + col
+            np.add.at(sums.ravel(), flat_idx, vals)
+            np.add.at(counts.ravel(), flat_idx, 1)
+
+    out = np.full((target_height, target_width), np.nan, dtype=np.float64)
+    mask = counts > 0
+    out[mask] = sums[mask] / counts[mask]
+    meta = {
+        "utm_epsg": utm_epsg,
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
+        "target_width": target_width,
+        "target_height": target_height,
+        "x_res": (x_max - x_min) / max(target_width - 1, 1),
+        "y_res": (y_max - y_min) / max(target_height - 1, 1),
+    }
+    return out, meta
+
+
 def write_geocoded_geotiff(
     input_h5: str,
     output_tif: str,
@@ -1499,6 +1696,24 @@ def write_geocoded_png(
     confidence_interval_pct: float | None = 98.0,
 ) -> str:
     output_png = Path(output_png)
+    if dataset_name == "avg_amplitude":
+        source_display = _stretch_source_grid_for_png(
+            input_h5, dataset_name, stretch_percent=5.0
+        )
+        out, _ = _accumulate_source_grid_to_utm(
+            input_h5,
+            source_display,
+            target_width=target_width,
+            target_height=target_height,
+            block_rows=block_rows,
+        )
+        img = np.zeros(out.shape, dtype=np.uint8)
+        valid = np.isfinite(out)
+        if np.any(valid):
+            img[valid] = np.rint(np.clip(out[valid], 0.0, 255.0)).astype(np.uint8)
+        Image.fromarray(img, mode="L").save(output_png)
+        return str(output_png)
+
     out, _ = accumulate_utm_grid(
         input_h5,
         dataset_name=dataset_name,
@@ -1682,6 +1897,61 @@ def write_wrapped_phase_png(
         target_height=target_height,
         block_rows=block_rows,
     )
+    rgb = np.zeros((*phase.shape, 3), dtype=np.uint8)
+    value = np.ones(phase.shape, dtype=np.float64)
+    try:
+        avg_amplitude, _ = accumulate_utm_grid(
+            input_h5,
+            dataset_name="avg_amplitude",
+            target_width=phase.shape[1],
+            target_height=phase.shape[0],
+            block_rows=block_rows,
+        )
+        avg_amplitude, _ = prepare_display_grid(
+            avg_amplitude,
+            confidence_interval_pct=98.0,
+        )
+        amp_valid = np.isfinite(avg_amplitude) & (avg_amplitude > 0)
+        if np.any(amp_valid):
+            amp_db = 10.0 * np.log10(avg_amplitude[amp_valid])
+            p2 = float(np.percentile(amp_db, 2))
+            p98 = float(np.percentile(amp_db, 98))
+            scaled = np.clip((amp_db - p2) / (p98 - p2 + 1.0e-9), 0.0, 1.0)
+            value[:] = 0.15
+            value[amp_valid] = np.clip(scaled, 0.15, 1.0)
+    except Exception:
+        pass
+    valid = np.isfinite(phase)
+    if np.any(valid):
+        hue = ((phase[valid] + np.pi) / (2.0 * np.pi)).astype(np.float64)
+        colors = np.array(
+            [
+                colorsys.hsv_to_rgb(float(h), 1.0, float(v))
+                for h, v in zip(hue, value[valid], strict=False)
+            ]
+        )
+        rgb[valid] = (colors * 255.0).astype(np.uint8)
+    Image.fromarray(rgb, mode="RGB").save(output_png)
+    return str(output_png)
+
+
+def write_unwrapped_phase_png(
+    input_h5: str,
+    output_png: str,
+    dataset_name: str = "unwrapped_phase",
+    target_width: int = 2048,
+    target_height: int | None = None,
+    block_rows: int = 64,
+) -> str:
+    output_png = Path(output_png)
+    phase, _ = accumulate_utm_grid(
+        input_h5,
+        dataset_name=dataset_name,
+        target_width=target_width,
+        target_height=target_height,
+        block_rows=block_rows,
+    )
+    phase = np.mod(np.asarray(phase, dtype=np.float64) + np.pi, 2.0 * np.pi) - np.pi
     rgb = np.zeros((*phase.shape, 3), dtype=np.uint8)
     value = np.ones(phase.shape, dtype=np.float64)
     try:

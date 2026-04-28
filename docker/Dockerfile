@@ -51,6 +51,7 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.ed
         pybind11-dev \
         ccache \
         swig \
+        nano \
         python3-numpy \
     && rm -rf /var/lib/apt/lists/*
 

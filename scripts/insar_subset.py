@@ -4,6 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
 from osgeo import gdal
 
 from common_processing import (
@@ -22,9 +23,6 @@ def _copy_or_subset_raster(src_path: str, dst_path: Path, window: tuple[int, int
     if not _is_vsi_path(src_path) and not Path(src_path).exists():
         dst_path.write_bytes(b"")
         return str(dst_path)
-    if window is None:
-        shutil.copyfile(src_path, dst_path)
-        return str(dst_path)
     try:
         ds = gdal.Open(str(src_path), gdal.GA_ReadOnly)
     except Exception:
@@ -33,19 +31,58 @@ def _copy_or_subset_raster(src_path: str, dst_path: Path, window: tuple[int, int
     if ds is None:
         dst_path.write_bytes(b"")
         return str(dst_path)
-    row0, col0, rows, cols = window
-    translated = gdal.Translate(
-        str(dst_path),
-        ds,
-        srcWin=[col0, row0, cols, rows],
-        format="GTiff",
-        creationOptions=["COMPRESS=LZW", "TILED=YES"],
-    )
-    ds = None
-    if translated is None:
+    if window is None:
+        row0, col0 = 0, 0
+        rows = int(ds.RasterYSize)
+        cols = int(ds.RasterXSize)
+    else:
+        row0, col0, rows, cols = window
+    if rows <= 0 or cols <= 0:
+        ds = None
         dst_path.write_bytes(b"")
         return str(dst_path)
-    translated = None
+
+    band1 = ds.GetRasterBand(1).ReadAsArray(int(col0), int(row0), int(cols), int(rows))
+    if band1 is None:
+        ds = None
+        dst_path.write_bytes(b"")
+        return str(dst_path)
+    if np.iscomplexobj(band1):
+        complex_arr = np.asarray(band1, dtype=np.complex64)
+    elif int(ds.RasterCount) >= 2:
+        band2 = ds.GetRasterBand(2).ReadAsArray(int(col0), int(row0), int(cols), int(rows))
+        if band2 is None:
+            band2 = np.zeros_like(band1, dtype=np.float32)
+        complex_arr = np.asarray(band1, dtype=np.float32) + 1j * np.asarray(band2, dtype=np.float32)
+        complex_arr = complex_arr.astype(np.complex64)
+    else:
+        complex_arr = np.asarray(band1, dtype=np.float32).astype(np.complex64)
+
+    gt = ds.GetGeoTransform(can_return_null=True)
+    projection = ds.GetProjectionRef()
+    ds = None
+
+    drv = gdal.GetDriverByName("GTiff")
+    out = drv.Create(
+        str(dst_path),
+        int(cols),
+        int(rows),
+        1,
+        gdal.GDT_CFloat32,
+        options=["COMPRESS=LZW", "TILED=YES"],
+    )
+    if out is None:
+        dst_path.write_bytes(b"")
+        return str(dst_path)
+    if gt is not None:
+        x0 = float(gt[0]) + float(col0) * float(gt[1]) + float(row0) * float(gt[2])
+        y0 = float(gt[3]) + float(col0) * float(gt[4]) + float(row0) * float(gt[5])
+        out.SetGeoTransform((x0, float(gt[1]), float(gt[2]), y0, float(gt[4]), float(gt[5])))
+    if projection:
+        out.SetProjection(projection)
+    out.GetRasterBand(1).WriteArray(complex_arr)
+    out.FlushCache()
+    out = None
     return str(dst_path)
 
 
@@ -160,8 +197,8 @@ def build_cropped_manifest(
     output_name: str,
     window: tuple[int, int, int, int] | None,
 ) -> str:
-    manifest_path = Path(manifest_path)
-    output_dir = Path(output_dir)
+    manifest_path = Path(manifest_path).resolve()
+    output_dir = Path(output_dir).resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     output_stem = output_name.replace("_", ".")
     slc_path = resolve_manifest_data_path(manifest_path, manifest["slc"]["path"])
@@ -187,7 +224,7 @@ def build_cropped_manifest(
 
     slc_entry_out = manifest.get("slc", {})
     if window is None:
-        slc_out_value = slc_entry_out
+        slc_out_value = {"path": slc_path} if isinstance(slc_entry_out, dict) else slc_path
     else:
         slc_tif_out = output_dir / f"{output_stem}.tif"
         slc_vrt_out = output_dir / f"{output_stem}.vrt"
@@ -226,7 +263,6 @@ def build_cropped_manifest(
         }
     )
     processing = dict(new_manifest.get("processing", {}))
-    processing.pop("insar_preprocess", None)
     processing["insar_crop"] = {
         "source_manifest": str(manifest_path),
         "output_manifest": str(manifest_out),

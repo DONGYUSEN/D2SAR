@@ -48,18 +48,36 @@ ICU_DEFAULTS = {
     "phase_variance_threshold": 8.0,
 }
 
+ICU_RELAXED_OVERRIDES = {
+    "overlap_lines": 400,
+    "use_phase_gradient_neutron": True,
+    "phase_gradient_window_size": 7,
+    "neutron_phase_gradient_threshold": 1.5,
+    "trees_number": 12,
+    "max_branch_length": 128,
+    "initial_correlation_threshold": 0.015,
+    "max_correlation_threshold": 0.55,
+    "correlation_threshold_increments": 0.03,
+    "min_tile_area": 0.0005,
+    "bootstrap_lines": 12,
+    "min_overlap_area": 8,
+    "phase_variance_threshold": 15.0,
+}
+
+ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY = 0.01
+
 SNAPHU_DEFAULTS = {
     "nlooks": 1.0,
-    "cost_mode": "smooth",
+    "cost_mode": "defo",
     "initialization_method": "mcf",
     "min_conncomp_frac": 0.01,
-    "phase_grad_window": (7, 7),
+    "phase_grad_window": (5, 5),
     "ntiles": (1, 1),
     "tile_overlap": (0, 0),
     "nproc": 1,
     "tile_cost_thresh": 500,
     "min_region_size": 300,
-    "single_tile_reoptimize": True,
+    "single_tile_reoptimize": False,
     "regrow_conncomps": True,
 }
 SNAPHU_RETRY_PROFILES = (
@@ -100,6 +118,7 @@ class PairContext:
     resolved_dem: str
     orbit_interp: str
     wavelength: float
+    effective_crop_window: dict | None = None
 
 
 STAGE_SEQUENCE = ("check", "prep", "crop", "p0", "p1", "p2", "p3", "p4", "p5", "p6")
@@ -317,6 +336,37 @@ def _log_stage_status(
     if fallback_reason:
         message += f" fallback={fallback_reason}"
     print(message, flush=True)
+
+
+def _log_prepare_info(section: str, message: str) -> None:
+    print(f"[{utc_now_iso()}] [prep] {section} {message}", flush=True)
+
+
+def _format_normalize_start_message(
+    precheck: dict,
+    *,
+    master_acquisition: dict | None = None,
+    slave_acquisition: dict | None = None,
+) -> str:
+    checks = precheck.get("checks") or {}
+    reasons = []
+    if (checks.get("prf") or {}).get("severity") == "warn":
+        reasons.append("PRF 差异超标")
+    if (checks.get("radar_grid") or {}).get("severity") == "warn":
+        reasons.append("雷达网格有差异")
+    if (checks.get("doppler") or {}).get("severity") == "warn":
+        reasons.append("Doppler有差异")
+    reason_text = "、".join(reasons) if reasons else "预检查要求"
+    prf_text = ""
+    if master_acquisition is not None and slave_acquisition is not None:
+        master_prf = master_acquisition.get("prf")
+        slave_prf = slave_acquisition.get("prf")
+        if master_prf is not None and slave_prf is not None:
+            prf_text = f" slave PRF {slave_prf} -> master PRF {master_prf};"
+    return (
+        f"---- 发现 {reason_text}，"
+        f"开始归一化处理: {prf_text} "
+    )
 
 
 class _StageProgress:
@@ -557,6 +607,96 @@ def _write_band_array(band, data: np.ndarray, xoff: int = 0, yoff: int = 0) -> N
 
 
 def resolve_manifest_data_path(manifest_path: str | Path, entry) -> str | None:
+    def _remap_legacy_absolute_path(path_str: str) -> str:
+        if not path_str.startswith("/"):
+            return path_str
+        candidates: list[Path] = []
+        if path_str.startswith("/results/"):
+            candidates.append(Path.cwd() / path_str.lstrip("/"))
+        if path_str.startswith("/work/results/"):
+            candidates.append(Path.cwd() / path_str[len("/work/") :].lstrip("/"))
+        if path_str.startswith("/tmp/"):
+            candidates.append(Path("/home/ysdong/Temp") / path_str[5:])
+        if path_str.startswith("/temp/"):
+            candidates.append(Path("/home/ysdong/Temp") / path_str[6:])
+        for candidate in candidates:
+            candidate = candidate.resolve()
+            if candidate.exists():
+                return str(candidate)
+        return path_str
+
+    def _resolve_archive_path(raw_path: str | Path) -> str:
+        def _find_archive_candidate(path_str: str) -> str:
+            path_obj = Path(path_str)
+            candidates: list[Path] = [path_obj]
+            name = path_obj.name
+            if name:
+                candidates.extend(
+                    [
+                        manifest_dir / name,
+                        manifest_dir / "temp" / name,
+                        manifest_dir.parent / name,
+                        manifest_dir.parent / "temp" / name,
+                        Path.cwd() / name,
+                        Path("/results") / name,
+                        Path("/work") / name,
+                        Path("/tmp") / name,
+                        Path("/temp") / name,
+                    ]
+                )
+            for candidate in candidates:
+                try:
+                    if candidate.exists():
+                        return str(candidate.resolve())
+                except Exception:
+                    continue
+            return path_str
+
+        path = Path(raw_path)
+        resolved = path if path.is_absolute() else (manifest_dir / path)
+        resolved = resolved.resolve()
+        resolved_str = str(resolved)
+        if not resolved.exists():
+            remapped = _remap_legacy_absolute_path(resolved_str)
+            if remapped != resolved_str:
+                return remapped
+            candidate = _find_archive_candidate(resolved_str)
+            if candidate != resolved_str:
+                return candidate
+        return resolved_str
+
+    def _split_archive_member(path: str, *, storage: str) -> tuple[str, str] | None:
+        low = path.lower()
+        markers = (".zip/",) if storage == "zip" else (".tar.gz/", ".tgz/", ".tar/")
+        for marker in markers:
+            idx = low.find(marker)
+            if idx < 0:
+                continue
+            archive_end = idx + len(marker) - 1
+            archive = path[:archive_end]
+            member = path[archive_end + 1 :]
+            if archive and member:
+                return archive, member
+        return None
+
+    def _normalize_vsi_entry(vsi_path: str) -> str:
+        if vsi_path.startswith("/vsitar/"):
+            prefix = "/vsitar/"
+            storage = "tar"
+        elif vsi_path.startswith("/vsizip/"):
+            prefix = "/vsizip/"
+            storage = "zip"
+        else:
+            return vsi_path
+        remainder = vsi_path[len(prefix) :]
+        split = _split_archive_member(remainder, storage=storage)
+        if split is None:
+            return vsi_path
+        archive, member = split
+        archive_abs = _resolve_archive_path(archive)
+        member_path = str(member).lstrip("/").replace("\\", "/")
+        return f"{prefix}{archive_abs}/{member_path}"
+
     if entry is None:
         return None
     manifest_dir = Path(manifest_path).parent.resolve()
@@ -568,14 +708,31 @@ def resolve_manifest_data_path(manifest_path: str | Path, entry) -> str | None:
         resolved = base_path if base_path.is_absolute() else (manifest_dir / base_path)
         storage = str(entry.get("storage") or "").strip().lower()
         member = entry.get("member")
+        if storage == "tar" and member:
+            archive = str(resolved.resolve()).replace("\\", "/")
+            if not Path(archive).exists():
+                archive = _remap_legacy_absolute_path(archive).replace("\\", "/")
+            member_path = str(member).lstrip("/").replace("\\", "/")
+            return f"/vsitar/{archive}/{member_path}"
         if storage == "zip" and member:
-            archive = resolved.as_posix()
+            archive = str(resolved.resolve()).replace("\\", "/")
+            if not Path(archive).exists():
+                archive = _remap_legacy_absolute_path(archive).replace("\\", "/")
             member_path = str(member).lstrip("/").replace("\\", "/")
             return f"/vsizip/{archive}/{member_path}"
-        return str(resolved)
-    entry_path = Path(str(entry))
+        resolved_str = str(resolved.resolve())
+        if not Path(resolved_str).exists():
+            resolved_str = _remap_legacy_absolute_path(resolved_str)
+        return resolved_str
+    entry_str = str(entry)
+    if entry_str.startswith("/vsitar/") or entry_str.startswith("/vsizip/"):
+        return _normalize_vsi_entry(entry_str)
+    entry_path = Path(entry_str)
     resolved = entry_path if entry_path.is_absolute() else (manifest_dir / entry_path)
-    return str(resolved)
+    resolved_str = str(resolved.resolve())
+    if not Path(resolved_str).exists():
+        resolved_str = _remap_legacy_absolute_path(resolved_str)
+    return resolved_str
 
 
 def resolve_manifest_metadata_path(
@@ -597,18 +754,60 @@ def resolve_manifest_metadata_path(
     return fallback_path
 
 
-def _compute_default_resolution(manifest_path: str | Path) -> float:
-    """Compute default resolution from radargrid metadata.
+def _normalize_looks(value: int | float | str | None, name: str) -> int:
+    looks = int(value or 1)
+    if looks < 1:
+        raise ValueError(f"{name} must be >= 1")
+    return looks
 
-    Default = max(groundRangeResolution, azimuthResolution) × 2,
-    rounded UP to nearest 0.5.
 
-    Args:
-        manifest_path: Path to the master manifest.json
+def _multilook_output_shape(shape: tuple[int, int], azimuth_looks: int, range_looks: int) -> tuple[int, int]:
+    azimuth_looks = _normalize_looks(azimuth_looks, "azimuth_looks")
+    range_looks = _normalize_looks(range_looks, "range_looks")
+    rows = int(shape[0]) // azimuth_looks
+    cols = int(shape[1]) // range_looks
+    if rows < 1 or cols < 1:
+        raise ValueError(
+            f"multilook factors too large for shape {shape}: azimuth_looks={azimuth_looks}, range_looks={range_looks}"
+        )
+    return rows, cols
 
-    Returns:
-        Default resolution in meters, rounded up to nearest 0.5
+
+def _multilook_mean(arr: np.ndarray, azimuth_looks: int, range_looks: int) -> np.ndarray:
+    azimuth_looks = _normalize_looks(azimuth_looks, "azimuth_looks")
+    range_looks = _normalize_looks(range_looks, "range_looks")
+    if azimuth_looks == 1 and range_looks == 1:
+        return np.asarray(arr)
+    rows_out, cols_out = _multilook_output_shape(arr.shape[:2], azimuth_looks, range_looks)
+    trim_rows = rows_out * azimuth_looks
+    trim_cols = cols_out * range_looks
+    trimmed = np.asarray(arr)[:trim_rows, :trim_cols]
+    reshaped = trimmed.reshape(rows_out, azimuth_looks, cols_out, range_looks, *trimmed.shape[2:])
+    return reshaped.mean(axis=(1, 3))
+
+
+def _round_up_half(value: float) -> float:
+    return math.ceil(float(value) * 2.0) / 2.0
+
+
+def _compute_default_resolution(
+    manifest_path: str | Path,
+    *,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
+) -> float:
+    """Compute default output resolution from radargrid metadata.
+
+    Full-resolution default:
+        2 * max(groundRangeResolution, azimuthResolution), rounded up to 0.5 m.
+
+    Multilook default:
+        max(groundRangeResolution * range_looks, azimuthResolution * azimuth_looks),
+        rounded up to 0.5 m.
     """
+    range_looks = _normalize_looks(range_looks, "range_looks")
+    azimuth_looks = _normalize_looks(azimuth_looks, "azimuth_looks")
+
     manifest = load_manifest(manifest_path)
     radargrid_path = resolve_manifest_metadata_path(manifest_path, manifest, "radargrid")
     with open(radargrid_path, encoding="utf-8") as f:
@@ -618,10 +817,12 @@ def _compute_default_resolution(manifest_path: str | Path) -> float:
     azimuth_res = float(radargrid.get("azimuthResolution", 0.0) or 0.0)
     max_res = max(range_res, azimuth_res)
 
-    target = 2.0 * max_res  # 2x sampling as per README
-    default_res = math.ceil(target * 2) / 2.0  # round up to nearest 0.5
-    default_res = math.ceil(target * 2) / 2.0
-    return default_res
+    if range_looks == 1 and azimuth_looks == 1:
+        return _round_up_half(2.0 * max_res)
+
+    range_res_ml = range_res * float(range_looks)
+    azimuth_res_ml = azimuth_res * float(azimuth_looks)
+    return _round_up_half(max(range_res_ml, azimuth_res_ml))
 
 
 def gps_to_datetime(ts: str) -> datetime:
@@ -683,6 +884,33 @@ def choose_orbit_interp(orbit_json: dict, acquisition_json: dict | None = None) 
         return "Legendre"
     except Exception:
         return "Legendre"
+
+
+def _manifest_sensor_name(manifest: dict | None, acquisition_data: dict | None = None) -> str:
+    manifest_sensor = ""
+    if isinstance(manifest, dict):
+        manifest_sensor = str(manifest.get("sensor", "")).strip().lower()
+    if manifest_sensor:
+        return manifest_sensor
+    if isinstance(acquisition_data, dict):
+        return str(acquisition_data.get("source", "")).strip().lower()
+    return ""
+
+
+def _choose_context_orbit_interp(
+    master_manifest: dict,
+    slave_manifest: dict,
+    master_orbit_data: dict,
+    master_acq_data: dict,
+    slave_acq_data: dict | None = None,
+) -> str:
+    sensors = {
+        _manifest_sensor_name(master_manifest, master_acq_data),
+        _manifest_sensor_name(slave_manifest, slave_acq_data),
+    }
+    if "lutan" in sensors:
+        return "Legendre"
+    return choose_orbit_interp(master_orbit_data, master_acq_data)
 
 
 def _build_coregistration_doppler_lut():
@@ -1077,6 +1305,27 @@ def _load_processing_metadata(manifest_path: Path) -> tuple[dict, dict, dict, di
     return manifest, orbit_data, acquisition_data, radargrid_data, doppler_data
 
 
+def _load_rdr2geo_inputs_from_manifest(manifest_path: str | Path) -> tuple[dict, dict, dict]:
+    manifest_path = Path(manifest_path)
+    manifest = load_manifest(manifest_path)
+    with open(
+        resolve_manifest_metadata_path(manifest_path, manifest, "orbit"),
+        encoding="utf-8",
+    ) as f:
+        orbit_data = json.load(f)
+    with open(
+        resolve_manifest_metadata_path(manifest_path, manifest, "acquisition"),
+        encoding="utf-8",
+    ) as f:
+        acquisition_data = json.load(f)
+    with open(
+        resolve_manifest_metadata_path(manifest_path, manifest, "radargrid"),
+        encoding="utf-8",
+    ) as f:
+        radargrid_data = json.load(f)
+    return orbit_data, acquisition_data, radargrid_data
+
+
 def _resolve_dem_path(
     manifest_path: Path,
     manifest: dict,
@@ -1086,7 +1335,7 @@ def _resolve_dem_path(
     dem_margin_deg: float,
 ) -> str:
     if dem_path is not None:
-        return str(Path(dem_path))
+        return str(Path(dem_path).resolve())
 
     manifest_dem = (
         manifest.get("dem", {}).get("path")
@@ -1097,8 +1346,28 @@ def _resolve_dem_path(
         resolved_manifest_dem = resolve_manifest_data_path(manifest_path, manifest_dem)
         if resolved_manifest_dem is not None:
             return resolved_manifest_dem
+
+    # Fallback: auto-resolve DEM from scene corners when manifest has no dem.path.
+    if corners:
+        try:
+            from dem_manager import resolve_dem_for_scene
+
+            cache_dir = Path(dem_cache_dir) if dem_cache_dir else (manifest_path.parent / "dem")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            auto_dem_path, _ = resolve_dem_for_scene(
+                corners,
+                dem_path=None,
+                output_dir=str(cache_dir),
+                margin_deg=float(dem_margin_deg),
+            )
+            return str(auto_dem_path)
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"failed to auto-resolve DEM (no dem.path in manifest): {exc}"
+            ) from exc
+
     raise FileNotFoundError(
-        "DEM path is required in strip_insar2.py stage-1 migration when manifest has no dem.path"
+        "DEM path is required: pass --dem or provide manifest.dem.path; auto DEM requires valid scene corners"
     )
 
 
@@ -1142,30 +1411,31 @@ def build_pair_name(master_date: str, slave_date: str) -> str:
 
 def build_output_paths(output_dir: str | Path, pair_name: str) -> dict[str, str]:
     output_dir = Path(output_dir)
+    product_dir = output_dir / f"{pair_name}_product"
     return {
         "interferogram_h5": str(output_dir / f"{pair_name}_insar.h5"),
-        "avg_amplitude_tif": str(output_dir / f"{pair_name}_avg_amplitude_utm_geocoded.tif"),
-        "avg_amplitude_png": str(output_dir / f"{pair_name}_avg_amplitude_utm_geocoded.png"),
-        "avg_amplitude_kml": str(output_dir / f"{pair_name}_avg_amplitude_utm_geocoded.kml"),
-        "interferogram_tif": str(output_dir / f"{pair_name}_interferogram_utm_geocoded.tif"),
-        "interferogram_png": str(output_dir / f"{pair_name}_interferogram_wrapped_phase_utm_geocoded.png"),
-        "interferogram_kml": str(output_dir / f"{pair_name}_interferogram_wrapped_phase_utm_geocoded.kml"),
-        "filtered_interferogram_tif": str(output_dir / f"{pair_name}_filtered_interferogram_utm_geocoded.tif"),
+        "avg_amplitude_tif": str(product_dir / f"{pair_name}_avg_amplitude_utm_geocoded.tif"),
+        "avg_amplitude_png": str(product_dir / f"{pair_name}_avg_amplitude_utm_geocoded.png"),
+        "avg_amplitude_kml": str(product_dir / f"{pair_name}_avg_amplitude_utm_geocoded.kml"),
+        "interferogram_tif": str(product_dir / f"{pair_name}_interferogram_utm_geocoded.tif"),
+        "interferogram_png": str(product_dir / f"{pair_name}_interferogram_wrapped_phase_utm_geocoded.png"),
+        "interferogram_kml": str(product_dir / f"{pair_name}_interferogram_wrapped_phase_utm_geocoded.kml"),
+        "filtered_interferogram_tif": str(product_dir / f"{pair_name}_filtered_interferogram_utm_geocoded.tif"),
         "filtered_interferogram_png": str(
-            output_dir / f"{pair_name}_filtered_interferogram_wrapped_phase_utm_geocoded.png"
+            product_dir / f"{pair_name}_filtered_interferogram_wrapped_phase_utm_geocoded.png"
         ),
         "filtered_interferogram_kml": str(
-            output_dir / f"{pair_name}_filtered_interferogram_wrapped_phase_utm_geocoded.kml"
+            product_dir / f"{pair_name}_filtered_interferogram_wrapped_phase_utm_geocoded.kml"
         ),
-        "coherence_tif": str(output_dir / f"{pair_name}_coherence_utm_geocoded.tif"),
-        "coherence_png": str(output_dir / f"{pair_name}_coherence_utm_geocoded.png"),
-        "coherence_kml": str(output_dir / f"{pair_name}_coherence_utm_geocoded.kml"),
-        "unwrapped_phase_tif": str(output_dir / f"{pair_name}_unwrapped_phase_utm_geocoded.tif"),
-        "unwrapped_phase_png": str(output_dir / f"{pair_name}_unwrapped_phase_utm_geocoded.png"),
-        "unwrapped_phase_kml": str(output_dir / f"{pair_name}_unwrapped_phase_utm_geocoded.kml"),
-        "los_displacement_tif": str(output_dir / f"{pair_name}_los_displacement_utm_geocoded.tif"),
-        "los_displacement_png": str(output_dir / f"{pair_name}_los_displacement_utm_geocoded.png"),
-        "los_displacement_kml": str(output_dir / f"{pair_name}_los_displacement_utm_geocoded.kml"),
+        "coherence_tif": str(product_dir / f"{pair_name}_coherence_utm_geocoded.tif"),
+        "coherence_png": str(product_dir / f"{pair_name}_coherence_utm_geocoded.png"),
+        "coherence_kml": str(product_dir / f"{pair_name}_coherence_utm_geocoded.kml"),
+        "unwrapped_phase_tif": str(product_dir / f"{pair_name}_unwrapped_phase_utm_geocoded.tif"),
+        "unwrapped_phase_png": str(product_dir / f"{pair_name}_unwrapped_phase_utm_geocoded.png"),
+        "unwrapped_phase_kml": str(product_dir / f"{pair_name}_unwrapped_phase_utm_geocoded.kml"),
+        "los_displacement_tif": str(product_dir / f"{pair_name}_los_displacement_utm_geocoded.tif"),
+        "los_displacement_png": str(product_dir / f"{pair_name}_los_displacement_utm_geocoded.png"),
+        "los_displacement_kml": str(product_dir / f"{pair_name}_los_displacement_utm_geocoded.kml"),
     }
 
 
@@ -1243,8 +1513,8 @@ def load_pair_context(
     dem_cache_dir: str | None = None,
     dem_margin_deg: float = 0.2,
 ) -> PairContext:
-    master_manifest_path = Path(master_manifest_path)
-    slave_manifest_path = Path(slave_manifest_path)
+    master_manifest_path = Path(master_manifest_path).resolve()
+    slave_manifest_path = Path(slave_manifest_path).resolve()
     (
         master_manifest,
         master_orbit_data,
@@ -1264,7 +1534,7 @@ def load_pair_context(
     slave_date = extract_scene_date(slave_acq_data, slave_orbit_data)
     pair_name = build_pair_name(master_date, slave_date)
 
-    output_root = Path(output_root)
+    output_root = Path(output_root).resolve()
     pair_dir = output_root / pair_name
     pair_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1283,7 +1553,13 @@ def load_pair_context(
         dem_cache_dir,
         dem_margin_deg,
     )
-    orbit_interp = choose_orbit_interp(master_orbit_data, master_acq_data)
+    orbit_interp = _choose_context_orbit_interp(
+        master_manifest,
+        slave_manifest,
+        master_orbit_data,
+        master_acq_data,
+        slave_acq_data,
+    )
     wavelength = get_wavelength(master_acq_data)
 
     return PairContext(
@@ -1318,6 +1594,7 @@ def _write_stage_outputs_record(
     backend_used: str,
     output_files: dict,
     fallback_reason: str | None = None,
+    processing_options: dict | None = None,
 ) -> None:
     upstream = {
         "p0": ["prep"],
@@ -1326,6 +1603,7 @@ def _write_stage_outputs_record(
         "p3": ["p2"],
         "p4": ["p3"],
     }
+    upstream_dependencies = upstream.get(stage, [])
     record = {
         "stage": stage,
         "input_manifests": {
@@ -1334,12 +1612,17 @@ def _write_stage_outputs_record(
         },
         "effective_crop": {},
         "backend_used": backend_used,
-        "upstream_stage_dependencies": upstream.get(stage, []),
+        "upstream_stage_dependencies": upstream_dependencies,
+        "upstream_stage_tokens": {
+            dep: (load_stage_record(output_dir, dep) or {}).get("end_time")
+            for dep in upstream_dependencies
+        },
         "output_files": output_files,
         "start_time": utc_now_iso(),
         "end_time": utc_now_iso(),
         "success": True,
         "fallback_reason": fallback_reason,
+        "processing_options": dict(processing_options or {}),
     }
     write_stage_record(output_dir, stage, record)
     mark_stage_success(output_dir, stage)
@@ -1355,7 +1638,9 @@ def _write_custom_stage_record(
     output_files: dict,
     fallback_reason: str | None = None,
     upstream_stage_dependencies: list[str] | None = None,
+    processing_options: dict | None = None,
 ) -> None:
+    upstream_dependencies = upstream_stage_dependencies or []
     record = {
         "stage": stage,
         "input_manifests": {
@@ -1364,12 +1649,17 @@ def _write_custom_stage_record(
         },
         "effective_crop": {},
         "backend_used": backend_used,
-        "upstream_stage_dependencies": upstream_stage_dependencies or [],
+        "upstream_stage_dependencies": upstream_dependencies,
+        "upstream_stage_tokens": {
+            dep: (load_stage_record(output_dir, dep) or {}).get("end_time")
+            for dep in upstream_dependencies
+        },
         "output_files": output_files,
         "start_time": utc_now_iso(),
         "end_time": utc_now_iso(),
         "success": True,
         "fallback_reason": fallback_reason,
+        "processing_options": dict(processing_options or {}),
     }
     write_stage_record(output_dir, stage, record)
     mark_stage_success(output_dir, stage)
@@ -1400,6 +1690,7 @@ def _load_cached_stage_outputs(
     stage: str,
     *,
     required_keys: tuple[str, ...],
+    expected_processing_options: dict | None = None,
 ) -> dict | None:
     if not success_marker_path(output_dir, stage).is_file():
         return None
@@ -1417,6 +1708,19 @@ def _load_cached_stage_outputs(
             if not Path(str(value)).exists():
                 return None
         except Exception:
+            return None
+    if expected_processing_options is not None:
+        processing_options = record.get("processing_options") or {}
+        if dict(processing_options) != dict(expected_processing_options):
+            return None
+    upstream_dependencies = record.get("upstream_stage_dependencies") or []
+    stored_tokens = record.get("upstream_stage_tokens") or {}
+    if upstream_dependencies and stored_tokens:
+        current_tokens = {
+            dep: (load_stage_record(output_dir, dep) or {}).get("end_time")
+            for dep in upstream_dependencies
+        }
+        if current_tokens != stored_tokens:
             return None
     return dict(output_files)
 
@@ -1685,6 +1989,103 @@ def append_topo_coordinates_hdf(
             tmp_parent.rmdir()
 
 
+def append_topo_coordinates_hdf_from_vrt(
+    topo_vrt_path: str | Path,
+    output_h5: str | Path,
+    *,
+    block_rows: int = ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
+) -> str:
+    topo_vrt_path = Path(topo_vrt_path)
+    output_h5 = Path(output_h5)
+    ds = gdal.Open(str(topo_vrt_path), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"failed to open topo VRT: {topo_vrt_path}")
+    try:
+        width = int(ds.RasterXSize)
+        length = int(ds.RasterYSize)
+        looked_length, looked_width = _multilook_output_shape((length, width), azimuth_looks, range_looks)
+        trim_length = looked_length * azimuth_looks
+        trim_width = looked_width * range_looks
+
+        lon_band = ds.GetRasterBand(1)
+        lat_band = ds.GetRasterBand(2)
+        hgt_band = ds.GetRasterBand(3)
+
+        output_block_rows = max(1, int(block_rows) // azimuth_looks)
+        input_block_rows = output_block_rows * azimuth_looks
+        with h5py.File(output_h5, "a") as f:
+            for name in ("longitude", "latitude", "height"):
+                if name in f:
+                    del f[name]
+            chunk_rows = min(max(1, output_block_rows), looked_length)
+            chunk_cols = min(1024, looked_width)
+            d_lon = f.create_dataset("longitude", shape=(looked_length, looked_width), dtype="f8", chunks=(chunk_rows, chunk_cols), compression="gzip", shuffle=True)
+            d_lat = f.create_dataset("latitude", shape=(looked_length, looked_width), dtype="f8", chunks=(chunk_rows, chunk_cols), compression="gzip", shuffle=True)
+            d_hgt = f.create_dataset("height", shape=(looked_length, looked_width), dtype="f8", chunks=(chunk_rows, chunk_cols), compression="gzip", shuffle=True)
+            f.attrs["coordinate_system"] = "EPSG:4326"
+            f.attrs["longitude_units"] = "degrees_east"
+            f.attrs["latitude_units"] = "degrees_north"
+            f.attrs["height_units"] = "meters"
+            f.attrs["coordinate_source"] = "p0_master_topo_vrt_multilooked"
+
+            for out_row0 in range(0, looked_length, output_block_rows):
+                row0 = out_row0 * azimuth_looks
+                rows = min(input_block_rows, trim_length - row0)
+                out_rows = rows // azimuth_looks
+                lon_block = _read_band_array(lon_band, 0, row0, trim_width, rows).astype(np.float64)
+                lat_block = _read_band_array(lat_band, 0, row0, trim_width, rows).astype(np.float64)
+                hgt_block = _read_band_array(hgt_band, 0, row0, trim_width, rows).astype(np.float64)
+                d_lon[out_row0:out_row0 + out_rows, :] = _multilook_mean(lon_block, azimuth_looks, range_looks)
+                d_lat[out_row0:out_row0 + out_rows, :] = _multilook_mean(lat_block, azimuth_looks, range_looks)
+                d_hgt[out_row0:out_row0 + out_rows, :] = _multilook_mean(hgt_block, azimuth_looks, range_looks)
+        return str(output_h5)
+    finally:
+        ds = None
+
+
+def _append_multilooked_topo_coordinates_hdf(
+    *,
+    context: PairContext,
+    output_h5: str | Path,
+    block_rows: int,
+    range_looks: int,
+    azimuth_looks: int,
+    use_gpu: bool,
+    gpu_id: int,
+) -> str:
+    scratch_root = stage_dir(context.pair_dir, "p5") / "multilook_topo_tmp"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="d2sar_ml_rdr2geo_", dir=str(scratch_root)))
+    try:
+        orbit_data, acquisition_data, radargrid_data = _load_rdr2geo_inputs_from_manifest(
+            context.master_manifest_path
+        )
+        topo_vrt = _run_rdr2geo_topo(
+            orbit_data=orbit_data,
+            acquisition_data=acquisition_data,
+            radargrid_data=radargrid_data,
+            dem_path=context.resolved_dem,
+            orbit_interp=context.orbit_interp,
+            use_gpu=use_gpu,
+            gpu_id=gpu_id,
+            output_dir=workdir,
+            block_rows=block_rows,
+        )
+        return append_topo_coordinates_hdf_from_vrt(
+            topo_vrt,
+            output_h5,
+            block_rows=block_rows,
+            range_looks=range_looks,
+            azimuth_looks=azimuth_looks,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        if scratch_root.exists() and not any(scratch_root.iterdir()):
+            scratch_root.rmdir()
+
+
 def point2epsg(lon: float, lat: float) -> int:
     if lon >= 180.0:
         lon -= 360.0
@@ -1852,6 +2253,102 @@ def accumulate_utm_grid(
     return out, meta
 
 
+def _stretch_source_grid_for_png(
+    input_h5: str,
+    dataset_name: str,
+    stretch_percent: float = 5.0,
+) -> np.ndarray:
+    with h5py.File(input_h5, "r") as f:
+        data = f[dataset_name][:]
+    data = np.asarray(data, dtype=np.float32)
+    display = np.full(data.shape, np.nan, dtype=np.float32)
+    valid = np.isfinite(data)
+    if dataset_name in {"slc_amplitude", "avg_amplitude", "coherence"}:
+        valid &= data > 0
+    if not np.any(valid):
+        return display
+    lower_pct = float(np.clip(stretch_percent, 0.0, 50.0))
+    upper_pct = 100.0 - lower_pct
+    vals = data[valid].astype(np.float64)
+    lower = float(np.percentile(vals, lower_pct))
+    upper = float(np.percentile(vals, upper_pct))
+    if upper <= lower:
+        display[valid] = 255.0
+        return display
+    scaled = np.clip((data[valid] - lower) / (upper - lower), 0.0, 1.0)
+    display[valid] = (scaled * 255.0).astype(np.float32)
+    return display
+
+
+def _accumulate_source_grid_to_utm(
+    input_h5: str,
+    source_grid: np.ndarray,
+    target_width: int,
+    target_height: int | None = None,
+    block_rows: int = 64,
+) -> tuple[np.ndarray, dict]:
+    input_h5 = Path(input_h5)
+    with h5py.File(input_h5, "r") as f:
+        x_ds = f["utm_x"]
+        y_ds = f["utm_y"]
+        length, width = source_grid.shape
+        if x_ds.shape != source_grid.shape or y_ds.shape != source_grid.shape:
+            raise RuntimeError(
+                f"source grid shape {source_grid.shape} does not match UTM coordinate grids"
+            )
+        utm_epsg = int(f.attrs["utm_epsg"])
+        x_min = np.inf
+        x_max = -np.inf
+        y_min = np.inf
+        y_max = -np.inf
+        for row0 in range(0, length, block_rows):
+            rows = min(block_rows, length - row0)
+            x = x_ds[row0:row0 + rows, :]
+            y = y_ds[row0:row0 + rows, :]
+            valid = np.isfinite(x) & np.isfinite(y)
+            if np.any(valid):
+                x_min = min(x_min, float(np.nanmin(x[valid])))
+                x_max = max(x_max, float(np.nanmax(x[valid])))
+                y_min = min(y_min, float(np.nanmin(y[valid])))
+                y_max = max(y_max, float(np.nanmax(y[valid])))
+        aspect = (y_max - y_min) / max(x_max - x_min, 1e-9)
+        if target_height is None:
+            target_height = max(1, int(round(target_width * aspect)))
+        sums = np.zeros((target_height, target_width), dtype=np.float64)
+        counts = np.zeros((target_height, target_width), dtype=np.uint32)
+        for row0 in range(0, length, block_rows):
+            rows = min(block_rows, length - row0)
+            x = x_ds[row0:row0 + rows, :]
+            y = y_ds[row0:row0 + rows, :]
+            data = source_grid[row0:row0 + rows, :]
+            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(data)
+            if not np.any(valid):
+                continue
+            x_valid = x[valid]
+            y_valid = y[valid]
+            vals = data[valid].astype(np.float64)
+            col = np.clip(((x_valid - x_min) / max(x_max - x_min, 1e-9) * (target_width - 1)).astype(np.int32), 0, target_width - 1)
+            row = np.clip(((y_max - y_valid) / max(y_max - y_min, 1e-9) * (target_height - 1)).astype(np.int32), 0, target_height - 1)
+            flat_idx = row * target_width + col
+            np.add.at(sums.ravel(), flat_idx, vals)
+            np.add.at(counts.ravel(), flat_idx, 1)
+    out = np.full((target_height, target_width), np.nan, dtype=np.float64)
+    mask = counts > 0
+    out[mask] = sums[mask] / counts[mask]
+    meta = {
+        "utm_epsg": utm_epsg,
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
+        "target_width": target_width,
+        "target_height": target_height,
+        "x_res": (x_max - x_min) / max(target_width - 1, 1),
+        "y_res": (y_max - y_min) / max(target_height - 1, 1),
+    }
+    return out, meta
+
+
 def write_geocoded_geotiff(
     input_h5: str,
     output_tif: str,
@@ -1886,7 +2383,20 @@ def write_geocoded_png(
     target_height: int | None = None,
     block_rows: int = 64,
 ) -> str:
-    out, _ = accumulate_utm_grid(input_h5, dataset_name, target_width, target_height, block_rows)
+    if dataset_name == "avg_amplitude":
+        source_display = _stretch_source_grid_for_png(input_h5, dataset_name, stretch_percent=5.0)
+        out, meta = _accumulate_source_grid_to_utm(
+            input_h5, source_display, target_width, target_height, block_rows
+        )
+        img = np.zeros(out.shape, dtype=np.uint8)
+        valid = np.isfinite(out)
+        if np.any(valid):
+            img[valid] = np.rint(np.clip(out[valid], 0.0, 255.0)).astype(np.uint8)
+        Image.fromarray(img, mode="L").save(output_png)
+        _write_png_georef_sidecars(output_png, meta)
+        return str(output_png)
+
+    out, meta = accumulate_utm_grid(input_h5, dataset_name, target_width, target_height, block_rows)
     img = np.zeros(out.shape, dtype=np.uint8)
     valid = np.isfinite(out)
     if np.any(valid):
@@ -1896,7 +2406,49 @@ def write_geocoded_png(
         scaled = np.clip((vals - p2) / (p98 - p2 + 1.0e-9), 0.0, 1.0)
         img[valid] = (scaled * 255).astype(np.uint8)
     Image.fromarray(img, mode="L").save(output_png)
+    _write_png_georef_sidecars(output_png, meta)
     return str(output_png)
+
+
+def _write_png_georef_sidecars(output_png: str | Path, meta: dict) -> None:
+    output_png = Path(output_png)
+    x_res = float(meta["x_res"])
+    y_res = float(meta["y_res"])
+    x_min = float(meta["x_min"])
+    y_max = float(meta["y_max"])
+    utm_epsg = int(meta["utm_epsg"])
+
+    worldfile = output_png.with_suffix(".pgw")
+    worldfile.write_text(
+        "\n".join(
+            [
+                str(x_res),
+                "0.0",
+                "0.0",
+                str(-y_res),
+                str(x_min + 0.5 * x_res),
+                str(y_max - 0.5 * y_res),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(utm_epsg)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    output_png.with_suffix(".prj").write_text(srs.ExportToWkt(), encoding="utf-8")
+
+
+def _record_png_sidecars(exported: dict[str, str], png_key: str, png_path: str | Path) -> None:
+    png_path = Path(png_path)
+    pgw_path = png_path.with_suffix(".pgw")
+    prj_path = png_path.with_suffix(".prj")
+    base_key = png_key.removesuffix("_png")
+    if pgw_path.exists():
+        exported[f"{base_key}_pgw"] = str(pgw_path)
+    if prj_path.exists():
+        exported[f"{base_key}_prj"] = str(prj_path)
 
 
 def _accumulate_wrapped_phase_grid(
@@ -2005,42 +2557,48 @@ def write_wrapped_phase_png(
     target_height: int | None = None,
     block_rows: int = 64,
 ) -> str:
-    phase, _ = _accumulate_wrapped_phase_grid(input_h5, dataset_name, target_width, target_height, block_rows)
-    rgb = np.zeros((*phase.shape, 3), dtype=np.uint8)
-    value = np.ones(phase.shape, dtype=np.float64)
-    try:
-        avg_amplitude, _ = accumulate_utm_grid(
-            input_h5,
-            "avg_amplitude",
-            target_width=phase.shape[1],
-            target_height=phase.shape[0],
-            block_rows=block_rows,
-        )
-        avg_amplitude, _ = prepare_display_grid(
-            avg_amplitude,
-            confidence_interval_pct=98.0,
-        )
-        amp_valid = np.isfinite(avg_amplitude) & (avg_amplitude > 0)
-        if np.any(amp_valid):
-            amp_db = 10.0 * np.log10(avg_amplitude[amp_valid])
-            p2 = float(np.percentile(amp_db, 2))
-            p98 = float(np.percentile(amp_db, 98))
-            scaled = np.clip((amp_db - p2) / (p98 - p2 + 1.0e-9), 0.0, 1.0)
-            value[:] = 0.15
-            value[amp_valid] = np.clip(scaled, 0.15, 1.0)
-    except Exception:
-        pass
+    phase, meta = _accumulate_wrapped_phase_grid(input_h5, dataset_name, target_width, target_height, block_rows)
+    rgba = np.zeros((*phase.shape, 4), dtype=np.uint8)
     valid = np.isfinite(phase)
     if np.any(valid):
         hue = ((phase[valid] + np.pi) / (2.0 * np.pi)).astype(np.float64)
         colors = np.array(
             [
-                colorsys.hsv_to_rgb(float(h), 1.0, float(v))
-                for h, v in zip(hue, value[valid], strict=False)
+                colorsys.hsv_to_rgb(float(h), 1.0, 1.0)
+                for h in hue
             ]
         )
-        rgb[valid] = (colors * 255.0).astype(np.uint8)
-    Image.fromarray(rgb, mode="RGB").save(output_png)
+        rgba[valid, :3] = (colors * 255.0).astype(np.uint8)
+        rgba[valid, 3] = 255
+    Image.fromarray(rgba, mode="RGBA").save(output_png)
+    _write_png_georef_sidecars(output_png, meta)
+    return str(output_png)
+
+
+def write_unwrapped_phase_png(
+    input_h5: str,
+    output_png: str,
+    dataset_name: str,
+    target_width: int,
+    target_height: int | None = None,
+    block_rows: int = 64,
+) -> str:
+    phase, meta = accumulate_utm_grid(input_h5, dataset_name, target_width, target_height, block_rows)
+    phase = np.mod(np.asarray(phase, dtype=np.float64) + np.pi, 2.0 * np.pi) - np.pi
+    rgba = np.zeros((*phase.shape, 4), dtype=np.uint8)
+    valid = np.isfinite(phase)
+    if np.any(valid):
+        hue = ((phase[valid] + np.pi) / (2.0 * np.pi)).astype(np.float64)
+        colors = np.array(
+            [
+                colorsys.hsv_to_rgb(float(h), 1.0, 1.0)
+                for h in hue
+            ]
+        )
+        rgba[valid, :3] = (colors * 255.0).astype(np.uint8)
+        rgba[valid, 3] = 255
+    Image.fromarray(rgba, mode="RGBA").save(output_png)
+    _write_png_georef_sidecars(output_png, meta)
     return str(output_png)
 
 
@@ -2147,6 +2705,11 @@ def export_insar_products(
     generate_kml: bool = True,
 ) -> dict[str, str]:
     input_h5 = str(input_h5)
+
+    for key, value in output_paths.items():
+        if key.endswith(("_tif", "_png", "_kml")):
+            Path(value).parent.mkdir(parents=True, exist_ok=True)
+
     target_width, target_height = compute_utm_output_shape(input_h5, resolution_meters)
     exported: dict[str, str] = {}
     scalar_datasets = (
@@ -2159,9 +2722,20 @@ def export_insar_products(
         tif_path = output_paths[tif_key]
         png_path = output_paths[png_key]
         write_geocoded_geotiff(input_h5, tif_path, dataset_name, target_width, target_height, block_rows)
-        write_geocoded_png(input_h5, png_path, dataset_name, target_width, target_height, block_rows)
+        if dataset_name == "unwrapped_phase":
+            write_unwrapped_phase_png(
+                input_h5,
+                png_path,
+                dataset_name,
+                target_width,
+                target_height,
+                block_rows,
+            )
+        else:
+            write_geocoded_png(input_h5, png_path, dataset_name, target_width, target_height, block_rows)
         exported[tif_key] = tif_path
         exported[png_key] = png_path
+        _record_png_sidecars(exported, png_key, png_path)
         if generate_kml:
             kml_key = png_key.replace("_png", "_kml")
             exported[kml_key] = write_ground_overlay_kml_from_geotiff(
@@ -2181,6 +2755,7 @@ def export_insar_products(
         write_wrapped_phase_png(input_h5, png_path, dataset_name, target_width, target_height, block_rows)
         exported[tif_key] = tif_path
         exported[png_key] = png_path
+        _record_png_sidecars(exported, png_key, png_path)
         if generate_kml:
             kml_key = png_key.replace("_png", "_kml")
             exported[kml_key] = write_ground_overlay_kml_from_geotiff(
@@ -2499,12 +3074,13 @@ def _run_slave_geo2rdr_from_master_topo(
     use_gpu: bool,
     gpu_id: int,
     block_rows: int = ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
+    orbit_interp: str | None = None,
 ) -> tuple[str, str]:
     import isce3.io
 
     slave_orbit = construct_orbit(
         slave_orbit_data,
-        choose_orbit_interp(slave_orbit_data, slave_acq_data),
+        orbit_interp or choose_orbit_interp(slave_orbit_data, slave_acq_data),
     )
     slave_grid = construct_radar_grid(slave_rg_data, slave_acq_data, slave_orbit_data)
     doppler = _build_coregistration_doppler_lut()
@@ -2966,6 +3542,7 @@ def _run_nisar_registration_chain(
         output_dir=p1_stage_path,
         use_gpu=use_gpu,
         gpu_id=gpu_id,
+        orbit_interp=context.orbit_interp,
     )
 
     coarse_coreg_slave_path = str(
@@ -3070,6 +3647,12 @@ def _run_nisar_registration_chain(
             row_offset, col_offset, dense_match_details = _run_strip_pycuampcor_dense_offsets(
                 master_slc_path=master_slc,
                 slave_slc_path=coarse_coreg_slave_path,
+                master_slc_metadata=context.master_manifest.get("slc", {}),
+                slave_slc_metadata={
+                    "sample_format": "cfloat32",
+                    "storage_layout": "single_band_complex",
+                    "complex_band_count": 1,
+                },
                 output_dir=dense_offsets_dir,
                 gpu_id=gpu_id,
                 return_details=True,
@@ -3446,6 +4029,144 @@ def _estimate_coherence(
     return coh.astype(np.float32)
 
 
+def _read_slc_block_as_complex(dataset, row0: int, rows: int, width: int) -> np.ndarray:
+    band1 = dataset.GetRasterBand(1)
+    block1 = _read_band_array(band1, 0, row0, width, rows)
+    if dataset.RasterCount >= 2:
+        band2 = _read_band_array(dataset.GetRasterBand(2), 0, row0, width, rows)
+        return (block1 + 1j * band2).astype(np.complex64)
+    return block1.astype(np.complex64)
+
+
+def _estimate_coherence_from_slc_paths(
+    master_slc_path: str,
+    slave_slc_path: str,
+    *,
+    block_rows: int = 256,
+    window_size: int = 5,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
+    flatten_raster: str | None = None,
+    flatten_mask_raster: str | None = None,
+    range_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    flatten_starting_range_shift_m: float | None = None,
+) -> np.ndarray:
+    range_looks = _normalize_looks(range_looks, "range_looks")
+    azimuth_looks = _normalize_looks(azimuth_looks, "azimuth_looks")
+    master_ds = gdal.Open(str(master_slc_path), gdal.GA_ReadOnly)
+    slave_ds = gdal.Open(str(slave_slc_path), gdal.GA_ReadOnly)
+    if master_ds is None or slave_ds is None:
+        raise RuntimeError(
+            f"failed to open SLCs for coherence estimation: master={master_slc_path}, slave={slave_slc_path}"
+        )
+    try:
+        width = int(master_ds.RasterXSize)
+        length = int(master_ds.RasterYSize)
+        if int(slave_ds.RasterXSize) != width or int(slave_ds.RasterYSize) != length:
+            raise RuntimeError(
+                "coherence input dimensions differ: "
+                f"master={length}x{width}, slave={slave_ds.RasterYSize}x{slave_ds.RasterXSize}"
+            )
+
+        if range_looks > 1 or azimuth_looks > 1:
+            looked_length, looked_width = _multilook_output_shape((length, width), azimuth_looks, range_looks)
+            trim_length = looked_length * azimuth_looks
+            trim_width = looked_width * range_looks
+            coherence = np.zeros((looked_length, looked_width), dtype=np.float32)
+
+            flatten_ds = None
+            flatten_mask_ds = None
+            if flatten_raster:
+                flatten_ds = gdal.Open(str(flatten_raster), gdal.GA_ReadOnly)
+                if flatten_ds is None:
+                    raise RuntimeError(f"failed to open flatten raster: {flatten_raster}")
+            if flatten_mask_raster:
+                flatten_mask_ds = gdal.Open(str(flatten_mask_raster), gdal.GA_ReadOnly)
+            try:
+                output_block_rows = max(1, int(block_rows) // azimuth_looks)
+                input_block_rows = output_block_rows * azimuth_looks
+                for out_row0 in range(0, looked_length, output_block_rows):
+                    row0 = out_row0 * azimuth_looks
+                    rows = min(input_block_rows, trim_length - row0)
+                    out_rows = rows // azimuth_looks
+                    master_block = _read_slc_block_as_complex(master_ds, row0, rows, trim_width)
+                    slave_block = _read_slc_block_as_complex(slave_ds, row0, rows, trim_width)
+                    ifg_block = master_block * np.conj(slave_block)
+                    if flatten_ds is not None and range_pixel_spacing is not None and wavelength:
+                        offset_block = _read_band_array(
+                            flatten_ds.GetRasterBand(1),
+                            0,
+                            row0,
+                            trim_width,
+                            rows,
+                        ).astype(np.float32)
+                        phase = (
+                            4.0
+                            * np.pi
+                            * (
+                                float(range_pixel_spacing) * offset_block
+                                + float(flatten_starting_range_shift_m or 0.0)
+                            )
+                            / float(wavelength)
+                        )
+                        flatten_term = np.exp(-1j * phase.astype(np.float32)).astype(np.complex64)
+                        if flatten_mask_ds is not None:
+                            mask_block = _read_band_array(
+                                flatten_mask_ds.GetRasterBand(1),
+                                0,
+                                row0,
+                                trim_width,
+                                rows,
+                            ).astype(np.uint8) != 0
+                            if np.any(mask_block):
+                                ifg_block[mask_block] *= flatten_term[mask_block]
+                        else:
+                            ifg_block *= flatten_term
+                    ifg_ml = _multilook_mean(ifg_block, azimuth_looks, range_looks)
+                    pwr_m_ml = _multilook_mean(
+                        (np.abs(master_block).astype(np.float32) ** 2),
+                        azimuth_looks,
+                        range_looks,
+                    ).astype(np.float32)
+                    pwr_s_ml = _multilook_mean(
+                        (np.abs(slave_block).astype(np.float32) ** 2),
+                        azimuth_looks,
+                        range_looks,
+                    ).astype(np.float32)
+                    coh_block = np.abs(ifg_ml).astype(np.float32) / np.sqrt(
+                        np.maximum(pwr_m_ml * pwr_s_ml, 1.0e-9)
+                    )
+                    coh_block = np.clip(coh_block, 0.0, 1.0)
+                    coh_block[~np.isfinite(coh_block)] = 0.0
+                    coherence[out_row0 : out_row0 + out_rows, :] = coh_block[:out_rows]
+                return coherence
+            finally:
+                flatten_ds = None
+                flatten_mask_ds = None
+
+        coherence = np.zeros((length, width), dtype=np.float32)
+        pad = max(int(window_size) // 2, 0)
+        for row0 in range(0, length, int(block_rows)):
+            rows = min(int(block_rows), length - row0)
+            read_row0 = max(0, row0 - pad)
+            read_row1 = min(length, row0 + rows + pad)
+            read_rows = read_row1 - read_row0
+            master_block = _read_slc_block_as_complex(master_ds, read_row0, read_rows, width)
+            slave_block = _read_slc_block_as_complex(slave_ds, read_row0, read_rows, width)
+            coherence_ext = _estimate_coherence(
+                master_block,
+                slave_block,
+                size=int(window_size),
+            )
+            local_row0 = row0 - read_row0
+            coherence[row0 : row0 + rows] = coherence_ext[local_row0 : local_row0 + rows]
+        return coherence
+    finally:
+        master_ds = None
+        slave_ds = None
+
+
 def _run_crossmul_cpu(
     *,
     master_slc_path: str,
@@ -3457,6 +4178,8 @@ def _run_crossmul_cpu(
     flatten_starting_range_shift_m: float | None,
     block_rows: int = ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
     progress_reporter: _StageProgress | None = None,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     master_slc = _open_slc_as_complex(master_slc_path)
     slave_slc = _open_slc_as_complex(slave_slc_path)
@@ -3464,7 +4187,19 @@ def _run_crossmul_cpu(
         raise RuntimeError(
             f"shape mismatch for crossmul: master={master_slc.shape}, slave={slave_slc.shape}"
         )
-    interferogram = np.zeros(master_slc.shape, dtype=np.complex64)
+    range_looks = _normalize_looks(range_looks, "range_looks")
+    azimuth_looks = _normalize_looks(azimuth_looks, "azimuth_looks")
+
+    looked_length, looked_width = _multilook_output_shape(
+        master_slc.shape,
+        azimuth_looks,
+        range_looks,
+    )
+    trim_length = looked_length * azimuth_looks
+    trim_width = looked_width * range_looks
+    master_slc = master_slc[:trim_length, :trim_width]
+    slave_slc = slave_slc[:trim_length, :trim_width]
+    interferogram = np.zeros((looked_length, looked_width), dtype=np.complex64)
 
     range_offset = None
     mask = None
@@ -3476,6 +4211,7 @@ def _run_crossmul_cpu(
             range_offset = _read_band_array(ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
         finally:
             ds = None
+        range_offset = range_offset[:trim_length, :trim_width]
         mask = np.ones(range_offset.shape, dtype=bool)
         if flatten_mask_raster:
             mask_ds = gdal.Open(str(flatten_mask_raster), gdal.GA_ReadOnly)
@@ -3484,10 +4220,15 @@ def _run_crossmul_cpu(
                     mask = _read_band_array(mask_ds.GetRasterBand(1), dtype=np.uint8).astype(np.uint8) != 0
                 finally:
                     mask_ds = None
+                mask = mask[:trim_length, :trim_width]
 
-    total_blocks = max((int(master_slc.shape[0]) + int(block_rows) - 1) // int(block_rows), 1)
-    for row0 in range(0, master_slc.shape[0], block_rows):
-        rows = min(block_rows, master_slc.shape[0] - row0)
+    output_block_rows = max(1, int(block_rows) // azimuth_looks)
+    input_block_rows = output_block_rows * azimuth_looks
+    total_blocks = max((trim_length + input_block_rows - 1) // input_block_rows, 1)
+    for out_row0 in range(0, looked_length, output_block_rows):
+        row0 = out_row0 * azimuth_looks
+        rows = min(input_block_rows, trim_length - row0)
+        out_rows = rows // azimuth_looks
         block = master_slc[row0 : row0 + rows] * np.conj(slave_slc[row0 : row0 + rows])
         block = block.astype(np.complex64, copy=False)
         if range_offset is not None:
@@ -3507,16 +4248,24 @@ def _run_crossmul_cpu(
                 block *= flatten_term
             elif np.any(block_mask):
                 block[block_mask] *= flatten_term[block_mask]
-        interferogram[row0 : row0 + rows] = block
+        block_ml = _multilook_mean(block, azimuth_looks, range_looks).astype(np.complex64)
+        interferogram[out_row0 : out_row0 + out_rows] = block_ml[:out_rows]
         if progress_reporter is not None:
             progress_reporter.block(
                 backend="cpu",
-                current=(row0 // block_rows) + 1,
+                current=(out_row0 // output_block_rows) + 1,
                 total=total_blocks,
                 detail="crossmul",
             )
 
-    coherence = _estimate_coherence(master_slc, slave_slc)
+    if range_looks == 1 and azimuth_looks == 1:
+        coherence = _estimate_coherence(master_slc, slave_slc)
+    else:
+        pwr_m = _multilook_mean(np.abs(master_slc).astype(np.float32) ** 2, azimuth_looks, range_looks)
+        pwr_s = _multilook_mean(np.abs(slave_slc).astype(np.float32) ** 2, azimuth_looks, range_looks)
+        coherence = np.abs(interferogram).astype(np.float32) / np.sqrt(np.maximum(pwr_m * pwr_s, 1.0e-9))
+        coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
+        coherence[~np.isfinite(coherence)] = 0.0
     return interferogram.astype(np.complex64), coherence
 
 
@@ -3730,6 +4479,8 @@ def _crossmul_isce3_gpu(
     output_dir: Path,
     gpu_id: int,
     block_rows: int,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
     flatten_raster: str | None = None,
     range_pixel_spacing: float | None = None,
     wavelength: float | None = None,
@@ -3742,6 +4493,8 @@ def _crossmul_isce3_gpu(
         output_dir=output_dir,
         gpu_id=gpu_id,
         block_rows=block_rows,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
         flatten_raster=flatten_raster,
         range_pixel_spacing=range_pixel_spacing,
         wavelength=wavelength,
@@ -3757,6 +4510,8 @@ def _run_crossmul_filter_gpu_pipeline(
     output_dir: Path,
     gpu_id: int,
     block_rows: int,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
     flatten_raster: str | None = None,
     range_pixel_spacing: float | None = None,
     wavelength: float | None = None,
@@ -3770,6 +4525,8 @@ def _run_crossmul_filter_gpu_pipeline(
         output_dir=output_dir,
         gpu_id=gpu_id,
         block_rows=block_rows,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
         flatten_raster=flatten_raster,
         range_pixel_spacing=range_pixel_spacing,
         wavelength=wavelength,
@@ -3786,6 +4543,8 @@ def _crossmul_isce3_gpu_subprocess(
     output_dir: Path,
     gpu_id: int,
     block_rows: int,
+    range_looks: int,
+    azimuth_looks: int,
     flatten_raster: str | None = None,
     range_pixel_spacing: float | None = None,
     wavelength: float | None = None,
@@ -3832,9 +4591,11 @@ def _crossmul_isce3_gpu_subprocess(
             "        src_ds = None\n"
             "    return str(dst)\n"
             "\n"
-            "master_slc_path, slave_slc_path, gpu_id, block_rows, ifg_path, coh_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m = sys.argv[1:]\n"
+            "master_slc_path, slave_slc_path, gpu_id, block_rows, range_looks, az_looks, ifg_path, coh_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m = sys.argv[1:]\n"
             "gpu_id = int(gpu_id)\n"
             "block_rows = int(block_rows)\n"
+            "range_looks = int(range_looks)\n"
+            "az_looks = int(az_looks)\n"
             "flatten_raster = None if flatten_raster == '__NONE__' else flatten_raster\n"
             "range_pixel_spacing = None if range_pixel_spacing == '__NONE__' else float(range_pixel_spacing)\n"
             "wavelength = None if wavelength == '__NONE__' else float(wavelength)\n"
@@ -3851,13 +4612,17 @@ def _crossmul_isce3_gpu_subprocess(
             "slave_raster = isce3.io.Raster(str(slave_local))\n"
             "width = int(master_raster.width)\n"
             "length = int(master_raster.length)\n"
+            "looked_width = width // range_looks\n"
+            "looked_length = length // az_looks\n"
+            "if looked_width < 1 or looked_length < 1:\n"
+            "    raise RuntimeError(f'invalid multilook factors for raster size: {length}x{width}, looks={az_looks}x{range_looks}')\n"
             "if int(slave_raster.width) != width or int(slave_raster.length) != length:\n"
             "    raise RuntimeError(f'CUDA crossmul input dimensions differ: master={length}x{width}, slave={slave_raster.length}x{slave_raster.width}')\n"
-            "ifg_raster = isce3.io.Raster(str(ifg_path), width, length, 1, gdal.GDT_CFloat32, 'ENVI')\n"
-            "coh_raster = isce3.io.Raster(str(coh_path), width, length, 1, gdal.GDT_Float32, 'ENVI')\n"
+            "ifg_raster = isce3.io.Raster(str(ifg_path), looked_width, looked_length, 1, gdal.GDT_CFloat32, 'ENVI')\n"
+            "coh_raster = isce3.io.Raster(str(coh_path), looked_width, looked_length, 1, gdal.GDT_Float32, 'ENVI')\n"
             "crossmul = isce3.cuda.signal.Crossmul()\n"
-            "crossmul.range_looks = 1\n"
-            "crossmul.az_looks = 1\n"
+            "crossmul.range_looks = range_looks\n"
+            "crossmul.az_looks = az_looks\n"
             "crossmul.lines_per_block = block_rows\n"
             "try:\n"
             "    crossmul.set_dopplers(isce3.core.LUT1d(), isce3.core.LUT1d())\n"
@@ -3886,6 +4651,8 @@ def _crossmul_isce3_gpu_subprocess(
         str(slave_slc_path),
         str(gpu_id),
         str(block_rows),
+        str(range_looks),
+        str(azimuth_looks),
         str(ifg_path),
         str(coh_path),
         flatten_raster if flatten_raster is not None else "__NONE__",
@@ -3938,10 +4705,21 @@ def _crossmul_isce3_gpu_subprocess(
         raise RuntimeError("failed to open CUDA crossmul outputs")
     try:
         interferogram = _read_band_array(ifg_ds.GetRasterBand(1), dtype=np.complex64).astype(np.complex64)
-        coherence = _read_band_array(coh_ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
     finally:
         ifg_ds = None
         coh_ds = None
+    coherence = _estimate_coherence_from_slc_paths(
+        master_slc_path,
+        slave_slc_path,
+        block_rows=min(int(block_rows), 256),
+        window_size=5,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
+        flatten_raster=flatten_raster,
+        range_pixel_spacing=range_pixel_spacing,
+        wavelength=wavelength,
+        flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+    )
     return interferogram, coherence
 
 
@@ -3952,6 +4730,8 @@ def _crossmul_filter_isce3_gpu_subprocess(
     output_dir: Path,
     gpu_id: int,
     block_rows: int,
+    range_looks: int,
+    azimuth_looks: int,
     flatten_raster: str | None = None,
     range_pixel_spacing: float | None = None,
     wavelength: float | None = None,
@@ -4064,9 +4844,11 @@ def _crossmul_filter_isce3_gpu_subprocess(
             "    cp.cuda.runtime.deviceSynchronize()\n"
             "    return cp.asnumpy(result)\n"
             "\n"
-            "master_slc_path, slave_slc_path, gpu_id, block_rows, ifg_path, coh_path, filtered_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m, filter_gpu = sys.argv[1:]\n"
+            "master_slc_path, slave_slc_path, gpu_id, block_rows, range_looks, az_looks, ifg_path, coh_path, filtered_path, flatten_raster, range_pixel_spacing, wavelength, flatten_starting_range_shift_m, filter_gpu = sys.argv[1:]\n"
             "gpu_id = int(gpu_id)\n"
             "block_rows = int(block_rows)\n"
+            "range_looks = int(range_looks)\n"
+            "az_looks = int(az_looks)\n"
             "filter_gpu = filter_gpu.lower() == 'true'\n"
             "flatten_raster = None if flatten_raster == '__NONE__' else flatten_raster\n"
             "range_pixel_spacing = None if range_pixel_spacing == '__NONE__' else float(range_pixel_spacing)\n"
@@ -4082,13 +4864,17 @@ def _crossmul_filter_isce3_gpu_subprocess(
             "slave_raster = isce3.io.Raster(str(slave_local))\n"
             "width = int(master_raster.width)\n"
             "length = int(master_raster.length)\n"
+            "looked_width = width // range_looks\n"
+            "looked_length = length // az_looks\n"
+            "if looked_width < 1 or looked_length < 1:\n"
+            "    raise RuntimeError(f'invalid multilook factors for raster size: {length}x{width}, looks={az_looks}x{range_looks}')\n"
             "if int(slave_raster.width) != width or int(slave_raster.length) != length:\n"
             "    raise RuntimeError(f'CUDA crossmul input dimensions differ: master={length}x{width}, slave={slave_raster.length}x{slave_raster.width}')\n"
-            "ifg_raster = isce3.io.Raster(str(ifg_path), width, length, 1, gdal.GDT_CFloat32, 'ENVI')\n"
-            "coh_raster = isce3.io.Raster(str(coh_path), width, length, 1, gdal.GDT_Float32, 'ENVI')\n"
+            "ifg_raster = isce3.io.Raster(str(ifg_path), looked_width, looked_length, 1, gdal.GDT_CFloat32, 'ENVI')\n"
+            "coh_raster = isce3.io.Raster(str(coh_path), looked_width, looked_length, 1, gdal.GDT_Float32, 'ENVI')\n"
             "crossmul = isce3.cuda.signal.Crossmul()\n"
-            "crossmul.range_looks = 1\n"
-            "crossmul.az_looks = 1\n"
+            "crossmul.range_looks = range_looks\n"
+            "crossmul.az_looks = az_looks\n"
             "crossmul.lines_per_block = block_rows\n"
             "try:\n"
             "    crossmul.set_dopplers(isce3.core.LUT1d(), isce3.core.LUT1d())\n"
@@ -4113,8 +4899,8 @@ def _crossmul_filter_isce3_gpu_subprocess(
             "master_raster = None\n"
             "slave_raster = None\n"
             "flatten_isce_raster = None\n"
-            "_wait_for_min_file_size(ifg_path, width * length * np.dtype(np.complex64).itemsize)\n"
-            "_wait_for_min_file_size(coh_path, width * length * np.dtype(np.float32).itemsize)\n"
+            "_wait_for_min_file_size(ifg_path, looked_width * looked_length * np.dtype(np.complex64).itemsize)\n"
+            "_wait_for_min_file_size(coh_path, looked_width * looked_length * np.dtype(np.float32).itemsize)\n"
             "ifg_ds = gdal.Open(str(ifg_path), gdal.GA_ReadOnly)\n"
             "if ifg_ds is None:\n"
             "    raise RuntimeError('failed to open CUDA crossmul interferogram for filtering')\n"
@@ -4136,7 +4922,7 @@ def _crossmul_filter_isce3_gpu_subprocess(
             "    filter_backend = 'cpu'\n"
             "    filtered = _goldstein_filter_cpu(interferogram)\n"
             "print('D2SAR_FILTER_INFO=' + json.dumps({'backend': filter_backend, 'fallback': filter_fallback_reason}), flush=True)\n"
-            "filtered_ds = gdal.GetDriverByName('ENVI').Create(str(filtered_path), width, length, 1, gdal.GDT_CFloat32)\n"
+            "filtered_ds = gdal.GetDriverByName('ENVI').Create(str(filtered_path), looked_width, looked_length, 1, gdal.GDT_CFloat32)\n"
             "if filtered_ds is None:\n"
             "    raise RuntimeError(f'failed to create filtered interferogram raster: {filtered_path}')\n"
             "filtered_ds.GetRasterBand(1).WriteArray(filtered.astype(np.complex64))\n"
@@ -4156,6 +4942,8 @@ def _crossmul_filter_isce3_gpu_subprocess(
         str(slave_slc_path),
         str(gpu_id),
         str(block_rows),
+        str(range_looks),
+        str(azimuth_looks),
         str(ifg_path),
         str(coh_path),
         str(filtered_path),
@@ -4232,7 +5020,6 @@ def _crossmul_filter_isce3_gpu_subprocess(
         raise RuntimeError("failed to open CUDA crossmul/filter outputs")
     try:
         interferogram = _read_band_array(ifg_ds.GetRasterBand(1), dtype=np.complex64).astype(np.complex64)
-        coherence = _read_band_array(coh_ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
         filtered_interferogram = _read_band_array(
             filtered_ds.GetRasterBand(1),
             dtype=np.complex64,
@@ -4241,6 +5028,18 @@ def _crossmul_filter_isce3_gpu_subprocess(
         ifg_ds = None
         coh_ds = None
         filtered_ds = None
+    coherence = _estimate_coherence_from_slc_paths(
+        master_slc_path,
+        slave_slc_path,
+        block_rows=min(int(block_rows), 256),
+        window_size=5,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
+        flatten_raster=flatten_raster,
+        range_pixel_spacing=range_pixel_spacing,
+        wavelength=wavelength,
+        flatten_starting_range_shift_m=flatten_starting_range_shift_m,
+    )
     return (
         interferogram,
         coherence,
@@ -4258,6 +5057,8 @@ def _run_crossmul_and_filter(
     gpu_id: int,
     output_dir: Path,
     block_rows: int = ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
     flatten_raster: str | None = None,
     flatten_mask_raster: str | None = None,
     range_pixel_spacing: float | None = None,
@@ -4280,6 +5081,8 @@ def _run_crossmul_and_filter(
                 output_dir=output_dir,
                 gpu_id=gpu_id,
                 block_rows=block_rows,
+                range_looks=range_looks,
+                azimuth_looks=azimuth_looks,
                 flatten_raster=flatten_raster,
                 range_pixel_spacing=range_pixel_spacing,
                 wavelength=wavelength,
@@ -4310,6 +5113,8 @@ def _run_crossmul_and_filter(
         gpu_id=gpu_id,
         output_dir=output_dir,
         block_rows=block_rows,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
         flatten_raster=flatten_raster,
         flatten_mask_raster=flatten_mask_raster,
         range_pixel_spacing=range_pixel_spacing,
@@ -4346,6 +5151,8 @@ def _run_crossmul(
     gpu_id: int,
     output_dir: Path,
     block_rows: int = ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
     flatten_raster: str | None = None,
     flatten_mask_raster: str | None = None,
     range_pixel_spacing: float | None = None,
@@ -4364,6 +5171,8 @@ def _run_crossmul(
                 output_dir=output_dir,
                 gpu_id=gpu_id,
                 block_rows=block_rows,
+                range_looks=range_looks,
+                azimuth_looks=azimuth_looks,
                 flatten_raster=flatten_raster,
                 range_pixel_spacing=range_pixel_spacing,
                 wavelength=wavelength,
@@ -4384,6 +5193,8 @@ def _run_crossmul(
         flatten_starting_range_shift_m=flatten_starting_range_shift_m,
         block_rows=block_rows,
         progress_reporter=progress_reporter,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
     )
     return interferogram, coherence, "cpu", fallback_reason
 
@@ -4394,11 +5205,18 @@ def run_crossmul_stage(
     gpu_mode: str,
     gpu_id: int,
     block_rows: int,
+    range_looks: int,
+    azimuth_looks: int,
 ) -> tuple[dict, str, str | None]:
+    processing_options = {
+        "range_looks": int(range_looks),
+        "azimuth_looks": int(azimuth_looks),
+    }
     cached_outputs = _load_cached_stage_outputs(
         context.pair_dir,
         "p2",
         required_keys=("interferogram", "coherence"),
+        expected_processing_options=processing_options,
     )
     if cached_outputs is not None:
         return cached_outputs, "cache", None
@@ -4439,6 +5257,8 @@ def run_crossmul_stage(
             gpu_id=gpu_id,
             output_dir=context.pair_dir,
             block_rows=block_rows,
+            range_looks=range_looks,
+            azimuth_looks=azimuth_looks,
             flatten_raster=flatten_options.get("flatten_raster"),
             flatten_mask_raster=flatten_options.get("flatten_mask_raster"),
             range_pixel_spacing=flatten_options.get("range_pixel_spacing"),
@@ -4475,32 +5295,36 @@ def run_crossmul_stage(
         backend_used=stage_backend,
         output_files=result,
         fallback_reason=fallback_reason,
+        processing_options=processing_options,
     )
     return result, stage_backend, fallback_reason
 
 
-def _build_icu_unwrapper():
+def _build_icu_unwrapper(config: dict | None = None):
     import isce3
 
+    cfg = dict(ICU_DEFAULTS)
+    if config:
+        cfg.update(config)
     unwrap = isce3.unwrap.ICU()
-    unwrap.corr_incr_thr = ICU_DEFAULTS["correlation_threshold_increments"]
-    unwrap.buffer_lines = ICU_DEFAULTS["buffer_lines"]
-    unwrap.overlap_lines = ICU_DEFAULTS["overlap_lines"]
-    unwrap.use_phase_grad_neut = ICU_DEFAULTS["use_phase_gradient_neutron"]
-    unwrap.use_intensity_neut = ICU_DEFAULTS["use_intensity_neutron"]
-    unwrap.phase_grad_win_size = ICU_DEFAULTS["phase_gradient_window_size"]
-    unwrap.neut_phase_grad_thr = ICU_DEFAULTS["neutron_phase_gradient_threshold"]
-    unwrap.neut_intensity_thr = ICU_DEFAULTS["neutron_intensity_threshold"]
-    unwrap.neut_correlation_thr = ICU_DEFAULTS["max_intensity_correlation_threshold"]
-    unwrap.trees_number = ICU_DEFAULTS["trees_number"]
-    unwrap.max_branch_length = ICU_DEFAULTS["max_branch_length"]
-    unwrap.ratio_dxdy = ICU_DEFAULTS["pixel_spacing_ratio"]
-    unwrap.init_corr_thr = ICU_DEFAULTS["initial_correlation_threshold"]
-    unwrap.max_corr_thr = ICU_DEFAULTS["max_correlation_threshold"]
-    unwrap.min_cc_area = ICU_DEFAULTS["min_tile_area"]
-    unwrap.num_bs_lines = ICU_DEFAULTS["bootstrap_lines"]
-    unwrap.min_overlap_area = ICU_DEFAULTS["min_overlap_area"]
-    unwrap.phase_var_thr = ICU_DEFAULTS["phase_variance_threshold"]
+    unwrap.corr_incr_thr = cfg["correlation_threshold_increments"]
+    unwrap.buffer_lines = cfg["buffer_lines"]
+    unwrap.overlap_lines = cfg["overlap_lines"]
+    unwrap.use_phase_grad_neut = cfg["use_phase_gradient_neutron"]
+    unwrap.use_intensity_neut = cfg["use_intensity_neutron"]
+    unwrap.phase_grad_win_size = cfg["phase_gradient_window_size"]
+    unwrap.neut_phase_grad_thr = cfg["neutron_phase_gradient_threshold"]
+    unwrap.neut_intensity_thr = cfg["neutron_intensity_threshold"]
+    unwrap.neut_correlation_thr = cfg["max_intensity_correlation_threshold"]
+    unwrap.trees_number = cfg["trees_number"]
+    unwrap.max_branch_length = cfg["max_branch_length"]
+    unwrap.ratio_dxdy = cfg["pixel_spacing_ratio"]
+    unwrap.init_corr_thr = cfg["initial_correlation_threshold"]
+    unwrap.max_corr_thr = cfg["max_correlation_threshold"]
+    unwrap.min_cc_area = cfg["min_tile_area"]
+    unwrap.num_bs_lines = cfg["bootstrap_lines"]
+    unwrap.min_overlap_area = cfg["min_overlap_area"]
+    unwrap.phase_var_thr = cfg["phase_variance_threshold"]
     return unwrap
 
 
@@ -4508,6 +5332,7 @@ def _unwrap_with_icu(
     interferogram: np.ndarray,
     coherence: np.ndarray,
     scratch_dir: Path,
+    config: dict | None = None,
 ) -> np.ndarray:
     import isce3
 
@@ -4523,7 +5348,7 @@ def _unwrap_with_icu(
     unw_ds = None
     cc_ds = None
 
-    icu = _build_icu_unwrapper()
+    icu = _build_icu_unwrapper(config)
     icu.unwrap(
         isce3.io.Raster(str(scratch_dir / "unwrapped_phase.tif"), update=True),
         isce3.io.Raster(str(scratch_dir / "connected_components.tif"), update=True),
@@ -4538,9 +5363,94 @@ def _unwrap_with_icu(
         result = _read_band_array(ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
     finally:
         ds = None
+    cc_ds = gdal.Open(str(scratch_dir / "connected_components.tif"), gdal.GA_ReadOnly)
+    if cc_ds is None:
+        raise RuntimeError("ICU did not produce connected component raster")
+    try:
+        connected_components = _read_band_array(cc_ds.GetRasterBand(1), dtype=np.uint8)
+    finally:
+        cc_ds = None
+    if connected_components is None or not np.any(connected_components):
+        raise RuntimeError("ICU produced no connected component labels")
+    result[connected_components == 0] = np.nan
     if not np.any(np.isfinite(result)):
         raise RuntimeError("ICU produced no finite pixels")
     return result
+
+
+def _unwrap_with_icu_profiles(
+    interferogram: np.ndarray,
+    coherence: np.ndarray,
+    scratch_dir: Path,
+) -> tuple[np.ndarray, str | None]:
+    attempts = (
+        ("default", None),
+        ("relaxed", ICU_RELAXED_OVERRIDES),
+    )
+    errors: list[str] = []
+    best_result: np.ndarray | None = None
+    best_profile = ""
+    best_valid_fraction = -1.0
+    for profile_name, config in attempts:
+        try:
+            result = _unwrap_with_icu(
+                interferogram,
+                coherence,
+                scratch_dir / profile_name,
+                config=config,
+            )
+            valid_fraction = float(np.isfinite(result).mean())
+            if valid_fraction > best_valid_fraction:
+                best_result = result
+                best_profile = profile_name
+                best_valid_fraction = valid_fraction
+            if (
+                profile_name == "default"
+                and valid_fraction >= ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY
+            ):
+                return result, None
+        except Exception as exc:
+            errors.append(f"{profile_name}: {exc}")
+    if best_result is not None:
+        if best_profile == "relaxed":
+            return best_result, "ICU profile=relaxed"
+        return (
+            best_result,
+            f"ICU default valid_fraction={best_valid_fraction:.4f}; relaxed profile not better",
+        )
+    raise RuntimeError(f"ICU failed across profiles: {'; '.join(errors)}")
+
+
+def _select_snaphu_runtime_config(shape: tuple[int, int]) -> dict[str, object]:
+    rows, cols = (int(shape[0]), int(shape[1]))
+    pixels = rows * cols
+    if pixels <= 25_000_000 and max(rows, cols) <= 5000:
+        return {}
+
+    if pixels <= 80_000_000:
+        target_tile_dim = 4096
+    elif pixels <= 180_000_000:
+        target_tile_dim = 3584
+    else:
+        target_tile_dim = 3072
+
+    tiles_down = max(1, math.ceil(rows / target_tile_dim))
+    tiles_across = max(1, math.ceil(cols / target_tile_dim))
+    tiles_down = min(tiles_down, 6)
+    tiles_across = min(tiles_across, 6)
+    tile_count = tiles_down * tiles_across
+    if tile_count <= 1:
+        return {}
+
+    overlap = min(800, max(400, int(round(target_tile_dim * 0.12))))
+    cpu_count = os.cpu_count() or 1
+    cpu_budget = max(1, int(math.floor(cpu_count * 0.8)))
+    nproc = max(1, min(cpu_budget, tile_count, 8))
+    return {
+        "ntiles": (tiles_down, tiles_across),
+        "tile_overlap": (overlap, overlap),
+        "nproc": nproc,
+    }
 
 
 def _unwrap_with_snaphu(
@@ -4553,15 +5463,9 @@ def _unwrap_with_snaphu(
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
     cfg = dict(SNAPHU_DEFAULTS)
+    cfg.update(_select_snaphu_runtime_config(interferogram.shape))
     if config_overrides:
         cfg.update(config_overrides)
-
-    rows, cols = interferogram.shape
-    if rows > 5000 and cols > 5000:
-        cfg["ntiles"] = (2, 2)
-        cfg["tile_overlap"] = (600, 600)
-        cfg["nproc"] = 4
-        print(f"[SNAPHU] Large image detected ({rows}x{cols}), using 2x2 tiles with 600 overlap, nproc=4")
 
     unw = np.zeros(interferogram.shape, dtype=np.float32)
     conncomp = np.zeros(interferogram.shape, dtype=np.uint32)
@@ -4594,15 +5498,19 @@ def _unwrap_with_snaphu_profiles(
     interferogram: np.ndarray,
     coherence: np.ndarray,
     scratch_dir: Path,
+    *,
+    nlooks: float,
 ) -> tuple[np.ndarray, str | None]:
     errors: list[str] = []
     for profile_name, overrides in SNAPHU_RETRY_PROFILES:
         try:
+            cfg_overrides = dict(overrides)
+            cfg_overrides["nlooks"] = float(nlooks)
             result = _unwrap_with_snaphu(
                 interferogram,
                 coherence,
                 scratch_dir / profile_name,
-                config_overrides=overrides,
+                config_overrides=cfg_overrides,
             )
             fallback_reason = None
             if profile_name != "default":
@@ -4618,11 +5526,23 @@ def run_unwrap_stage(
     *,
     unwrap_method: str,
     block_rows: int,
+    range_looks: int,
+    azimuth_looks: int,
 ) -> tuple[dict, str, str | None]:
+    processing_options = {
+        "unwrap_method": str(unwrap_method),
+        "range_looks": int(range_looks),
+        "azimuth_looks": int(azimuth_looks),
+        "snaphu_nlooks": float(range_looks * azimuth_looks),
+        "icu_defaults": dict(ICU_DEFAULTS),
+        "icu_relaxed_overrides": dict(ICU_RELAXED_OVERRIDES),
+        "icu_min_valid_fraction_for_relaxed_retry": ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY,
+    }
     cached_outputs = _load_cached_stage_outputs(
         context.pair_dir,
         "p3",
         required_keys=("unwrapped_phase",),
+        expected_processing_options=processing_options,
     )
     if cached_outputs is not None:
         return cached_outputs, "cache", None
@@ -4636,24 +5556,52 @@ def run_unwrap_stage(
     fallback_reason = None
     with tempfile.TemporaryDirectory(prefix="strip_insar2_unwrap_", dir=str(context.pair_dir)) as tmpdir:
         scratch = Path(tmpdir)
-        if unwrap_method != "icu":
-            raise ValueError(f"unsupported unwrap method: {unwrap_method}")
-        try:
-            unwrapped_phase = _unwrap_with_icu(interferogram, coherence, scratch / "icu")
-        except Exception as icu_exc:
+        if unwrap_method == "snaphu":
             try:
-                unwrapped_phase, snaphu_fallback = _unwrap_with_snaphu_profiles(
+                unwrapped_phase, snaphu_profile = _unwrap_with_snaphu_profiles(
                     interferogram,
                     coherence,
                     scratch / "snaphu",
+                    nlooks=float(range_looks * azimuth_looks),
                 )
-                fallback_reason = f"ICU failed, fell back to SNAPHU: {icu_exc}"
-                if snaphu_fallback:
-                    fallback_reason += f"; {snaphu_fallback}"
+                if snaphu_profile:
+                    fallback_reason = snaphu_profile
             except Exception as snaphu_exc:
-                raise RuntimeError(
-                    f"ICU failed ({icu_exc}); SNAPHU fallback also failed ({snaphu_exc})"
-                ) from snaphu_exc
+                try:
+                    unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
+                        interferogram, coherence, scratch / "icu"
+                    )
+                    fallback_reason = f"SNAPHU failed, fell back to ICU: {snaphu_exc}"
+                    if icu_profile:
+                        fallback_reason += f"; {icu_profile}"
+                except Exception as icu_exc:
+                    raise RuntimeError(
+                        f"SNAPHU failed ({snaphu_exc}); ICU fallback also failed ({icu_exc})"
+                    ) from icu_exc
+        elif unwrap_method == "icu":
+            try:
+                unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
+                    interferogram, coherence, scratch / "icu"
+                )
+                if icu_profile:
+                    fallback_reason = icu_profile
+            except Exception as icu_exc:
+                try:
+                    unwrapped_phase, snaphu_fallback = _unwrap_with_snaphu_profiles(
+                        interferogram,
+                        coherence,
+                        scratch / "snaphu",
+                        nlooks=float(range_looks * azimuth_looks),
+                    )
+                    fallback_reason = f"ICU failed, fell back to SNAPHU: {icu_exc}"
+                    if snaphu_fallback:
+                        fallback_reason += f"; {snaphu_fallback}"
+                except Exception as snaphu_exc:
+                    raise RuntimeError(
+                        f"ICU failed ({icu_exc}); SNAPHU fallback also failed ({snaphu_exc})"
+                    ) from snaphu_exc
+        else:
+            raise ValueError(f"unsupported unwrap method: {unwrap_method}")
 
     output_files = {
         "unwrapped_phase": _save_stage_array(context.pair_dir, "p3", "unwrapped_phase", unwrapped_phase)
@@ -4666,6 +5614,7 @@ def run_unwrap_stage(
         backend_used="cpu",
         output_files=output_files,
         fallback_reason=fallback_reason,
+        processing_options=processing_options,
     )
     return output_files, "cpu", fallback_reason
 
@@ -4676,11 +5625,21 @@ def compute_los_displacement(unwrapped_phase: np.ndarray, wavelength: float) -> 
     )
 
 
-def run_los_stage(context: PairContext) -> tuple[dict, str, str | None]:
+def run_los_stage(
+    context: PairContext,
+    *,
+    range_looks: int,
+    azimuth_looks: int,
+) -> tuple[dict, str, str | None]:
+    processing_options = {
+        "range_looks": int(range_looks),
+        "azimuth_looks": int(azimuth_looks),
+    }
     cached_outputs = _load_cached_stage_outputs(
         context.pair_dir,
         "p4",
         required_keys=("los_displacement",),
+        expected_processing_options=processing_options,
     )
     if cached_outputs is not None:
         return cached_outputs, "cache", None
@@ -4699,6 +5658,7 @@ def run_los_stage(context: PairContext) -> tuple[dict, str, str | None]:
         slave_manifest_path=context.slave_manifest_path,
         backend_used="cpu",
         output_files=output_files,
+        processing_options=processing_options,
     )
     return output_files, "cpu", None
 
@@ -4715,18 +5675,28 @@ def write_insar_hdf(
     output_h5: str,
     block_rows: int = ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT,
     filtered_interferogram: np.ndarray | None = None,
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
 ) -> str:
     master_amp = _compute_slc_amplitude(master_slc_path)
     slave_amp = _compute_slc_amplitude(slave_slc_path)
     avg_amplitude = ((master_amp + slave_amp) * 0.5).astype(np.float32)
+    avg_amplitude = _multilook_mean(avg_amplitude, azimuth_looks, range_looks).astype(np.float32)
     rows, cols = avg_amplitude.shape
 
     with h5py.File(output_h5, "w") as f:
-        f.attrs["product_type"] = "insar_interferogram_fullres"
+        f.attrs["product_type"] = (
+            "insar_interferogram_fullres"
+            if int(range_looks) == 1 and int(azimuth_looks) == 1
+            else "insar_interferogram_multilook"
+        )
         f.attrs["width"] = cols
         f.attrs["length"] = rows
         f.attrs["wavelength"] = float(wavelength)
         f.attrs["unwrap_method"] = unwrap_method
+        f.attrs["range_looks"] = int(range_looks)
+        f.attrs["azimuth_looks"] = int(azimuth_looks)
+        f.attrs["snaphu_nlooks"] = float(range_looks * azimuth_looks)
         f.attrs["radiometry"] = "complex_interferogram"
         f.attrs["value_domain"] = "phase"
         f.attrs["los_displacement_convention"] = "positive = toward satellite"
@@ -4756,11 +5726,20 @@ def write_primary_product(
     gpu_id: int,
     block_rows: int,
     unwrap_method: str,
+    range_looks: int,
+    azimuth_looks: int,
 ) -> tuple[str, str, str | None]:
+    processing_options = {
+        "unwrap_method": str(unwrap_method),
+        "range_looks": int(range_looks),
+        "azimuth_looks": int(azimuth_looks),
+        "effective_crop_window": dict(context.effective_crop_window) if context.effective_crop_window is not None else None,
+    }
     cached_outputs = _load_cached_stage_outputs(
         context.pair_dir,
         "p5",
         required_keys=("interferogram_h5",),
+        expected_processing_options=processing_options,
     )
     if cached_outputs is not None:
         return str(cached_outputs["interferogram_h5"]), "cache", None
@@ -4795,41 +5774,98 @@ def write_primary_product(
         output_h5,
         block_rows=block_rows,
         filtered_interferogram=filtered_interferogram,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
     )
     progress = _StageProgress("p5")
-
-    def _gpu():
-        progress.running(backend="gpu", detail="rdr2geo/topo", elapsed=0.0, force=True)
-        return append_topo_coordinates_hdf(
-            str(context.master_manifest_path),
-            context.resolved_dem,
-            output_h5,
-            block_rows=block_rows,
-            orbit_interp=context.orbit_interp,
-            use_gpu=True,
-            gpu_id=gpu_id,
-            progress_reporter=progress,
-        )
-
-    def _cpu():
-        return append_topo_coordinates_hdf(
-            str(context.master_manifest_path),
-            context.resolved_dem,
-            output_h5,
-            block_rows=block_rows,
-            orbit_interp=context.orbit_interp,
-            use_gpu=False,
-            progress_reporter=progress,
-        )
-
     try:
-        _, backend_used, fallback_reason = run_stage_with_fallback(
-            stage_name="coordinates",
-            gpu_mode=gpu_mode,
-            gpu_id=gpu_id,
-            gpu_runner=_gpu,
-            cpu_runner=_cpu,
-        )
+        # Geocoding topology selection matrix:
+        # - full-res: rerun/add coordinates directly from the current master manifest grid
+        # - window crop: cropped/prepared master manifest defines the runtime radar grid
+        # - multilook without crop: full-scene p0 topo may be multilooked and reused
+        # - window crop + multilook: rerun rdr2geo from the prepared/cropped master manifest, then
+        #   multilook lon/lat/hgt onto the product grid. Reusing p0 topo here risks stale
+        #   full-scene geometry or cache/window mismatches.
+        if int(range_looks) > 1 or int(azimuth_looks) > 1:
+            if context.effective_crop_window is not None:
+                def _gpu_multilook():
+                    progress.running(backend="gpu", detail="rdr2geo/topo-multilook", elapsed=0.0, force=True)
+                    return _append_multilooked_topo_coordinates_hdf(
+                        context=context,
+                        output_h5=output_h5,
+                        block_rows=block_rows,
+                        range_looks=range_looks,
+                        azimuth_looks=azimuth_looks,
+                        use_gpu=True,
+                        gpu_id=gpu_id,
+                    )
+
+                def _cpu_multilook():
+                    return _append_multilooked_topo_coordinates_hdf(
+                        context=context,
+                        output_h5=output_h5,
+                        block_rows=block_rows,
+                        range_looks=range_looks,
+                        azimuth_looks=azimuth_looks,
+                        use_gpu=False,
+                        gpu_id=gpu_id,
+                    )
+
+                _, backend_used, fallback_reason = run_stage_with_fallback(
+                    stage_name="coordinates-multilook",
+                    gpu_mode=gpu_mode,
+                    gpu_id=gpu_id,
+                    gpu_runner=_gpu_multilook,
+                    cpu_runner=_cpu_multilook,
+                )
+            else:
+                p0_record = load_stage_record(context.pair_dir, "p0") or {}
+                p0_outputs = p0_record.get("output_files") or {}
+                master_topo_vrt = p0_outputs.get("master_topo_vrt") or p0_outputs.get("master_topo")
+                if not master_topo_vrt or not Path(str(master_topo_vrt)).exists():
+                    raise RuntimeError("p0 master_topo_vrt is required for multilook coordinate export")
+                progress.running(backend="cpu", detail="topo-from-p0-vrt", elapsed=0.0, force=True)
+                append_topo_coordinates_hdf_from_vrt(
+                    master_topo_vrt,
+                    output_h5,
+                    block_rows=block_rows,
+                    range_looks=range_looks,
+                    azimuth_looks=azimuth_looks,
+                )
+                backend_used = "cpu"
+                fallback_reason = None
+        else:
+            def _gpu():
+                progress.running(backend="gpu", detail="rdr2geo/topo", elapsed=0.0, force=True)
+                return append_topo_coordinates_hdf(
+                    str(context.master_manifest_path),
+                    context.resolved_dem,
+                    output_h5,
+                    block_rows=block_rows,
+                    orbit_interp=context.orbit_interp,
+                    use_gpu=True,
+                    gpu_id=gpu_id,
+                    progress_reporter=progress,
+                )
+
+            def _cpu():
+                return append_topo_coordinates_hdf(
+                    str(context.master_manifest_path),
+                    context.resolved_dem,
+                    output_h5,
+                    block_rows=block_rows,
+                    orbit_interp=context.orbit_interp,
+                    use_gpu=False,
+                    progress_reporter=progress,
+                )
+
+            _, backend_used, fallback_reason = run_stage_with_fallback(
+                stage_name="coordinates",
+                gpu_mode=gpu_mode,
+                gpu_id=gpu_id,
+                gpu_runner=_gpu,
+                cpu_runner=_cpu,
+            )
     finally:
         progress.close()
     append_utm_coordinates_hdf(
@@ -4846,6 +5882,7 @@ def write_primary_product(
         output_files={"interferogram_h5": output_h5},
         fallback_reason=fallback_reason,
         upstream_stage_dependencies=["p4"],
+        processing_options=processing_options,
     )
     return output_h5, backend_used, fallback_reason
 
@@ -4855,8 +5892,8 @@ def _derive_pair_identity(
     slave_manifest_path: str | Path,
     output_root: str | Path,
 ) -> tuple[str, Path]:
-    master_path = Path(master_manifest_path)
-    slave_path = Path(slave_manifest_path)
+    master_path = Path(master_manifest_path).resolve()
+    slave_path = Path(slave_manifest_path).resolve()
     master_manifest = load_manifest(master_path)
     slave_manifest = load_manifest(slave_path)
     with open(resolve_manifest_metadata_path(master_path, master_manifest, "acquisition"), encoding="utf-8") as f:
@@ -4870,7 +5907,7 @@ def _derive_pair_identity(
     master_date = extract_scene_date(master_acq_data, master_orbit_data)
     slave_date = extract_scene_date(slave_acq_data, slave_orbit_data)
     pair_name = build_pair_name(master_date, slave_date)
-    pair_dir = Path(output_root) / pair_name
+    pair_dir = Path(output_root).resolve() / pair_name
     pair_dir.mkdir(parents=True, exist_ok=True)
     return pair_name, pair_dir
 
@@ -4880,19 +5917,20 @@ def _prepare_runtime_inputs(
     master_manifest_path: str | Path,
     slave_manifest_path: str | Path,
     pair_dir: Path,
-    bbox: tuple[float, float, float, float] | None,
+    window: tuple[int, int, int, int] | None,
     dem_path: str | None,
     dem_cache_dir: str | None,
     dem_margin_deg: float,
 ) -> dict:
+    pair_dir = Path(pair_dir).resolve()
     prepared_dir = pair_dir / "prepared"
     master_prepared_dir = prepared_dir / "master"
     slave_prepared_dir = prepared_dir / "slave"
     master_prepared_dir.mkdir(parents=True, exist_ok=True)
     slave_prepared_dir.mkdir(parents=True, exist_ok=True)
 
-    master_path = Path(master_manifest_path)
-    slave_path = Path(slave_manifest_path)
+    master_path = Path(master_manifest_path).resolve()
+    slave_path = Path(slave_manifest_path).resolve()
     master_manifest = load_manifest(master_path)
     slave_manifest = load_manifest(slave_path)
 
@@ -4902,6 +5940,8 @@ def _prepare_runtime_inputs(
         master_acq_data = json.load(f)
     with open(resolve_manifest_metadata_path(master_path, master_manifest, "radargrid"), encoding="utf-8") as f:
         master_rg_data = json.load(f)
+    with open(resolve_manifest_metadata_path(master_path, master_manifest, "doppler"), encoding="utf-8") as f:
+        master_dop_data = json.load(f)
     with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "acquisition"), encoding="utf-8") as f:
         slave_acq_data = json.load(f)
     with open(resolve_manifest_metadata_path(slave_path, slave_manifest, "radargrid"), encoding="utf-8") as f:
@@ -4922,24 +5962,59 @@ def _prepare_runtime_inputs(
         prf_policy="auto",
         skip_precheck=False,
     )
+    precheck_checks = {
+        key: {
+            "severity": value.get("severity"),
+            "message": value.get("message"),
+        }
+        for key, value in (precheck.get("checks") or {}).items()
+        if isinstance(value, dict)
+    }
+    _log_prepare_info(
+        "precheck",
+        (
+            f"requires_prep={bool(precheck.get('requires_prep'))} "
+            f"geometry_mode={precheck.get('recommended_geometry_mode', 'unknown')} "
+            f"checks={json.dumps(precheck_checks, ensure_ascii=False)}"
+        ),
+    )
 
     normalize_needed = precheck.get("requires_prep", False)
     normalized_slave_manifest = None
+    normalize_plan = None
+    normalize_dir = pair_dir / "normalize_temp"
     if normalize_needed:
         from insar_preprocess import build_preprocess_plan
-        normalize_dir = pair_dir / "normalize_temp"
         normalize_dir.mkdir(parents=True, exist_ok=True)
-        _, normalized_slave_manifest = build_preprocess_plan(
+        _log_prepare_info(
+            "normalize",
+            _format_normalize_start_message(
+                precheck,
+                master_acquisition=master_acq_data,
+                slave_acquisition=slave_acq_data,
+            ),
+        )
+        normalize_plan, normalized_slave_manifest = build_preprocess_plan(
             precheck=precheck,
             slave_manifest_path=slave_path,
             stage_dir=normalize_dir,
             master_acquisition=master_acq_data,
             master_radargrid=master_rg_data,
+            master_doppler=master_dop_data,
             slave_acquisition=slave_acq_data,
             slave_radargrid=slave_rg_data,
             slave_doppler=slave_dop_data,
         )
         normalized_slave_manifest = Path(normalized_slave_manifest)
+        _log_prepare_info(
+            "normalize",
+            (
+                f"performed=True actions={json.dumps(normalize_plan.get('actions', []), ensure_ascii=False)} "
+                f"normalized_slave_manifest={normalized_slave_manifest}"
+            ),
+        )
+    else:
+        _log_prepare_info("normalize", "performed=False actions=[] using_original_slave_manifest")
 
     effective_slave_path = slave_path
     if normalized_slave_manifest is not None and normalized_slave_manifest.exists():
@@ -4949,15 +6024,14 @@ def _prepare_runtime_inputs(
             slave_acq_data = json.load(f)
         with open(resolve_manifest_metadata_path(effective_slave_path, effective_slave_manifest, "radargrid"), encoding="utf-8") as f:
             slave_rg_data = json.load(f)
+        _log_prepare_info("normalize", f"effective_slave_manifest={effective_slave_path}")
 
     master_window = None
-    slave_window = None
-    effective_bbox = bbox
-    if bbox is not None:
+    if window is not None:
         from insar_crop import normalize_crop_request
         crop_result = normalize_crop_request(
-            bbox=bbox,
-            window=None,
+            bbox=None,
+            window=window,
             radargrid_data=master_rg_data,
             scene_corners=master_scene_corners,
         )
@@ -4967,70 +6041,66 @@ def _prepare_runtime_inputs(
             crop_result["master_window"]["rows"],
             crop_result["master_window"]["cols"],
         )
-
-    if master_window is not None:
-        from insar_subset import build_cropped_manifest
-        prepared_master_manifest_path = build_cropped_manifest(
-            manifest_path=master_path,
-            output_dir=master_prepared_dir,
-            output_name="master",
-            window=master_window,
+        _log_prepare_info(
+            "crop",
+            (
+                f"window={list(window) if window is not None else None} "
+                f"master_window={json.dumps(crop_result['master_window'], ensure_ascii=False)}"
+            ),
         )
     else:
-        import shutil
-        prepared_master_manifest_path = str(master_prepared_dir / "manifest.json")
-        shutil.copyfile(master_path, prepared_master_manifest_path)
-        for meta_file in ["acquisition.json", "radargrid.json", "doppler.json", "orbit.json", "scene.json"]:
-            src = master_path.parent / "metadata" / meta_file
-            if src.exists():
-                shutil.copyfile(src, master_prepared_dir / meta_file)
+        _log_prepare_info("crop", "window=None using_full_scene")
 
-    if master_window is not None:
-        from insar_subset import build_cropped_manifest
-        prepared_slave_manifest_path = build_cropped_manifest(
-            manifest_path=effective_slave_path,
-            output_dir=slave_prepared_dir,
-            output_name="slave",
-            window=master_window,
-        )
-    else:
-        import shutil
-        prepared_slave_manifest_path = str(slave_prepared_dir / "manifest.json")
-        shutil.copyfile(effective_slave_path, prepared_slave_manifest_path)
-        for meta_file in ["acquisition.json", "radargrid.json", "doppler.json", "orbit.json", "scene.json"]:
-            src = effective_slave_path.parent / "metadata" / meta_file
-            if src.exists():
-                shutil.copyfile(src, slave_prepared_dir / meta_file)
+    from insar_subset import build_cropped_manifest
+    master_prepare_mode = "crop" if master_window is not None else "full-scene"
+    prepared_master_manifest_path = build_cropped_manifest(
+        manifest_path=master_path,
+        output_dir=master_prepared_dir,
+        output_name="master",
+        window=master_window,
+    )
+    _log_prepare_info(
+        "prepare-master",
+        f"mode={master_prepare_mode} output_manifest={prepared_master_manifest_path}",
+    )
 
-    source_dem = _resolve_dem_path(master_path, master_manifest, [], dem_path, dem_cache_dir, dem_margin_deg)
+    slave_prepare_mode = "crop" if master_window is not None else "full-scene"
+    prepared_slave_manifest_path = build_cropped_manifest(
+        manifest_path=effective_slave_path,
+        output_dir=slave_prepared_dir,
+        output_name="slave",
+        window=master_window,
+    )
+    _log_prepare_info(
+        "prepare-slave",
+        f"mode={slave_prepare_mode} output_manifest={prepared_slave_manifest_path}",
+    )
+
+    source_dem = _resolve_dem_path(
+        master_path,
+        master_manifest,
+        master_scene_corners,
+        dem_path,
+        dem_cache_dir,
+        dem_margin_deg,
+    )
     prepared_dem_dir = prepared_dir / "dem"
     prepared_dem_dir.mkdir(parents=True, exist_ok=True)
-    if bbox is not None:
-        expanded_bbox = (
-            bbox[0] - dem_margin_deg,
-            bbox[1] - dem_margin_deg,
-            bbox[2] + dem_margin_deg,
-            bbox[3] + dem_margin_deg,
-        )
-        from osgeo import gdal
-        output_dem_path = prepared_dem_dir / "dem.tif"
-        gdal.Warp(
-            str(output_dem_path),
-            str(source_dem),
-            outputBounds=expanded_bbox,
-            resampleAlg="bilinear",
-            format="GTiff",
-            options=["COMPRESS=LZW", "TILED=YES"],
-        )
-        prepared_dem = str(output_dem_path)
+    dem_prepare_mode = "copy"
+    import shutil
+    if Path(source_dem).suffix.lower() in (".tif", ".vrt"):
+        prepared_dem = str(prepared_dem_dir / "dem.vrt")
+        shutil.copyfile(source_dem, prepared_dem)
     else:
-        import shutil
-        if Path(source_dem).suffix.lower() in (".tif", ".vrt"):
-            prepared_dem = str(prepared_dem_dir / "dem.vrt")
-            shutil.copyfile(source_dem, prepared_dem)
-        else:
-            prepared_dem = str(prepared_dem_dir / "dem.tif")
-            shutil.copyfile(source_dem, prepared_dem)
+        prepared_dem = str(prepared_dem_dir / "dem.tif")
+        shutil.copyfile(source_dem, prepared_dem)
+    _log_prepare_info(
+        "dem",
+        (
+            f"mode={dem_prepare_mode} source_dem={source_dem} "
+            f"output_dem={prepared_dem}"
+        ),
+    )
 
     summary = {
         "original_master_manifest": str(master_path),
@@ -5039,7 +6109,6 @@ def _prepare_runtime_inputs(
         "prepared_master_manifest": prepared_master_manifest_path,
         "prepared_slave_manifest": prepared_slave_manifest_path,
         "prepared_dem": prepared_dem,
-        "effective_bbox": list(bbox) if bbox else None,
         "effective_master_window": {
             "row0": master_window[0] if master_window else 0,
             "col0": master_window[1] if master_window else 0,
@@ -5048,22 +6117,51 @@ def _prepare_runtime_inputs(
         },
         "normalization_performed": normalize_needed,
         "normalization_required": bool(normalized_slave_manifest),
+        "precheck": {
+            "requires_prep": bool(precheck.get("requires_prep")),
+            "recommended_geometry_mode": precheck.get("recommended_geometry_mode"),
+            "checks": precheck_checks,
+        },
+        "normalization": {
+            "requested": bool(precheck.get("requires_prep")),
+            "performed": bool(normalized_slave_manifest),
+            "actions": list((normalize_plan or {}).get("actions", [])),
+            "geometry_mode": (normalize_plan or {}).get("geometry_mode"),
+            "normalized_slave_manifest": str(normalized_slave_manifest) if normalized_slave_manifest is not None else None,
+            "effective_slave_manifest": str(effective_slave_path),
+        },
+        "crop": {
+            "applied": bool(master_window is not None),
+            "window": list(window) if window else None,
+            "master_window": {
+                "row0": master_window[0] if master_window else 0,
+                "col0": master_window[1] if master_window else 0,
+                "rows": master_window[2] if master_window else master_rg_data.get("numberOfRows", 0),
+                "cols": master_window[3] if master_window else master_rg_data.get("numberOfColumns", 0),
+            },
+            "prepare_master_mode": master_prepare_mode,
+            "prepare_slave_mode": slave_prepare_mode,
+        },
+        "dem_prepare": {
+            "mode": dem_prepare_mode,
+            "source_dem": str(source_dem),
+            "prepared_dem": prepared_dem,
+        },
     }
     summary_path = prepared_dir / "prepare_summary.json"
+    summary["outputs"] = {
+        "prepared_master_manifest": prepared_master_manifest_path,
+        "prepared_slave_manifest": prepared_slave_manifest_path,
+        "prepared_dem": prepared_dem,
+        "summary_path": str(summary_path),
+    }
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    import shutil as _shutil
-    if normalize_needed and normalize_dir.exists():
-        try:
-            _shutil.rmtree(normalize_dir)
-        except Exception:
-            pass
+    _log_prepare_info("summary", f"summary_path={summary_path}")
 
     return {
         "prepared_master_manifest": prepared_master_manifest_path,
         "prepared_slave_manifest": prepared_slave_manifest_path,
         "prepared_dem": prepared_dem,
-        "effective_bbox": effective_bbox,
         "effective_master_window": summary["effective_master_window"],
     }
 
@@ -5076,50 +6174,55 @@ def process_strip_insar2(
     gpu_mode: str = "auto",
     gpu_id: int = 0,
     unwrap_method: str = "icu",
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
     resolution_meters: float = 20.0,
     block_rows: int | None = None,
     dem_path: str | None = None,
     dem_cache_dir: str | None = None,
     dem_margin_deg: float = 0.2,
     no_kml: bool = False,
-    bbox: tuple[float, float, float, float] | None = None,
+    window: tuple[int, int, int, int] | None = None,
 ) -> dict:
-    if bbox is not None:
-        pair_name, pair_dir = _derive_pair_identity(
-            master_manifest_path,
-            slave_manifest_path,
-            output_root,
-        )
-        prepared_inputs = _prepare_runtime_inputs(
-            master_manifest_path=master_manifest_path,
-            slave_manifest_path=slave_manifest_path,
-            pair_dir=pair_dir,
-            bbox=bbox,
-            dem_path=dem_path,
-            dem_cache_dir=dem_cache_dir,
-            dem_margin_deg=dem_margin_deg,
-        )
-        context = load_pair_context(
-            prepared_inputs["prepared_master_manifest"],
-            prepared_inputs["prepared_slave_manifest"],
-            output_root=output_root,
-            dem_path=prepared_inputs["prepared_dem"],
-            dem_cache_dir=dem_cache_dir,
-            dem_margin_deg=dem_margin_deg,
-        )
-    else:
-        context = load_pair_context(
-            master_manifest_path,
-            slave_manifest_path,
-            output_root=output_root,
-            dem_path=dem_path,
-            dem_cache_dir=dem_cache_dir,
-            dem_margin_deg=dem_margin_deg,
-        )
+    pair_name, pair_dir = _derive_pair_identity(
+        master_manifest_path,
+        slave_manifest_path,
+        output_root,
+    )
+    prepared_inputs = _prepare_runtime_inputs(
+        master_manifest_path=master_manifest_path,
+        slave_manifest_path=slave_manifest_path,
+        pair_dir=pair_dir,
+        window=window,
+        dem_path=dem_path,
+        dem_cache_dir=dem_cache_dir,
+        dem_margin_deg=dem_margin_deg,
+    )
+    context = load_pair_context(
+        prepared_inputs["prepared_master_manifest"],
+        prepared_inputs["prepared_slave_manifest"],
+        output_root=output_root,
+        dem_path=prepared_inputs["prepared_dem"],
+        dem_cache_dir=dem_cache_dir,
+        dem_margin_deg=dem_margin_deg,
+    )
+    context.effective_crop_window = prepared_inputs["effective_master_window"]
     stage_backends: dict[str, str] = {}
     fallback_reasons: dict[str, str] = {}
 
     geometry_block_rows, crossmul_block_rows = _resolve_stage_block_rows(block_rows)
+    range_looks = _normalize_looks(range_looks, "range_looks")
+    azimuth_looks = _normalize_looks(azimuth_looks, "azimuth_looks")
+
+    master_slc_entry = (context.master_manifest.get("slc") or {}).get("path")
+    slave_slc_entry = (context.slave_manifest.get("slc") or {}).get("path")
+    master_slc_resolved = resolve_manifest_data_path(context.master_manifest_path, master_slc_entry)
+    slave_slc_resolved = resolve_manifest_data_path(context.slave_manifest_path, slave_slc_entry)
+    print(
+        f"[{utc_now_iso()}] [p0] input-slc "
+        f"master={master_slc_resolved} slave={slave_slc_resolved}",
+        flush=True,
+    )
 
     _log_stage_status("p0", "START")
     _, backend_used, fallback_reason = run_geo2rdr_stage(
@@ -5150,6 +6253,8 @@ def process_strip_insar2(
         gpu_mode=gpu_mode,
         gpu_id=gpu_id,
         block_rows=crossmul_block_rows,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
     )
     stage_backends["crossmul"] = backend_used
     if fallback_reason:
@@ -5161,6 +6266,8 @@ def process_strip_insar2(
         context,
         unwrap_method=unwrap_method,
         block_rows=geometry_block_rows,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
     )
     stage_backends["unwrap"] = backend_used
     if fallback_reason:
@@ -5168,7 +6275,11 @@ def process_strip_insar2(
     _log_stage_status("p3", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
 
     _log_stage_status("p4", "START")
-    _, backend_used, fallback_reason = run_los_stage(context)
+    _, backend_used, fallback_reason = run_los_stage(
+        context,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
+    )
     stage_backends["los"] = backend_used
     if fallback_reason:
         fallback_reasons["los"] = fallback_reason
@@ -5182,6 +6293,8 @@ def process_strip_insar2(
         gpu_id=gpu_id,
         block_rows=geometry_block_rows,
         unwrap_method=unwrap_method,
+        range_looks=range_looks,
+        azimuth_looks=azimuth_looks,
     )
     stage_backends["product"] = backend_used
     if fallback_reason:
@@ -5233,23 +6346,57 @@ def main() -> None:
     )
     parser.add_argument("master_json")
     parser.add_argument("slave_json")
-    parser.add_argument("--output-root", default="results")
-    parser.add_argument("--gpu-mode", choices=["auto", "gpu", "cpu"], default="auto")
-    parser.add_argument("--gpu-id", type=int, default=0)
-    parser.add_argument("--unwrap-method", choices=["icu"], default="icu")
-    parser.add_argument("--resolution", type=float, default=None,
-                        help="Output ground resolution in meters (default: 2x max SAR resolution, rounded up to 0.5)")
-    parser.add_argument("--block-rows", type=int, default=None)
-    parser.add_argument("--dem-path")
-    parser.add_argument("--dem-cache-dir")
-    parser.add_argument("--dem-margin-deg", type=float, default=0.2)
+    parser.add_argument("--out", "--output-root", dest="output_root", default="results")
+    parser.add_argument("--gpu", "--gpu-mode", dest="gpu_mode", choices=["auto", "gpu", "cpu"], default="auto")
+    parser.add_argument("--gid", "--gpu-id", dest="gpu_id", type=int, default=0)
+    parser.add_argument(
+        "--unwrap",
+        "--unwrap-method",
+        "--unwrap-algo",
+        dest="unwrap_method",
+        choices=["snaphu", "icu"],
+        default="icu",
+    )
+    parser.add_argument(
+        "--rlks",
+        type=int,
+        default=1,
+        help="Range multilook factor. Default: 1 (satellite full-resolution default; no multilook).",
+    )
+    parser.add_argument(
+        "--alks",
+        type=int,
+        default=1,
+        help="Azimuth multilook factor. Default: 1 (satellite full-resolution default; no multilook).",
+    )
+    parser.add_argument(
+        "--res",
+        "--resolution",
+        dest="resolution",
+        type=float,
+        default=None,
+        help="Output ground resolution in meters. Default: full-resolution uses 2x max SAR resolution; multilook uses multilooked SAR resolution, rounded up to 0.5 m.",
+    )
+    parser.add_argument("--blk", "--block-rows", dest="block_rows", type=int, default=None)
+    parser.add_argument("--dem", "--dem-path", dest="dem_path")
+    parser.add_argument("--dem-cache", "--dem-cache-dir", dest="dem_cache_dir")
+    parser.add_argument("--dem-margin", "--dem-margin-deg", dest="dem_margin_deg", type=float, default=0.2)
     parser.add_argument("--no-kml", action="store_true")
-    parser.add_argument("--bbox", type=float, nargs=4, metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
-                        help="Geographic bounding box for crop region")
+    parser.add_argument(
+        "--window",
+        type=int,
+        nargs=4,
+        metavar=("ROW0", "COL0", "ROWS", "COLS"),
+        help="Direct radar-grid crop window: row0 col0 rows cols",
+    )
     args = parser.parse_args()
 
     if args.resolution is None:
-        args.resolution = _compute_default_resolution(args.master_json)
+        args.resolution = _compute_default_resolution(
+            args.master_json,
+            range_looks=args.rlks,
+            azimuth_looks=args.alks,
+        )
 
     try:
         result = process_strip_insar2(
@@ -5259,13 +6406,15 @@ def main() -> None:
             gpu_mode=args.gpu_mode,
             gpu_id=args.gpu_id,
             unwrap_method=args.unwrap_method,
+            range_looks=args.rlks,
+            azimuth_looks=args.alks,
             resolution_meters=args.resolution,
             block_rows=args.block_rows,
             dem_path=args.dem_path,
             dem_cache_dir=args.dem_cache_dir,
             dem_margin_deg=args.dem_margin_deg,
             no_kml=args.no_kml,
-            bbox=tuple(args.bbox) if args.bbox else None,
+            window=tuple(args.window) if args.window else None,
         )
     except Exception as exc:
         show_traceback = str(os.environ.get("D2SAR_STRIP_INSAR2_TRACEBACK", "0")).strip().lower() in {

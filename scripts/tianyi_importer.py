@@ -149,12 +149,13 @@ class TianyiImporter:
         return str(Path(member_name).resolve())
 
     def _relative_to_output(self, output_dir: Path, path_value: str | Path) -> str:
-        path_value = Path(path_value)
-        if not path_value.is_absolute():
-            path_value = path_value.resolve()
-        if self.is_zip or self.is_tar:
-            return str(path_value)
-        return os.path.relpath(str(path_value), str(output_dir.resolve()))
+        path_str = str(path_value)
+        if path_str.startswith("/vsizip/") or path_str.startswith("/vsitar/"):
+            return path_str
+        path_obj = Path(path_value)
+        if not path_obj.is_absolute():
+            path_obj = path_obj.resolve()
+        return str(path_obj)
 
     def _manifest_ref(
         self, output_dir: Path, path_value: str | Path, member: str | None = None
@@ -183,7 +184,8 @@ class TianyiImporter:
         dem_dir: str | None = None,
         download_dem: bool = False,
         dem_source: int = 1,
-        dem_margin_deg: float = 0.05,
+        dem_margin_deg: float = 0.1,
+        output_path: Path | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         from dem_manager import dem_from_scene_corners, find_dem_in_directory_for_scene
 
@@ -194,8 +196,13 @@ class TianyiImporter:
                     dem_dir,
                     margin_deg=dem_margin_deg,
                 )
+                # Convert to relative path for portability
+                if output_path:
+                    rel_dem_path = str(Path(dem_path).resolve().relative_to(output_path.resolve()))
+                else:
+                    rel_dem_path = str(Path(dem_path).resolve())
                 return dem_path, {
-                    "path": dem_path,
+                    "path": rel_dem_path,
                     "source": "local_directory",
                     "directory": str(Path(dem_dir).resolve()),
                     "autoDownloaded": False,
@@ -211,8 +218,13 @@ class TianyiImporter:
                 output_dir=dem_dir,
                 source=dem_source,
             )
+            # Convert to relative path for portability
+            if output_path:
+                rel_dem_path = str(Path(dem_path).resolve().relative_to(output_path.resolve()))
+            else:
+                rel_dem_path = str(Path(dem_path).resolve())
             return dem_path, {
-                "path": dem_path,
+                "path": rel_dem_path,
                 "source": f"SRTMGL{dem_source}",
                 "directory": str(Path(dem_dir).resolve()) if dem_dir else None,
                 "autoDownloaded": True,
@@ -384,7 +396,7 @@ class TianyiImporter:
         dem_dir: str | None = None,
         download_dem: bool = False,
         dem_source: int = 1,
-        dem_margin_deg: float = 0.05,
+        dem_margin_deg: float = 0.1,
     ) -> str:
         from common_processing import verify_and_correct_look_direction
 
@@ -415,17 +427,17 @@ class TianyiImporter:
         )
         self.acquisition["lookDirection"] = verified_look_direction
 
+        output_path = Path(output_dir)
         if dem_dir is None and download_dem:
-            dem_dir = str(Path(output_dir) / "dem")
+            dem_dir = str(output_path / "dem")
         dem_path, dem_info = self.resolve_dem_option(
             self.scene_info["sceneCorners"],
             dem_dir=dem_dir,
             download_dem=download_dem,
             dem_source=dem_source,
             dem_margin_deg=dem_margin_deg,
+            output_path=output_path,
         )
-
-        output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         metadata_dir = output_path / "metadata"
         metadata_dir.mkdir(exist_ok=True)
@@ -468,6 +480,10 @@ class TianyiImporter:
                 "path": slc_ref,
                 "format": "TIFF",
                 "complex": True,
+                "sample_format": "cint16",
+                "storage_layout": "single_band_complex",
+                "complex_band_count": 1,
+                "processing_format": "single_band_cfloat32",
                 "rows": self.radar_grid["numberOfRows"],
                 "columns": self.radar_grid["numberOfColumns"],
             },
