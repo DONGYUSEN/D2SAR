@@ -260,6 +260,8 @@ def resolve_manifest_data_path(manifest_path: str | Path, entry) -> str | None:
         path_value = entry.get("path")
         if path_value is None:
             return None
+        if str(path_value).startswith("/vsizip/") or str(path_value).startswith("/vsitar/"):
+            return _normalize_vsi_archive_path(str(path_value))
         base_path = Path(path_value)
         resolved = str(
             base_path if base_path.is_absolute() else (manifest_dir / base_path)
@@ -488,8 +490,16 @@ def construct_orbit(orbit_json: dict, interp_method: str = "Hermite"):
     state_vectors = []
     for i, sv in enumerate(orbit_json["stateVectors"]):
         dt = isce3.core.DateTime(raw_datetimes[i])
-        pos = np.array([sv["posX"], sv["posY"], sv["posZ"]], dtype=np.float64)
-        vel = np.array([sv["velX"], sv["velY"], sv["velZ"]], dtype=np.float64)
+        if "position" in sv:
+            position = sv["position"]
+            pos = np.array([position["x"], position["y"], position["z"]], dtype=np.float64)
+        else:
+            pos = np.array([sv["posX"], sv["posY"], sv["posZ"]], dtype=np.float64)
+        if "velocity" in sv:
+            velocity = sv["velocity"]
+            vel = np.array([velocity["x"], velocity["y"], velocity["z"]], dtype=np.float64)
+        else:
+            vel = np.array([sv["velX"], sv["velY"], sv["velZ"]], dtype=np.float64)
         state_vectors.append(isce3.core.StateVector(dt, pos, vel))
 
     ref_dt = isce3.core.DateTime(
@@ -530,13 +540,15 @@ def construct_doppler_lut2d(
     orbit_ref_dt = gps_to_datetime(orbit_json["header"]["firstStateTimeUTC"])
     gps_epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
     orbit_ref_gps = (orbit_ref_dt - gps_epoch).total_seconds()
-    sensing_start = float(acquisition_json["startGPSTime"]) - orbit_ref_gps
+    sensing_start_abs_gps = radargrid_json.get("sensingStartGPSTime", acquisition_json["startGPSTime"])
+    sensing_start = float(sensing_start_abs_gps) - orbit_ref_gps
     length = int(radargrid_json["numberOfRows"])
     if length <= 0:
         raise ValueError("radargrid_json.numberOfRows must be positive")
-    prf = float(acquisition_json["prf"])
+    row_spacing = radargrid_json.get("rowSpacing")
+    prf = 1.0 / float(row_spacing) if row_spacing else float(acquisition_json["prf"])
     if prf <= 0.0:
-        raise ValueError("acquisition_json.prf must be positive")
+        raise ValueError("radar grid PRF must be positive")
     # Pad one extra azimuth sample so end-of-swath evaluations remain inside
     # the LUT domain under floating-point error.
     sensing_end = sensing_start + length / prf
@@ -568,14 +580,15 @@ def construct_radar_grid(
     import isce3.core
     import isce3.product
 
-    sensing_start_abs_gps = acquisition_json["startGPSTime"]
+    sensing_start_abs_gps = radargrid_json.get("sensingStartGPSTime", acquisition_json["startGPSTime"])
     orbit_ref_dt = gps_to_datetime(orbit_json["header"]["firstStateTimeUTC"])
     gps_epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
     orbit_ref_gps = (orbit_ref_dt - gps_epoch).total_seconds()
     sensing_start_rel = sensing_start_abs_gps - orbit_ref_gps
 
     wavelength = isce3.core.speed_of_light / acquisition_json["centerFrequency"]
-    prf = acquisition_json["prf"]
+    row_spacing = radargrid_json.get("rowSpacing")
+    prf = 1.0 / float(row_spacing) if row_spacing else acquisition_json["prf"]
     r0 = isce3.core.speed_of_light * radargrid_json["rangeTimeFirstPixel"] / 2.0
     range_pixel_spacing = radargrid_json["columnSpacing"]
 

@@ -1,0 +1,21 @@
+{
+  "source": "lutan",
+  "mission": "LT1B",
+  "sensorMode": "Master",
+  "polarisation": "HH",
+  "imagingMode": "STRIP1",
+  "lookDirection": "RIGHT",
+  "centerFrequency": 1260000000.0,
+  "prf": 3292.181152,
+  "startTimeUTC": "2025-06-07T23:46:32.382968",
+  "stopTimeUTC": "2025-06-07T23:46:41.018277",
+  "startGPSTime": 1433375192.382968,
+  "stopGPSTime": 1433375201.018277,
+  "rangeTimeFirstPixel": 0.004358555955027703,
+  "rangeTimeLastPixel": 0.004516978177249925,
+  "centerLat": 29.384460544,
+  "centerLon": 95.102173478,
+  "headingAngle": 191.03995016170293,
+  "sceneAverageHeight": 2493.997630425653,
+  "incidenceAngleCenter": 26.0893814333799
+}

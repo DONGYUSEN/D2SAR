@@ -1,0 +1,14 @@
+{
+  "numberOfRows": 28431,
+  "numberOfColumns": 14259,
+  "rowSpacing": 2.115452207162859,
+  "columnSpacing": 1.6655136555555556,
+  "groundRangeResolution": 4.615721931001025,
+  "azimuthResolution": 3.873333491657103,
+  "prf": 3292.181152,
+  "rangeLooks": 1,
+  "azimuthLooks": 1,
+  "geocodedFlag": "false",
+  "rangeTimeFirstPixel": 0.004358555955027703,
+  "rangeTimeLastPixel": 0.004516978177249925
+}

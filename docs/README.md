@@ -183,6 +183,56 @@ python3 scripts/strip_rtc.py \
 - `amplitude_utm_geocoded.tif`
 - `amplitude_utm_geocoded.png`
 
+---
+
+## Sentinel TOPS RTC（当前生效流程）
+
+`scripts/tops_rtc.py` 当前统一流程为：
+
+1. 生成/读取 `tops_rtc_plan.json`
+2. 多 burst 先做 **radar-grid burst merge**
+3. 在 merged radar HDF 上执行 topo（`longitude/latitude/height`）
+4. 计算并应用 RTC
+5. 输出 geocoding 结果（GeoTIFF + PNG）
+
+关键点：
+
+- 保持单 burst RTC 处理逻辑不变
+- 多 burst 不再走“先各 burst geocode 再拼接”的旧路径
+- `--apply-rtc` 在多 burst 场景会直接进入 merged 流程并输出 geocoded 结果
+
+示例（2 burst，含 RTC + geocoding）：
+
+```bash
+python3 scripts/tops_rtc.py \
+  /path/to/manifest.json \
+  /path/to/out \
+  --apply-rtc \
+  --dem /path/to/dem.tif \
+  --burst-limit 2 \
+  --block-rows 256 \
+  --resolution 20
+```
+
+典型输出（按当前实现）：
+
+- `mosaic_slc_amplitude_radar.h5`
+- `mosaic_rtc_amplitude_radar.h5`
+- `mosaic_slc_amplitude_geocoded.tif`
+- `mosaic_slc_amplitude_geocoded.png`
+- `mosaic_rtc_amplitude_geocoded.tif`
+- `mosaic_rtc_amplitude_geocoded.png`
+
+### 已废弃接口（请勿再使用）
+
+以下旧接口/参数已不作为主流程：
+
+- `mosaic_bursts_geocoded`
+- `export_burst_geocoded_preview`
+- `--mosaic`
+- `--export-geocoded`
+- `--export-rtc-geocoded`
+
 ### GPU / CPU 后端语义
 
 `strip_rtc.py` 当前采用**混合后端**：

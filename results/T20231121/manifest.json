@@ -1,0 +1,52 @@
+{
+  "version": "1.0",
+  "productType": "SLC",
+  "sensor": "tianyi",
+  "polarisation": "VV",
+  "startTimeUTC": "2023-11-21T04:39:36.800884",
+  "stopTimeUTC": "2023-11-21T04:39:40.352354",
+  "slc": {
+    "path": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E/measurement/bc3-sm-slc-vv-20231121t043936-002414-000034-00096e-01.tiff"
+    },
+    "format": "TIFF",
+    "complex": true,
+    "sample_format": "cint16",
+    "storage_layout": "single_band_complex",
+    "complex_band_count": 1,
+    "processing_format": "single_band_cfloat32",
+    "rows": 14580,
+    "columns": 12544
+  },
+  "metadata": {
+    "acquisition": "/work/results/T20231121/metadata/acquisition.json",
+    "orbit": "/work/results/T20231121/metadata/orbit.json",
+    "radargrid": "/work/results/T20231121/metadata/radargrid.json",
+    "doppler": "/work/results/T20231121/metadata/doppler.json",
+    "scene": "/work/results/T20231121/metadata/scene.json"
+  },
+  "look_direction": {
+    "xml_value": "LEFT",
+    "verified_value": "LEFT",
+    "was_corrected": false
+  },
+  "ancillary": {
+    "manifestSafe": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E/manifest.safe"
+    },
+    "calibrationXML": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E/annotation/calibration/calibration-bc3-sm-slc-vv-20231121t043936-002414-000034-00096e-01.xml"
+    },
+    "annotationXML": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E/annotation/bc3-sm-slc-vv-20231121t043936-002414-000034-00096e-01.xml"
+    }
+  }
+}

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import importlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -24,6 +25,9 @@ import h5py
 import numpy as np
 from osgeo import gdal, osr
 from PIL import Image
+
+
+logger = logging.getLogger(__name__)
 
 
 ICU_DEFAULTS = {
@@ -69,16 +73,19 @@ ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY = 0.01
 SNAPHU_DEFAULTS = {
     "nlooks": 1.0,
     "cost_mode": "defo",
-    "initialization_method": "mcf",
+    "initialization_method": "mst",
     "min_conncomp_frac": 0.01,
     "phase_grad_window": (5, 5),
-    "ntiles": (1, 1),
-    "tile_overlap": (0, 0),
-    "nproc": 1,
+    "ntiles": "auto",
+    "tile_overlap": (512, 512),
+    "nproc": 4,
     "tile_cost_thresh": 500,
     "min_region_size": 300,
     "single_tile_reoptimize": False,
     "regrow_conncomps": True,
+    "defomax_cycle": 40.0,
+    "corr_thresh": 0.12,
+    "auto_tile_max_pixels": 4_000_000,
 }
 SNAPHU_RETRY_PROFILES = (
     ("default", {}),
@@ -93,7 +100,7 @@ SNAPHU_RETRY_PROFILES = (
         },
     ),
 )
-ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT = 1000
+ISCE3_GEOMETRY_LINES_PER_BLOCK_DEFAULT = 2000
 ISCE3_CROSSMUL_LINES_PER_BLOCK_DEFAULT = 1024
 
 
@@ -2711,6 +2718,7 @@ def export_insar_products(
             Path(value).parent.mkdir(parents=True, exist_ok=True)
 
     target_width, target_height = compute_utm_output_shape(input_h5, resolution_meters)
+
     exported: dict[str, str] = {}
     scalar_datasets = (
         ("avg_amplitude", "avg_amplitude_tif", "avg_amplitude_png"),
@@ -5453,6 +5461,100 @@ def _select_snaphu_runtime_config(shape: tuple[int, int]) -> dict[str, object]:
     }
 
 
+def _unwrap_with_dolphin(
+    interferogram: np.ndarray,
+    coherence: np.ndarray,
+    scratch_dir: Path,
+    *,
+    nlooks: float,
+    unwrap_method: str = "phass",
+) -> tuple[np.ndarray, str | None]:
+    """使用 dolphin 的相位解缠模块进行解缠。"""
+    from dolphin.unwrap import unwrap
+    from dolphin.workflows.config import UnwrapOptions, UnwrapMethod
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    ifg_file = scratch_dir / "interferogram.tif"
+    corr_file = scratch_dir / "coherence.tif"
+    unw_file = scratch_dir / "unwrapped.tif"
+
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    transform = from_bounds(0, 0, interferogram.shape[1], interferogram.shape[0], interferogram.shape[1], interferogram.shape[0])
+    
+    with rasterio.open(
+        ifg_file,
+        "w",
+        driver="GTiff",
+        height=interferogram.shape[0],
+        width=interferogram.shape[1],
+        count=1,
+        dtype="complex64",
+        transform=transform,
+        crs="EPSG:4326",
+    ) as dst:
+        dst.write(interferogram.astype(np.complex64), 1)
+
+    with rasterio.open(
+        corr_file,
+        "w",
+        driver="GTiff",
+        height=coherence.shape[0],
+        width=coherence.shape[1],
+        count=1,
+        dtype="float32",
+        transform=transform,
+        crs="EPSG:4326",
+    ) as dst:
+        dst.write(coherence.astype(np.float32), 1)
+
+    if unwrap_method.lower() == "snaphu":
+        unwrap_method_enum = UnwrapMethod.SNAPHU
+    elif unwrap_method.lower() == "phass":
+        unwrap_method_enum = UnwrapMethod.PHASS
+    elif unwrap_method.lower() == "icu":
+        unwrap_method_enum = UnwrapMethod.ICU
+    else:
+        unwrap_method_enum = UnwrapMethod.PHASS
+
+    snaphu_options = {
+        "ntiles": SNAPHU_DEFAULTS.get("ntiles", "auto"),
+        "tile_overlap": SNAPHU_DEFAULTS.get("tile_overlap", (512, 512)),
+        "n_parallel_tiles": SNAPHU_DEFAULTS.get("nproc", 4),
+        "init_method": SNAPHU_DEFAULTS.get("initialization_method", "mst"),
+        "cost": SNAPHU_DEFAULTS.get("cost_mode", "defo"),
+        "min_conncomp_frac": SNAPHU_DEFAULTS.get("min_conncomp_frac", 0.01),
+        "corr_thresh": SNAPHU_DEFAULTS.get("corr_thresh", None),
+    }
+
+    unwrap_options = UnwrapOptions(
+        unwrap_method=unwrap_method_enum,
+        snaphu_options=snaphu_options,
+    )
+
+    try:
+        unw_path, conncomp_path = unwrap(
+            ifg_filename=str(ifg_file),
+            corr_filename=str(corr_file),
+            unw_filename=str(unw_file),
+            nlooks=nlooks,
+            unwrap_options=unwrap_options,
+        )
+
+        with rasterio.open(unw_path) as src:
+            unwrapped_phase = src.read(1)
+
+        if not np.any(np.isfinite(unwrapped_phase)):
+            raise RuntimeError(f"{unwrap_method.upper()} produced no finite pixels")
+
+        return unwrapped_phase.astype(np.float32), None
+
+    except Exception as exc:
+        raise RuntimeError(f"dolphin {unwrap_method} unwrap failed: {exc}") from exc
+
+
 def _unwrap_with_snaphu(
     interferogram: np.ndarray,
     coherence: np.ndarray,
@@ -5528,6 +5630,7 @@ def run_unwrap_stage(
     block_rows: int,
     range_looks: int,
     azimuth_looks: int,
+    use_dolphin_unwrap: bool = True,
 ) -> tuple[dict, str, str | None]:
     processing_options = {
         "unwrap_method": str(unwrap_method),
@@ -5537,6 +5640,7 @@ def run_unwrap_stage(
         "icu_defaults": dict(ICU_DEFAULTS),
         "icu_relaxed_overrides": dict(ICU_RELAXED_OVERRIDES),
         "icu_min_valid_fraction_for_relaxed_retry": ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY,
+        "use_dolphin_unwrap": use_dolphin_unwrap,
     }
     cached_outputs = _load_cached_stage_outputs(
         context.pair_dir,
@@ -5556,52 +5660,88 @@ def run_unwrap_stage(
     fallback_reason = None
     with tempfile.TemporaryDirectory(prefix="strip_insar2_unwrap_", dir=str(context.pair_dir)) as tmpdir:
         scratch = Path(tmpdir)
-        if unwrap_method == "snaphu":
+        
+        if use_dolphin_unwrap:
             try:
-                unwrapped_phase, snaphu_profile = _unwrap_with_snaphu_profiles(
+                logger.info(f"使用 dolphin {unwrap_method} 解缠")
+                unwrapped_phase, _ = _unwrap_with_dolphin(
                     interferogram,
                     coherence,
-                    scratch / "snaphu",
+                    scratch / "dolphin",
                     nlooks=float(range_looks * azimuth_looks),
+                    unwrap_method=unwrap_method,
                 )
-                if snaphu_profile:
-                    fallback_reason = snaphu_profile
-            except Exception as snaphu_exc:
+            except Exception as dolphin_exc:
+                logger.warning(f"dolphin {unwrap_method} 解缠失败，回退到原生实现: {dolphin_exc}")
+                use_dolphin_unwrap = False
+        
+        if not use_dolphin_unwrap:
+            if unwrap_method == "snaphu":
                 try:
-                    unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
-                        interferogram, coherence, scratch / "icu"
-                    )
-                    fallback_reason = f"SNAPHU failed, fell back to ICU: {snaphu_exc}"
-                    if icu_profile:
-                        fallback_reason += f"; {icu_profile}"
-                except Exception as icu_exc:
-                    raise RuntimeError(
-                        f"SNAPHU failed ({snaphu_exc}); ICU fallback also failed ({icu_exc})"
-                    ) from icu_exc
-        elif unwrap_method == "icu":
-            try:
-                unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
-                    interferogram, coherence, scratch / "icu"
-                )
-                if icu_profile:
-                    fallback_reason = icu_profile
-            except Exception as icu_exc:
-                try:
-                    unwrapped_phase, snaphu_fallback = _unwrap_with_snaphu_profiles(
+                    unwrapped_phase, snaphu_profile = _unwrap_with_snaphu_profiles(
                         interferogram,
                         coherence,
                         scratch / "snaphu",
                         nlooks=float(range_looks * azimuth_looks),
                     )
-                    fallback_reason = f"ICU failed, fell back to SNAPHU: {icu_exc}"
-                    if snaphu_fallback:
-                        fallback_reason += f"; {snaphu_fallback}"
+                    if snaphu_profile:
+                        fallback_reason = snaphu_profile
                 except Exception as snaphu_exc:
-                    raise RuntimeError(
-                        f"ICU failed ({icu_exc}); SNAPHU fallback also failed ({snaphu_exc})"
-                    ) from snaphu_exc
-        else:
-            raise ValueError(f"unsupported unwrap method: {unwrap_method}")
+                    try:
+                        unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
+                            interferogram, coherence, scratch / "icu"
+                        )
+                        fallback_reason = f"SNAPHU failed, fell back to ICU: {snaphu_exc}"
+                        if icu_profile:
+                            fallback_reason += f"; {icu_profile}"
+                    except Exception as icu_exc:
+                        raise RuntimeError(
+                            f"SNAPHU failed ({snaphu_exc}); ICU fallback also failed ({icu_exc})"
+                        ) from icu_exc
+            elif unwrap_method == "icu":
+                try:
+                    unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
+                        interferogram, coherence, scratch / "icu"
+                    )
+                    if icu_profile:
+                        fallback_reason = icu_profile
+                except Exception as icu_exc:
+                    try:
+                        unwrapped_phase, snaphu_fallback = _unwrap_with_snaphu_profiles(
+                            interferogram,
+                            coherence,
+                            scratch / "snaphu",
+                            nlooks=float(range_looks * azimuth_looks),
+                        )
+                        fallback_reason = f"ICU failed, fell back to SNAPHU: {icu_exc}"
+                        if snaphu_fallback:
+                            fallback_reason += f"; {snaphu_fallback}"
+                    except Exception as snaphu_exc:
+                        raise RuntimeError(
+                            f"ICU failed ({icu_exc}); SNAPHU fallback also failed ({snaphu_exc})"
+                        ) from snaphu_exc
+            elif unwrap_method == "phass":
+                try:
+                    unwrapped_phase, icu_profile = _unwrap_with_icu_profiles(
+                        interferogram, coherence, scratch / "icu"
+                    )
+                    if icu_profile:
+                        fallback_reason = icu_profile
+                except Exception as icu_exc:
+                    try:
+                        unwrapped_phase, phass_fallback = _unwrap_with_snaphu_profiles(
+                            interferogram,
+                            coherence,
+                            scratch / "snaphu",
+                            nlooks=float(range_looks * azimuth_looks),
+                        )
+                        fallback_reason = f"PHASS (ICU fallback) failed, fell back to SNAPHU: {icu_exc}"
+                    except Exception as phass_exc:
+                        raise RuntimeError(
+                            f"PHASS failed ({phass_exc}); SNAPHU fallback also failed"
+                        ) from phass_exc
+            else:
+                raise ValueError(f"unsupported unwrap method: {unwrap_method}")
 
     output_files = {
         "unwrapped_phase": _save_stage_array(context.pair_dir, "p3", "unwrapped_phase", unwrapped_phase)
@@ -6173,7 +6313,7 @@ def process_strip_insar2(
     output_root: str | Path = "results",
     gpu_mode: str = "auto",
     gpu_id: int = 0,
-    unwrap_method: str = "icu",
+    unwrap_method: str = "phass",
     range_looks: int = 1,
     azimuth_looks: int = 1,
     resolution_meters: float = 20.0,
@@ -6347,15 +6487,15 @@ def main() -> None:
     parser.add_argument("master_json")
     parser.add_argument("slave_json")
     parser.add_argument("--out", "--output-root", dest="output_root", default="results")
-    parser.add_argument("--gpu", "--gpu-mode", dest="gpu_mode", choices=["auto", "gpu", "cpu"], default="auto")
+    parser.add_argument("--gpu", "--gpu-mode", dest="gpu_mode", choices=["auto", "gpu", "cpu"], default="gpu")
     parser.add_argument("--gid", "--gpu-id", dest="gpu_id", type=int, default=0)
     parser.add_argument(
         "--unwrap",
         "--unwrap-method",
         "--unwrap-algo",
         dest="unwrap_method",
-        choices=["snaphu", "icu"],
-        default="icu",
+        choices=["snaphu", "icu", "phass"],
+        default="phass",
     )
     parser.add_argument(
         "--rlks",

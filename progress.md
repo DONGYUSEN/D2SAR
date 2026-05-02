@@ -1,54 +1,100 @@
-# GPU INSAR 全流程测试进度
+# 进度记录：Sentinel TOPS RTC/InSAR 分析
 
-## 2026-04-20
-- 启动从第一步开始的 GPU 全流程逐步测试。
-- 检查本机脚本帮助时发现本机 Python 环境缺少 `h5py`，决定使用 `d2sar:latest` 容器执行。
-- 已发现输入 manifest 文件存在。
-- 当前没有正在运行的 Docker 容器。
-- 容器内 `nvidia-smi` 正常，GPU 可见。
-- 容器内 `strip_insar.py --help` 成功，确认阶段支持到 `p6`。
-- 已运行 `--step check`，输出目录 `/home/ysdong/Software/D2SAR/results/20231110_20231121_gpu_fulltest/work/check` 下有 `stage.json`、`precheck.json`、`SUCCESS`。
-- `check` 的 `backend_used=cpu`，这是元数据检查阶段的预期结果。
-- 已运行 `--step prep`，输出目录 `/home/ysdong/Software/D2SAR/results/20231110_20231121_gpu_fulltest/work/prep` 下有 `normalized_slave_manifest.json`、`normalized_doppler.json`、`normalized_radargrid.json`、`normalized_acquisition.json`、`preprocess_plan.json`、`stage.json`、`SUCCESS`。
-- 已运行 `--step crop`，输出目录 `/home/ysdong/Software/D2SAR/results/20231110_20231121_gpu_fulltest/work/crop` 下有 crop manifest、radargrid、acquisition、doppler、orbit、scene、`crop.json`、`stage.json`、`SUCCESS`。
-- 顶层生成 `master_normal_fullres.png`、`slave_normal_fullres.png`、`master_crop_fullres.png`、`slave_crop_fullres.png`。
-- 已运行 `--step p0`，完成 master/slave topo 计算，生成 `geo2rdr_master.tif`、`geo2rdr_slave.tif`、`geo2rdr_master/topo.vrt`、`geo2rdr_slave/topo.vrt`。
-- `p0` 的 `stage.json` 明确记录 `backend_used=gpu`。
-- 已运行 `--step p1`，完成 coarse/fine 配准，生成 `p1_geo2rdr_offsets/range.off`、`azimuth.off`、`model.json`，以及 `work/p1_dense_match` 下的 coarse/fine coreg、dense match、residual、final offsets、diagnostics、`registration_model.json`、`stage.json`、`SUCCESS`。
-- 已验证 `registration_model.json` 中 coarse/residual/final 统计与之前修复后的正确结果一致。
-- 已运行 `--step p2`，生成 `interferogram.npy`、`filtered_interferogram.npy`、`coherence.npy` 和 `wrapped_phase_radar.png`。
-- P2 日志提示 `ISCE3 CUDA Crossmul unavailable`，当前 crossmul 子步骤未真正走 CUDA。
-- 已运行 `--step p3`，生成 `work/p3_unwrap/unwrapped_phase.npy`、`stage.json`、`SUCCESS`。
-- 发现 `p3` 会创建 root 权限临时目录 `insar_unwrap_*`。
-## 2026-04-20
-- 接手继续 GPU 全流程测试，会话恢复后确认 `p5` 仍在容器 `unruffled_edison` 中运行。
-- 通过现有 PTY 会话日志确认 `p5` 已完成 topo 与 layover/shadow mask 到 block 57/57。
-- 当前 `interferogram_fullres.h5` 已增长到约 4.23 GB，但 `work/p5*` 目录下尚未出现 `stage.json`/`SUCCESS`，说明还在收尾写出。
-## 2026-04-20
-- `p5` 已完成，产物为 `/home/ysdong/Software/D2SAR/results/20231110_20231121_gpu_fulltest/interferogram_fullres.h5`。
-- `work/p5_hdf/stage.json` 显示本阶段因复用已有 `p2-p4` 产品而走 CPU 发布路径，`backend_used=cpu`。
-- 已启动 `--step p6`，继续验证最终发布阶段。
+## 2026-04-30
+- 创建本次分析规划文件。
+- 当前阶段：定位 `isce3` 中 Sentinel/TOPS/RTC/InSAR 相关文件和入口。
+- 已完成首轮检索：`isce3` 内未发现 Sentinel/TOPS 专用 workflow 文件名；主要可复用对象集中在 NISAR InSAR workflow、geocode、prepare HDF5、RTC geometry 底层接口。
+- 已读取 `insar.py`、`rdr2geo.py`、`geo2rdr.py`、`resample_slc_v2.py`、`crossmul.py`、`common_processing.py`、`strip_rtc.py`、`strip_insar2.py` 的关键段落。
+- 判断：Sentinel TOPS 需要自建 SAFE/annotation/orbit/calibration 到 D2SAR manifest/ISCE3 对象的适配层，不能直接复用 NISAR workflow 入口。
+- 已检查 `tianyi_importer.py` 和 `lutan_importer.py`，确认 importer 模式可复用，但 Sentinel 应新增独立 importer，避免把 Sentinel SAFE 语义混入 Tianyi。
+- 已完成阶段性分析，准备向用户汇总 `isce3` 原生处理链路、可复用边界和 Sentinel 独立模块建议。
+- 已按 TDD 实现 Sentinel importer 第一版。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py` 通过，`2 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py tests/test_sentinel_importer.py` 通过。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tianyi_importer_slc_format.py tests/test_lutan_importer_orbit_smooth.py` 通过，`4 passed`。
+- 已继续完善 Sentinel importer：补充 swath/polarization 精确选择、默认 VV 优先、manifest.safe processing/IPF 信息解析。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py` 通过，`3 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py tests/test_sentinel_importer.py` 通过。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tianyi_importer_slc_format.py tests/test_lutan_importer_orbit_smooth.py` 通过，`5 passed`。
+- 已补充剩余导入层中的 EOF 轨道解析和 overlap/ESD 派生元数据。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py` 通过，`4 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py tests/test_sentinel_importer.py` 通过。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tianyi_importer_slc_format.py tests/test_lutan_importer_orbit_smooth.py` 通过，`6 passed`。
+- 已对真实 Sentinel ZIP `/home/ysdong/Temp/S1A_IW_SLC__1SDV_20230625T114146_20230625T114213_049142_05E8CA_CCD3.zip` 执行导入测试，首次发现误选 `annotation/rfi` 导致关键 metadata 为空。
+- 已新增 RFI annotation 排除回归测试并修复主 annotation 分类规则。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py` 通过，`5 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py tests/test_sentinel_importer.py` 通过。
+- 真实 ZIP 复测命令：`python scripts/sentinel_importer.py '/home/ysdong/Temp/S1A_IW_SLC__1SDV_20230625T114146_20230625T114213_049142_05E8CA_CCD3.zip' /tmp/d2sar_sentinel_import_test`，输出 `/tmp/d2sar_sentinel_import_test/manifest.json`。
+- 真实 ZIP 复测检查：`manifest` 为 S1A/IW1/VV，SLC rows=`13419`、columns=`21677`，burst_count=`9`；`orbit.stateVectors`、`doppler.estimates`、`tops.overlaps` 均非空。
+- 已新增 `scripts/tops_geometry.py`，从 Sentinel importer manifest 构造并校验 per-burst radargrid metadata。
+- 验证命令：`python -m pytest tests/test_tops_geometry.py` 通过，`7 passed`。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tops_geometry.py` 通过，`12 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py scripts/tops_geometry.py tests/test_sentinel_importer.py tests/test_tops_geometry.py` 通过。
+- 真实 ZIP 几何验证命令：`python scripts/tops_geometry.py /tmp/d2sar_sentinel_import_test/manifest.json` 通过，burst_count=`9`。
+- 已新增 `scripts/tops_rtc.py` 第一版 prepare-only 阶段，生成 per-burst RTC 执行计划 `tops_rtc_plan.json`。
+- 真实 ZIP plan 生成时发现 `resolve_manifest_data_path()` 会对已规范的 VSI ZIP dict entry 重复包裹 `/vsizip/`，已新增回归测试并修复。
+- 验证命令：`python -m pytest tests/test_tops_rtc.py` 通过，`8 passed`。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py` 通过，`20 passed`。
+- 验证命令：`python -m py_compile scripts/common_processing.py scripts/sentinel_importer.py scripts/tops_geometry.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py` 通过。
+- 真实 ZIP 验证命令：`python scripts/tops_rtc.py /tmp/d2sar_sentinel_import_test/manifest.json /tmp/d2sar_tops_rtc_prepare` 通过，burst_count=`9`；首个 burst `slcWindow.yoff=0`，最后 burst `slcWindow.yoff=11928`。
+- 已为 `scripts/tops_rtc.py` 增加 materialize 阶段，支持按 burst SLC window 写出 `amplitude_fullres.h5`。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py` 通过，`21 passed`。
+- 验证命令：`python -m py_compile scripts/common_processing.py scripts/sentinel_importer.py scripts/tops_geometry.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py` 通过。
+- 真实 ZIP 验证命令：`python scripts/tops_rtc.py /tmp/d2sar_sentinel_import_test/manifest.json /tmp/d2sar_tops_rtc_prepare --materialize --burst-limit 1 --block-rows 256` 通过，写出 `burst_001/amplitude_fullres.h5`。
+- 真实 HDF 检查：`slc_amplitude.shape=(1491, 21677)`，`valid_mask.shape=(1491, 21677)`，`valid_mask.sum=29782395`，`product_type=sentinel_tops_burst_amplitude`。
+- 已为 `scripts/tops_rtc.py` 增加单 burst RTC factor 调用链：写出持久化 burst manifest，并调用可注入的 `compute_rtc_factor`。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py` 通过，`22 passed`。
+- 验证命令：`python -m py_compile scripts/common_processing.py scripts/sentinel_importer.py scripts/tops_geometry.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py` 通过。
+- 已为 `scripts/tops_rtc.py` 增加单 burst topo 调用链，复用 burst manifest 与 `append_topo_coordinates_hdf()`，可在 Docker/ISCE3 环境中执行。
+- Docker 首次真实 DEM topo 验证失败于 `common_processing.construct_orbit()` 不支持 Sentinel `position/velocity` 嵌套字段；已新增回归测试并修复。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py tests/test_common_processing_orbit.py` 通过，`24 passed`。
+- 验证命令：`python -m py_compile scripts/common_processing.py scripts/sentinel_importer.py scripts/tops_geometry.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py tests/test_common_processing_orbit.py` 通过。
+- Docker 真实 DEM topo 验证命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_sentinel_import_test/manifest.json /temp/d2sar_tops_rtc_topo --materialize --compute-topo --dem /temp/s1/proc/dem/dem.tif --burst-limit 1 --block-rows 256` 通过，写出 `burst_001/amplitude_fullres.h5` 中的 `longitude/latitude/height`。
+- 真实 topo HDF 检查：`longitude/latitude/height.shape=(1491,21677)`；lon range=`94.2641..95.1882`，lat range=`28.6046..28.8035`，height range=`278.98..4223.02`。
+- 已为 `scripts/tops_rtc.py` 增加单 burst geocoded preview 导出阶段，复用 UTM 坐标追加和 GeoTIFF/PNG 写出函数。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py tests/test_common_processing_orbit.py` 通过，`25 passed`。
+- 验证命令：`python -m py_compile scripts/common_processing.py scripts/sentinel_importer.py scripts/tops_geometry.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_tops_geometry.py tests/test_tops_rtc.py tests/test_common_processing_orbit.py` 通过。
+- Docker 真实导出验证命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_sentinel_import_test/manifest.json /temp/d2sar_tops_rtc_topo --export-geocoded --burst-limit 1 --resolution 20 --block-rows 64` 通过。
+- 真实导出结果：`burst_001/amplitude_utm_geocoded.tif` 为 EPSG:32646，大小 `4506x1163`；`burst_001/amplitude_utm_geocoded.png` 为灰度 `4506x1163`。
+- 已参考 ISCE2 TOPS Sentinel reader、BurstSLC、topsApp 和 tops_adapter，完成当前 importer 需求满足度复核。
+- 已补充 Sentinel importer 的 burst-aware 元数据输出，并扩展测试覆盖 ISCE2 BurstSLC 等价字段。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py` 通过，`2 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py tests/test_sentinel_importer.py` 通过。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_tianyi_importer_slc_format.py tests/test_lutan_importer_orbit_smooth.py` 通过，`4 passed`。
+- 已新增 `scripts/sentinel_orbit.py`，支持从 Sentinel-1 产品文件名解析 sensing 时间、本地 EOF/EOF.zip 轨道匹配、POEORB 优先于 RESORB、调用 `fetchOrbit.py` 下载、以及将 EOF 轨道应用到已导入 manifest。
+- 已扩展 `scripts/sentinel_importer.py`，新增 `orbit_dir` 与 `download_orbit` 参数；导入时若未显式指定 `orbit_file`，可自动解析/下载 EOF，成功时优先使用 EOF，失败时保留 annotation orbit fallback。
+- 验证命令：`python -m pytest tests/test_sentinel_orbit.py -q` 通过，`10 passed`。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_sentinel_orbit.py -q` 通过，`15 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py scripts/sentinel_orbit.py tests/test_sentinel_importer.py tests/test_sentinel_orbit.py` 通过。
+- 用户要求不能修改或调用 ISCE2/ISCE3 的哨兵轨道下载程序；已将 `scripts/sentinel_orbit.py` 改为自有 Python 下载逻辑，不再调用 `fetchOrbit.py` 或 `subprocess.run` 下载轨道。
+- 已新增测试覆盖：`_fetch_orbit()` 不调用 subprocess；`download_orbit_file()` 可通过内部 URL 下载 `.EOF.zip`、缓存 zip 并解出 EOF。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_sentinel_orbit.py -q` 通过，`17 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py scripts/sentinel_orbit.py tests/test_sentinel_importer.py tests/test_sentinel_orbit.py` 通过。
+- 已清理前一次通过 ISCE2 `fetchOrbit.py` 生成的输出，重新用 D2SAR 自有 `scripts/sentinel_orbit.py` 下载真实 Sentinel 轨道并导入真实 ZIP。
+- 真实导入命令：`python scripts/sentinel_importer.py /home/ysdong/Temp/S1A_IW_SLC__1SDV_20230625T114146_20230625T114213_049142_05E8CA_CCD3.zip /home/ysdong/Temp/d2sar_real_orbit_test/import --orbit-dir /home/ysdong/Temp/d2sar_real_orbit_test/orbits --download-orbit`。
+- 真实轨道下载结果：`S1A_OPER_AUX_POEORB_OPOD_20230715T080803_V20230624T225942_20230626T005942.EOF` 与 `.EOF.zip` 写入 `/home/ysdong/Temp/d2sar_real_orbit_test/orbits`；manifest 记录 `orbit.source=download`、`orbit.orbitType=precise`，orbit metadata 为 `source=sentinel-1-eof`，stateVectors=`9361`。
+- Docker 真实 burst topo 命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_real_orbit_test/import/manifest.json /temp/d2sar_real_rtc_test --materialize --compute-topo --dem /temp/s1/proc/dem/dem.tif --burst-limit 1 --block-rows 256` 通过。
+- Docker 真实 geocoded preview 命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_real_orbit_test/import/manifest.json /temp/d2sar_real_rtc_test --export-geocoded --burst-limit 1 --resolution 20 --block-rows 64` 通过。
+- 真实 burst 输出检查：`amplitude_fullres.h5` shape=`(1491,21677)`，valid pixels=`29782395`，lon range=`94.2729..95.1505`，lat range=`28.6067..28.7981`，height range=`278.982..4223.018`；GeoTIFF/PNG 均为 `4506x1163`，GeoTIFF 投影包含 EPSG:32646。
+- 已实现 RTC factor 应用 `apply_burst_rtc_factor()`：读取 GeoTIFF factor，按 `amp / sqrt(factor)` 校正 amplitude，`valid=0` 或 `factor<=0` 或 NaN 时输出 0。
+- 已新增 `apply_burst_rtc()` 和 `export_burst_rtc_geocoded_preview()` CLI 封装，扩展 `export_burst_geocoded_preview()` 支持 `amplitude_dataset`/`geotiff_suffix`/`png_suffix`/`input_h5` 参数化。
+- 验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_sentinel_orbit.py tests/test_tops_rtc.py -q` 通过，`17 passed`。
+- 验证命令：`python -m py_compile scripts/sentinel_importer.py scripts/sentinel_orbit.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_sentinel_orbit.py tests/test_tops_rtc.py` 通过。
+- Docker 全链路真实验证命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_real_orbit_test/import/manifest.json /temp/d2sar_real_rtc_test --materialize --compute-topo --compute-rtc-factor --apply-rtc --export-geocoded --export-rtc-geocoded --dem /temp/s1/proc/dem/dem.tif --burst-limit 9 --block-rows 256 --resolution 20` 通过，全 9 burst 处理完成。
+- 全 9 burst 输出检查：每 burst 均含 `amplitude_fullres.h5`(232MB)、`rtc_factor.tif`(124MB)、`amplitude_rtc.h5`(322MB)、`amplitude_utm_geocoded.tif/png`、`amplitude_rtc_utm_geocoded.tif/png`。
+- `amplitude_rtc.h5` 内容：`rtc_amplitude.shape=(1491,21677)`，`product_type=sentinel_tops_burst_rtc_amplitude`，`rtc_amplitude.min/max=0.0/153219552.0`。
+- 已实现 `mosaic_bursts_geocoded()`：多 burst 按地理 UTM 网格拼接，支持 `slc_amplitude` 和 `rtc_amplitude` 两套数据集，写出 GeoTIFF 和 PNG。
+- 已新增 CLI 参数 `--mosaic --mosaic-dataset slc_amplitude --mosaic-tif <path> --mosaic-png <path>`。
+- 真实 mosaic 验证命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_real_orbit_test/import/manifest.json /temp/d2sar_real_rtc_test --mosaic --mosaic-dataset slc_amplitude --resolution 20` 通过，输出 `mosaic_slc_amplitude.tif`(4.8MB, 4506x1163, EPSG:32646) 和 `mosaic_slc_amplitude.png`(196KB)。
+- 真实 mosaic RTC 验证命令：`docker run --rm --gpus all ... d2sar:cuda python3 /work/scripts/tops_rtc.py /temp/d2sar_real_orbit_test/import/manifest.json /temp/d2sar_real_rtc_test --mosaic --mosaic-dataset rtc_amplitude --resolution 20` 通过，输出 `mosaic_rtc_amplitude.tif`(4.8MB, 4506x1163, EPSG:32646) 和 `mosaic_rtc_amplitude.png`(31KB)。
+- 全链路回归验证命令：`python -m pytest tests/test_sentinel_importer.py tests/test_sentinel_orbit.py tests/test_tops_rtc.py -q` 通过，`32 passed`。
+- 全链路 py_compile 验证命令：`python -m py_compile scripts/sentinel_importer.py scripts/sentinel_orbit.py scripts/tops_rtc.py tests/test_sentinel_importer.py tests/test_sentinel_orbit.py tests/test_tops_rtc.py` 通过。
 
-## 2026-04-20
-- `p6` 已完成，生成 geocoded TIFF 和最终 interferogram/filtered interferogram PNG。
-- `work/p6_publish/stage.json` 记录 `backend_used=cpu`。
-- 本轮从 `check` 到 `p6` 的真实数据 GPU 全流程逐步测试已完整跑通。
+## 2026-05-01
+- 完成 TOPS RTC 第三步收口：主流程统一为“多 burst 先 radar-grid merge，再 topo/RTC/geocoding”。
+- 保持单 burst RTC 处理不变；多 burst 入口统一收敛到 `apply_burst_rtc()` 的 merged 路径。
+- 已完成真实 2-burst 回归：输出 `mosaic_slc_amplitude_geocoded.tif/png` 与 `mosaic_rtc_amplitude_geocoded.tif/png`，burst seam 连续，无明显几何跳变。
+- 已删除旧 geocoded mosaic 兼容实现及相关测试代码，避免继续走“先 geocode 后拼接”的旧策略。
+- 文档状态已同步：README 标注当前推荐流程，并明确旧参数/旧函数为废弃路径。
 
-## 2026-04-20
-- 为 `p2` 补了两类能力：基于 `p1_geo2rdr_offsets/range.off` 的 flatten-aware crossmul，以及真正调用 `isce3.cuda.signal.Crossmul()` 的 GPU crossmul 路径。
-- 先补了失败测试，再修改实现；当前 `/work/tests/test_strip_insar_stages.py` 在容器中已 23/23 通过。
-- 下一步在真实结果目录上重跑 `p2`，检查 CUDA crossmul 是否接通，以及 `wrapped_phase_radar.png` 是否改为去平地后的相位。
-
-## 2026-04-21
-- 针对 `p2` 在写出 `range_flatten.off.tif` 后无日志退出的问题，定位到真实原因是 `isce3.cuda.signal.Crossmul` 的 native 崩溃，而不是 Python 正常退出。
-- 关键根因之一：ISCE3 CUDA flatten 内核按 `double*` 读取 range offsets；已将 `range_flatten.off.tif` 改为 `Float64` 输出。
-- 为避免 GPU 子进程 segfault 直接杀掉主流程，已把 CUDA crossmul 放入独立子进程执行，主进程现在会捕获退出码和 stderr，并显式打印回退日志后切回 CPU。
-- 同时补充了 `work/p2_crossmul/gpu_fallback_reason.txt`，用于保存本次 GPU 回退原因。
-
-## 2026-04-21
-- 已将 `p2` GPU Crossmul 标记为实验特性并默认关闭；默认情况下即使 `--gpu-mode gpu`，Crossmul 子步骤也会走 CPU fallback，并明确记录原因。
-- 显式启用方式为设置环境变量 `D2SAR_ENABLE_EXPERIMENTAL_GPU_CROSSMUL=1`。
-- 已修正 full pipeline 中 `stage_backends["crossmul"]` 的记录，使其反映真实执行后端；当默认降级时记录为 `cpu`。
-- 已修改 Dockerfile，通过 `GDAL_ENABLE_DRIVER_RAW=ON` 增加 ENVI 支持。
-- 已构建验证镜像 `d2sar:envi-test`，确认 `gdal.GetDriverByName("ENVI")` 为 `True`，并可创建/打开 ENVI raster。
-- 测试验证：`d2sar:latest` 与 `d2sar:envi-test` 中 `tests/test_strip_insar_stages.py` 均为 `28 passed, 1 warning`。
+> 注：本文件前文出现的 `--mosaic`、`--export-geocoded`、`--export-rtc-geocoded` 等记录属于历史阶段日志，不代表当前推荐用法。

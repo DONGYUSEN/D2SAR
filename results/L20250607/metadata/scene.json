@@ -1,0 +1,51 @@
+{
+  "sceneCenterCoord": {
+    "refRow": 14215,
+    "refColumn": 7129,
+    "lat": 29.384460544,
+    "lon": 95.102173478,
+    "azimuthTimeUTC": "2025-06-07T23:46:36.700774",
+    "rangeTime": 0.004437767066138814,
+    "incidenceAngle": 26.0893814333799
+  },
+  "sceneCorners": [
+    {
+      "refRow": 1,
+      "refColumn": 1,
+      "lat": 29.6017608169,
+      "lon": 95.44763904,
+      "azimuthTimeUTC": "2025-06-07T23:46:32.382968",
+      "rangeTime": 0.004358555955027703,
+      "incidenceAngle": 23.610610136587383
+    },
+    {
+      "refRow": 1,
+      "refColumn": 14259,
+      "lat": 29.6943224709,
+      "lon": 94.8982734666,
+      "azimuthTimeUTC": "2025-06-07T23:46:32.382968",
+      "rangeTime": 0.004516978177249925,
+      "incidenceAngle": 28.293321547322904
+    },
+    {
+      "refRow": 28431,
+      "refColumn": 1,
+      "lat": 29.070164261,
+      "lon": 95.3273492415,
+      "azimuthTimeUTC": "2025-06-07T23:46:41.018277",
+      "rangeTime": 0.004358555955027703,
+      "incidenceAngle": 23.610610136587383
+    },
+    {
+      "refRow": 28431,
+      "refColumn": 14259,
+      "lat": 29.1626730437,
+      "lon": 94.7811408747,
+      "azimuthTimeUTC": "2025-06-07T23:46:41.018277",
+      "rangeTime": 0.004516978177249925,
+      "incidenceAngle": 28.293321547322904
+    }
+  ],
+  "sceneAverageHeight": 2493.997630425653,
+  "headingAngle": 191.03995016170293
+}

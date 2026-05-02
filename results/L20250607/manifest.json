@@ -1,0 +1,52 @@
+{
+  "version": "1.0",
+  "productType": "SLC",
+  "sensor": "lutan",
+  "polarisation": "HH",
+  "startTimeUTC": "2025-06-07T23:46:32.382968",
+  "stopTimeUTC": "2025-06-07T23:46:41.018277",
+  "slc": {
+    "path": {
+      "path": "/temp/LT1B_MONO_KSC_STRIP1_017805_E95.2_N29.4_20250607_SLC_HH_L1A_0000767220.tar.gz",
+      "storage": "tar",
+      "member": "LT1B_MONO_KSC_STRIP1_017805_E95.2_N29.4_20250607_SLC_HH_L1A_0000767220.tiff"
+    },
+    "format": "TIFF",
+    "complex": true,
+    "sample_format": "iq_int16",
+    "storage_layout": "two_band_iq",
+    "complex_band_count": 1,
+    "band_mapping": {
+      "real": 1,
+      "imag": 2
+    },
+    "processing_format": "single_band_cfloat32",
+    "rows": 28431,
+    "columns": 14259
+  },
+  "metadata": {
+    "acquisition": "/work/results/L20250607/metadata/acquisition.json",
+    "orbit": "/work/results/L20250607/metadata/orbit.json",
+    "orbit_raw": "/work/results/L20250607/metadata/orbit.raw.json",
+    "radargrid": "/work/results/L20250607/metadata/radargrid.json",
+    "doppler": "/work/results/L20250607/metadata/doppler.json",
+    "scene": "/work/results/L20250607/metadata/scene.json"
+  },
+  "look_direction": {
+    "xml_value": "RIGHT",
+    "verified_value": "RIGHT",
+    "was_corrected": false
+  },
+  "ancillary": {
+    "incidenceXML": {
+      "path": "/temp/LT1B_MONO_KSC_STRIP1_017805_E95.2_N29.4_20250607_SLC_HH_L1A_0000767220.tar.gz",
+      "storage": "tar",
+      "member": "LT1B_MONO_KSC_STRIP1_017805_E95.2_N29.4_20250607_SLC_HH_L1A_0000767220.incidence.xml"
+    },
+    "metaXML": {
+      "path": "/temp/LT1B_MONO_KSC_STRIP1_017805_E95.2_N29.4_20250607_SLC_HH_L1A_0000767220.tar.gz",
+      "storage": "tar",
+      "member": "LT1B_MONO_KSC_STRIP1_017805_E95.2_N29.4_20250607_SLC_HH_L1A_0000767220.meta.xml"
+    }
+  }
+}

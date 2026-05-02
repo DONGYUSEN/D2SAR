@@ -1,32 +1,33 @@
-# GPU INSAR 全流程逐步测试计划
+# 任务计划：拆分 Sentinel TOPS RTC/InSAR 处理代码
 
 ## 目标
-从第一步开始，在 GPU 条件下对真实数据执行 D2SAR INSAR 完整处理流程，逐阶段验证输入、输出、日志和关键诊断，确认配准修正后全流程稳定。
-
-## 输入数据
-- Master manifest: `/home/ysdong/Software/D2SAR/results/20231110/manifest.json`
-- Slave manifest: `/home/ysdong/Software/D2SAR/results/20231121/manifest.json`
-- 测试输出目录: `/home/ysdong/Software/D2SAR/results/20231110_20231121_gpu_fulltest`
-- 容器镜像: `d2sar:latest`
-- GPU 模式: `--gpu-mode gpu`
+分析 `isce3` 目录中与 Sentinel-1/TOPS、RTC、InSAR 相关的处理流程，识别可复用入口、配置、数据流和依赖边界，为后续将哨兵数据处理逻辑单独抽取成 `tops_rtc` / `insar` 代码做准备。
 
 ## 阶段
-- [complete] 阶段 0: 环境和脚本能力检查
-- [complete] 阶段 1: check
-- [complete] 阶段 2: prep
-- [complete] 阶段 3: crop
-- [complete] 阶段 4: p0 geo2rdr/coarse offset
-- [complete] 阶段 5: p1 coarse/fine registration
-- [complete] 阶段 6: p2 crossmul/filter/phase png
-- [complete] 阶段 7: 如脚本支持后续阶段，继续执行到完整流程末端
-- [complete] 阶段 8: 汇总诊断和输出验证
+| 阶段 | 状态 | 内容 |
+|---|---|---|
+| 1 | complete | 定位 `isce3` 中 Sentinel/TOPS/RTC/InSAR 相关文件和入口 |
+| 2 | complete | 梳理处理链路：输入、配置、核心步骤、输出 |
+| 3 | complete | 对比现有 D2SAR 外围脚本与 `isce3` 原生流程的边界 |
+| 4 | complete | 提出 Sentinel 独立模块拆分方案 |
+| 5 | complete | 总结风险、依赖和下一步实现建议 |
+| 6 | complete | 实现 Sentinel-1 SAFE 导入模块 |
+| 7 | complete | 对照 ISCE2 TOPS 和 ISCE3 输入需求复核 Sentinel importer |
+| 8 | complete | 补充 Sentinel importer 的 burst-aware TOPS 元数据解析 |
+| 9 | complete | 补充 swath/polarization 成员选择与 manifest.safe 处理信息解析 |
+| 10 | complete | 补充 EOF 轨道导入与 overlap/ESD 派生元数据 |
+| 11 | complete | 新增 Sentinel-1 EOF 轨道解析、自有下载代码和导入后 apply 工具 |
+| 12 | complete | 使用真实 Sentinel ZIP 验证自有轨道下载、导入和 burst RTC/topo/geocode 链路 |
+| 13 | complete | 全 9 burst materialize/topo/rtc/geocode 完整链路 |
+| 14 | complete | swath mosaic：同 IW 内多 burst 按地理 UTM 网格拼接 |
 
-## 验证标准
-- 每个阶段必须有对应 `SUCCESS` 或等价成功记录。
-- GPU 请求必须被记录为 `backend_used=gpu` 或相关 GPU 处理路径。
-- p1 必须检查 coarse/residual/final offset 统计，确认 residual 是小修正。
-- p2 必须生成 `wrapped_phase_radar.png`。
-- 后续阶段如果存在，必须检查最终产品是否生成。
+## 决策记录
+- 仅做代码分析和方案建议，不直接重构代码，除非用户后续确认实现。
+- 用户确认首先完成哨兵数据导入模块；已新增 `scripts/sentinel_importer.py`，保持 D2SAR manifest/metadata 输出风格。
+- Sentinel 轨道能力采用独立工具 `scripts/sentinel_orbit.py`，导入阶段仅在用户提供 `orbit_dir` 或 `download_orbit` 时启用，避免默认导入被网络下载阻塞。
+- Sentinel 轨道下载必须使用 D2SAR `scripts` 内自有代码，不调用、不修改 ISCE2/ISCE3 的轨道下载程序。
 
-## 当前状态
-`p0-p6` 已全部完成，结果目录包含 HDF5、UTM geocoded TIFF 与 PNG。
+## 错误记录
+| 错误 | 处理 |
+|---|---|
+| 暂无 | 暂无 |

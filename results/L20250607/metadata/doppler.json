@@ -1,0 +1,23 @@
+{
+  "azDeskew": "TRUE",
+  "dopplerBasebandEstimationMethod": "azimuth cross correlation",
+  "dopplerGeometricEstimationMethod": "orbit and attitude data evaluation",
+  "dopplerCentroidCoordinateType": "RAW",
+  "dopplerEstimate": {
+    "timeUTC": "2025-06-07T23:46:36.700774",
+    "dopplerAtMidRange": 0.570632765407361,
+    "dopplerAmbiguity": 0,
+    "geometricDopplerFlag": "true"
+  },
+  "combinedDoppler": {
+    "validityRangeMin": 0.004358555955027703,
+    "validityRangeMax": 0.004516978177249925,
+    "referencePoint": 0.004437767066138814,
+    "polynomialDegree": 2,
+    "coefficients": [
+      0.5706322447595896,
+      -236.91718441126142,
+      120667.65578130509
+    ]
+  }
+}

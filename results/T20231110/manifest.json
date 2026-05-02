@@ -1,0 +1,58 @@
+{
+  "version": "1.0",
+  "productType": "SLC",
+  "sensor": "tianyi",
+  "polarisation": "VV",
+  "startTimeUTC": "2023-11-10T04:39:48.881889",
+  "stopTimeUTC": "2023-11-10T04:39:52.433358",
+  "slc": {
+    "path": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853/measurement/bc3-sm-slc-vv-20231110t043948-002131-000033-000853-01.tiff"
+    },
+    "format": "TIFF",
+    "complex": true,
+    "sample_format": "cint16",
+    "storage_layout": "single_band_complex",
+    "complex_band_count": 1,
+    "processing_format": "single_band_cfloat32",
+    "rows": 14580,
+    "columns": 12544
+  },
+  "metadata": {
+    "acquisition": "/work/results/T20231110/metadata/acquisition.json",
+    "orbit": "/work/results/T20231110/metadata/orbit.json",
+    "radargrid": "/work/results/T20231110/metadata/radargrid.json",
+    "doppler": "/work/results/T20231110/metadata/doppler.json",
+    "scene": "/work/results/T20231110/metadata/scene.json"
+  },
+  "look_direction": {
+    "xml_value": "LEFT",
+    "verified_value": "LEFT",
+    "was_corrected": false
+  },
+  "ancillary": {
+    "manifestSafe": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853/manifest.safe"
+    },
+    "calibrationXML": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853/annotation/calibration/calibration-bc3-sm-slc-vv-20231110t043948-002131-000033-000853-01.xml"
+    },
+    "annotationXML": {
+      "path": "/temp/BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853.zip",
+      "storage": "zip",
+      "member": "BC3-SM-SLC-1SVV-20231110T043948-002131-000033-000853/annotation/bc3-sm-slc-vv-20231110t043948-002131-000033-000853-01.xml"
+    }
+  },
+  "dem": {
+    "path": "dem/dem_clip_wgs84.tif",
+    "source": "SRTMGL1",
+    "directory": "/work/results/T20231110/dem",
+    "autoDownloaded": true
+  }
+}

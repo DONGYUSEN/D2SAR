@@ -11,7 +11,10 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    MAKEFLAGS="-j4"
+    MAKEFLAGS="-j4" \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    MPLCONFIGDIR=/tmp/matplotlib
 
 # Tsinghua apt mirror + install system dependencies
 # Keep libgdal-dev (3.4.1): needed for building GDAL 3.8 from source
@@ -60,6 +63,9 @@ RUN mkdir -p /root/.config/pip && \
     echo "[global]" > /root/.config/pip/pip.conf && \
     echo "index-url = https://pypi.tuna.tsinghua.edu.cn/simple" >> /root/.config/pip/pip.conf && \
     echo "trusted-host = pypi.tuna.tsinghua.edu.cn" >> /root/.config/pip/pip.conf
+
+RUN mkdir -p /tmp/matplotlib /tmp/.cache && \
+    chmod -R 777 /tmp/matplotlib /tmp/.cache
 
 # =============================================================================
 # STEP 1: Build GDAL 3.8.5 from source to /opt/gdal38
@@ -111,7 +117,7 @@ ENV PATH=/opt/gdal38/bin:$PATH \
 # =============================================================================
 WORKDIR /opt/build/pyre
 ENV GIT_TERMINAL_PROMPT=0
-RUN git clone -b v1.12.5 https://github.com/pyre/pyre /opt/build/pyre/src && \
+RUN git clone -b v1.12.6 https://github.com/pyre/pyre /opt/build/pyre/src && \
     cmake -S src -B build \
         -DCMAKE_INSTALL_PREFIX=/opt/isce3 \
         -DPYRE_BUILD_TESTING=OFF \
@@ -155,6 +161,7 @@ RUN python3 -m pip install --upgrade --no-cache-dir \
         numba \
         pydantic \
         tyro \
+        rich \
         tqdm \
         threadpoolctl \
         pyproj \
@@ -170,6 +177,7 @@ RUN python3 -m pip install --upgrade --no-cache-dir \
         snaphu \
         pytest \
         scikit-build-core \
+        setuptools_scm \
         pysolid && \
     python3 -c "import cupy; print('cupy:', cupy.__version__)"
 
@@ -197,15 +205,20 @@ RUN git clone https://gitlab.com/plant/plant /opt/build/plant/src && \
 
 WORKDIR /opt/build/plant-isce3
 COPY plant-isce3/ /opt/build/plant-isce3/src/
-RUN cp -r src/src/plant_isce3 /opt/isce3/local/lib/python3.10/dist-packages/ && \
-    mkdir -p /opt/isce3/local/lib/python3.10/dist-packages/plant_isce3-0.3.2.egg-info && \
-    cp -r src/src/plant_isce3.egg-info/* /opt/isce3/local/lib/python3.10/dist-packages/plant_isce3-0.3.2.egg-info/ && \
+RUN pip install /opt/build/plant-isce3/src --prefix=/opt/isce3 --no-build-isolation && \
     rm -rf /opt/build/plant-isce3
 
 WORKDIR /opt/build/dolphin
 COPY dolphin /opt/dolphin_src/
-RUN cp -r /opt/dolphin_src/src/dolphin /opt/isce3/local/lib/python3.10/dist-packages/ && \
-    rm -rf /opt/dolphin_src /opt/build/dolphin
+COPY dolphin/.git /opt/dolphin_src/.git
+RUN /bin/bash -c 'git config --global --add safe.directory /opt/dolphin_src/.git && \
+    git config --global user.email "builder@docker.local" && \
+    git config --global user.name "Docker Builder" && \
+    pip install --upgrade pip setuptools setuptools_scm wheel && \
+    pip install /opt/dolphin_src --prefix=/opt/isce3 --no-build-isolation'
+RUN find /opt/isce3 -name "dolphin*" -type d
+RUN python3 -c "import dolphin; print('dolphin:', dolphin.__file__)"
+RUN rm -rf /opt/dolphin_src /opt/build/dolphin
 
 # Final cleanup: remove conflicting 'io' namespace package from opera-utils
 RUN rm -rf /opt/isce3/local/lib/python3.10/dist-packages/io
