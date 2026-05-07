@@ -421,7 +421,7 @@ def _create_unwrapper(unwrap_method: str) -> PhaseUnwrapper:
 
 
 class SNAPHUUnwrapper(PhaseUnwrapper):
-    """SNAPHU phase unwrapping (CPU only, requires external SNAPHU)."""
+    """SNAPHU phase unwrapping (CPU only), ISCE2-style with full parameter set."""
 
     def unwrap(
         self,
@@ -435,58 +435,178 @@ class SNAPHUUnwrapper(PhaseUnwrapper):
     ) -> np.ndarray:
         import shutil
 
-        # Check SNAPHU availability
         if shutil.which("snaphu") is None:
             raise RuntimeError(
                 "SNAPHU not found in PATH. Install SNAPHU or use --unwrap-method icu"
             )
 
         tmp_dir = Path(output_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         rows, cols = interferogram.shape
 
-        # Write interferogram (phase + amplitude in separate files for SNAPHU)
-        phase = np.angle(interferogram).astype(np.float32)
-        amp = np.abs(interferogram).astype(np.float32)
+        int_path = tmp_dir / "snaphu_input.int"
+        coh_path = tmp_dir / "snaphu_input.cor"
+        unw_path = tmp_dir / "snaphu_unwrapped.unw"
+        conn_path = tmp_dir / "snaphu_unwrapped.unw.conncomp"
 
-        int_path = tmp_dir / "snaphu_input_phase.tif"
-        coh_path = tmp_dir / "snaphu_coherence.tif"
-        unwrap_path = tmp_dir / "snaphu_unwrapped.tif"
+        self._write_binary_input(int_path, interferogram, cols, rows)
+        self._write_binary_input(coh_path, coherence, cols, rows)
 
-        # Write wrapped phase
-        from osgeo import gdal
+        wavelength = self._get_wavelength_from_radar_grid(radar_grid)
+        earth_radius = self._estimate_earth_radius(radar_grid)
+        altitude = self._estimate_altitude(radar_grid)
+        corr_looks = self._compute_corr_looks(radar_grid)
 
-        drv = gdal.GetDriverByName("GTiff")
-        ds = drv.Create(str(int_path), cols, rows, 1, gdal.GDT_Float32)
-        _write_band_array(ds.GetRasterBand(1), phase)
-        ds = None
+        range_looks = max(1, int(os.environ.get("D2SAR_RANGE_LOOKS", "1")))
+        azimuth_looks = max(1, int(os.environ.get("D2SAR_AZIMUTH_LOOKS", "1")))
+        nproc = max(1, int(os.environ.get("D2SAR_SNAPHU_NPROC", "1")))
+        tile_nrow = max(1, int(os.environ.get("D2SAR_SNAPHU_NTILEROW", "1")))
+        tile_ncol = max(1, int(os.environ.get("D2SAR_SNAPHU_NTILECOL", "1")))
+        row_overlap = max(0, int(os.environ.get("D2SAR_SNAPHU_ROWOVRLP", "0")))
 
-        # Write coherence
-        ds = drv.Create(str(coh_path), cols, rows, 1, gdal.GDT_Float32)
-        _write_band_array(ds.GetRasterBand(1), coherence.astype(np.float32))
-        ds = None
-
-        # Run SNAPHU
-        cfg_file = tmp_dir / "snaphu.conf"
-        cfg_file.write_text(
-            f"OUTFILE {unwrap_path}\n"
-            f"LINENUMBER {rows}\n"
-            f"WIDTH {cols}\n"
-            f"IGNOREFILE true\n"
-            f"CORRFILE {coh_path}\n"
+        snp = self._create_snaphu_instance(
+            input=str(int_path),
+            output=str(unw_path),
+            width=cols,
+            wavelength=wavelength,
+            earth_radius=earth_radius,
+            altitude=altitude,
+            corrfile=str(coh_path),
+            corr_looks=corr_looks,
+            range_looks=range_looks,
+            azimuth_looks=azimuth_looks,
+            nproc=nproc,
+            tile_nrow=tile_nrow,
+            tile_ncol=tile_ncol,
+            row_overlap=row_overlap,
         )
+        snp.prepare()
+        snp.unwrap()
 
-        subprocess.run(
-            ["snaphu", "-f", str(cfg_file), str(int_path)],
-            check=True,
-            cwd=str(tmp_dir),
-        )
+        if not os.path.exists(unw_path):
+            raise RuntimeError(f"SNAPHU output not found: {unw_path}")
 
-        # Read back
-        ds = gdal.Open(str(unwrap_path))
-        result = _read_band_array(ds.GetRasterBand(1), dtype=np.float32).astype(np.float32)
-        ds = None
-
+        result = self._read_unwrapped_phase(unw_path, cols, rows)
         return result
+
+    def _write_binary_input(self, out_path: Path, data: np.ndarray, cols: int, rows: int) -> None:
+        from osgeo import gdal
+        drv = gdal.GetDriverByName("ENVI")
+        ds = drv.Create(str(out_path), cols, rows, 1, gdal.GDT_Float32)
+        band = ds.GetRasterBand(1)
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        band.WriteArray(np.ascontiguousarray(data))
+        band.FlushCache()
+        ds = None
+
+    def _read_unwrapped_phase(self, unw_path: str, cols: int, rows: int) -> np.ndarray:
+        from osgeo import gdal
+        ds = gdal.Open(unw_path)
+        if ds is None:
+            raise RuntimeError(f"Cannot open unwrapped file: {unw_path}")
+        band = ds.GetRasterBand(1)
+        result = band.ReadAsArray()
+        ds = None
+        if result is None:
+            raise RuntimeError("Failed to read unwrapped phase")
+        return result.astype(np.float32)
+
+    def _get_wavelength_from_radar_grid(self, radar_grid) -> float:
+        if hasattr(radar_grid, "wavelength"):
+            return float(radar_grid.wavelength)
+        if hasattr(radar_grid, "center_frequency"):
+            return 299792458.0 / float(radar_grid.center_frequency)
+        return 0.0565656
+
+    def _estimate_earth_radius(self, radar_grid) -> float:
+        return 6378137.0
+
+    def _estimate_altitude(self, radar_grid) -> float:
+        if hasattr(radar_grid, "height") and radar_grid.height is not None:
+            return float(radar_grid.height)
+        if hasattr(radar_grid, "satellite_height"):
+            return float(radar_grid.satellite_height)
+        if hasattr(radar_grid, "rangerate") and hasattr(radar_grid, "doppler"):
+            try:
+                alt = 6378137.0 + 500000.0
+                return alt
+            except Exception:
+                pass
+        return 6378137.0 + 500000.0
+
+    def _compute_corr_looks(self, radar_grid) -> float:
+        range_looks = 1
+        azimuth_looks = 1
+        if hasattr(radar_grid, "number_range_looks"):
+            range_looks = max(1, int(getattr(radar_grid, "number_range_looks", 1)))
+        if hasattr(radar_grid, "number_azimuth_looks"):
+            azimuth_looks = max(1, int(getattr(radar_grid, "number_azimuth_looks", 1)))
+        azres = 10.0
+        azfact = 1.0
+        rngfact = 1.0
+        if hasattr(radar_grid, "azimuth_resolution"):
+            try:
+                azres = float(radar_grid.azimuth_resolution)
+                azfact = azres / max(1e-6, float(getattr(radar_grid, "azimuth_spacing", azres)))
+            except Exception:
+                pass
+        if hasattr(radar_grid, "range_resolution"):
+            try:
+                rgres = float(radar_grid.range_resolution)
+                rngfact = rgres / max(1e-6, float(getattr(radar_grid, "range_spacing", rgres)))
+            except Exception:
+                pass
+        corr_looks = range_looks * azimuth_looks / max(1e-6, azfact * rngfact)
+        return float(max(1.0, corr_looks))
+
+    def _create_snaphu_instance(
+        self,
+        input: str,
+        output: str,
+        width: int,
+        wavelength: float,
+        earth_radius: float,
+        altitude: float,
+        corrfile: str,
+        corr_looks: float,
+        range_looks: int,
+        azimuth_looks: int,
+        nproc: int,
+        tile_nrow: int,
+        tile_ncol: int,
+        row_overlap: int,
+    ):
+        from isce3.core import speed_of_light
+        from contrib.Snaphu.Snaphu import Snaphu
+
+        snp = Snaphu()
+        snp.input = input
+        snp.output = output
+        snp.width = width
+        snp.wavelength = float(wavelength)
+        snp.earthRadius = float(earth_radius)
+        snp.altitude = float(altitude)
+        snp.corrfile = corrfile
+        snp.corrLooks = float(corr_looks)
+        snp.rangeLooks = int(range_looks)
+        snp.azimuthLooks = int(azimuth_looks)
+        snp.costMode = "DEFO"
+        snp.initMethod = "MST"
+        snp.maxComponents = 20
+        snp.defoMaxCycles = 4.0
+        snp.dumpConnectedComponents = True
+        snp.intFileFormat = "FLOAT_DATA"
+        snp.corFileFormat = "ALT_LINE_DATA"
+        snp.unwFileFormat = "ALT_LINE_DATA"
+        snp.nproc = max(1, int(nproc))
+        snp.tileNRow = max(1, int(tile_nrow))
+        snp.tileNCol = max(1, int(tile_ncol))
+        snp.rowOverlap = max(0, int(row_overlap))
+        snp.colOverlap = 0
+        snp.minConnectedComponentFrac = 0.01
+        snp.connectedComponentCostThreshold = 300
+        return snp
 
 
 # ---------------------------------------------------------------------------

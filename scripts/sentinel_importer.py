@@ -218,15 +218,20 @@ class SentinelImporter:
                     start=start_dt.replace(tzinfo=None),
                     stop=stop_dt.replace(tzinfo=None),
                 )
-            self.orbit_resolution = resolve_orbit_for_product(
-                self.product_path,
-                orbit_dir=self.orbit_dir,
-                download=self.download_orbit,
-                work_dir=output_dir,
-                product_info=product_info,
-            )
-            if self.orbit_resolution is not None:
-                self.orbit_file = Path(self.orbit_resolution.path).resolve()
+            try:
+                self.orbit_resolution = resolve_orbit_for_product(
+                    self.product_path,
+                    orbit_dir=self.orbit_dir,
+                    download=self.download_orbit,
+                    work_dir=output_dir,
+                    product_info=product_info,
+                )
+                if self.orbit_resolution is not None:
+                    self.orbit_file = Path(self.orbit_resolution.path).resolve()
+            except Exception:
+                # Fallback to annotation orbit when external orbit resolution/download fails.
+                self.orbit_resolution = None
+                self.orbit_file = None
         orbit = self.extract_eof_orbit(self.orbit_file) if self.orbit_file else self.extract_orbit(root)
         doppler = self.extract_doppler(root)
         scene = self.extract_scene_info(root)

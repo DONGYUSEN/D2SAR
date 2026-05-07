@@ -26,6 +26,8 @@ import numpy as np
 from osgeo import gdal, osr
 from PIL import Image
 
+import tops_rtc
+
 
 logger = logging.getLogger(__name__)
 
@@ -174,10 +176,10 @@ STAGE_DIR_NAMES = {
     "check": "check",
     "prep": "prep",
     "crop": "crop",
-    "p0": "p0_geo2rdr",
-    "p1": "p1_dense_match",
-    "p2": "p2_crossmul",
-    "p3": "p3_unwrap",
+    "p0": "p0_burst_topo",
+    "p1": "p1_burst_geo2rdr",
+    "p2": "p2_burst_ifg",
+    "p3": "p3_burst_merge_unwrap",
     "p4": "p4_geocode",
     "p5": "p5_hdf",
     "p6": "p6_publish",
@@ -185,7 +187,7 @@ STAGE_DIR_NAMES = {
 STAGE_LOG_LABELS = {
     "p0": "rdr2geo/topo",
     "p1": "resample/registration",
-    "p2": "crossmul/filter",
+    "p2": "burst-ifg/overlap-ifg",
     "p3": "unwrap",
     "p4": "los",
     "p5": "product/hdf",
@@ -375,10 +377,11 @@ def _log_stage_status(
     status: str,
     *,
     detail: str | None = None,
+    label_override: str | None = None,
     backend_used: str | None = None,
     fallback_reason: str | None = None,
 ) -> None:
-    label = STAGE_LOG_LABELS.get(stage, stage)
+    label = str(label_override) if label_override else STAGE_LOG_LABELS.get(stage, stage)
     message = f"[{utc_now_iso()}] [{stage}] {status} {label}"
     if detail:
         message += f" {detail}"
@@ -1851,6 +1854,46 @@ def _write_float_gtiff(path: Path, data: np.ndarray, *, dtype=gdal.GDT_Float32, 
     return str(path)
 
 
+def _gdal_path_exists(path_str: str | Path) -> bool:
+    """检测 GDAL 支持的路径是否存在，包括 /vsizip/ 和 /vsitar/ 路径。
+
+    Args:
+        path_str: 文件路径，可能是普通路径、/vsizip/... 或 /vsitar/... 格式
+
+    Returns:
+        True 如果路径可被 GDAL 打开，False otherwise
+    """
+    try:
+        ds = gdal.Open(str(path_str), gdal.GA_ReadOnly)
+        if ds is not None:
+            ds.FlushCache()
+            ds = None
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _load_float_offset_raster(path: str | Path | None) -> np.ndarray | None:
+    if not path:
+        return None
+    if not _gdal_path_exists(path):
+        return None
+    ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+    if ds is None:
+        return None
+    try:
+        arr = _read_band_array(ds.GetRasterBand(1), dtype=np.float64).astype(np.float64)
+    finally:
+        ds = None
+    valid = np.isfinite(arr)
+    valid &= arr != GEO2RDR_OFFSET_NODATA
+    valid &= arr > GEO2RDR_OFFSET_INVALID_LOW
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    out[valid] = arr[valid]
+    return out
+
+
 def _open_slc_as_complex(slc_path: str) -> np.ndarray:
     ds = gdal.Open(slc_path, gdal.GA_ReadOnly)
     if ds is None:
@@ -2887,6 +2930,167 @@ def _build_topo_vrt(target_dir: Path, *, epsg: int) -> str:
     return str(vrt_path)
 
 
+def _burst_indices_from_infos(bursts: list[Any]) -> set[int]:
+    indices = [int(getattr(burst, "burst_index", 0) or 0) for burst in bursts]
+    if not indices:
+        return set()
+    if min(indices) == 0:
+        return {idx + 1 for idx in indices}
+    return {idx for idx in indices if idx > 0}
+
+
+def _burst_grid_range_start(grid: dict[str, Any]) -> float:
+    if "startingRange" in grid:
+        return float(grid["startingRange"])
+    if "rangeTimeFirstPixel" in grid:
+        return float(grid["rangeTimeFirstPixel"]) * 299792458.0 / 2.0
+    return 0.0
+
+
+def _merged_burst_grid_json(bursts: list[dict[str, Any]]) -> dict[str, Any]:
+    merged_fn = getattr(tops_rtc, "_merged_radar_grid_json", None)
+    if callable(merged_fn):
+        return merged_fn(bursts)
+    if not bursts:
+        raise ValueError("at least one burst is required")
+    grids = [burst["radargrid"] for burst in bursts]
+    dt = float(grids[0].get("rowSpacing", 0.0))
+    dr = float(grids[0].get("columnSpacing", 0.0))
+    if dt <= 0.0 or dr <= 0.0:
+        raise ValueError("burst radar grid rowSpacing and columnSpacing must be positive")
+    ref_start = min(float(grid["sensingStartGPSTime"]) for grid in grids)
+    ref_range = min(_burst_grid_range_start(grid) for grid in grids)
+    out_rows = 0
+    out_cols = 0
+    for grid in grids:
+        row_off = int(round((float(grid["sensingStartGPSTime"]) - ref_start) / dt))
+        col_off = int(round((_burst_grid_range_start(grid) - ref_range) / dr))
+        first_line = int(grid.get("firstValidLine", 0))
+        num_lines = int(grid.get("numValidLines", grid.get("numberOfRows", 0)))
+        first_sample = int(grid.get("firstValidSample", 0))
+        num_samples = int(grid.get("numValidSamples", grid.get("numberOfColumns", 0)))
+        number_rows = int(grid.get("numberOfRows", first_line + num_lines))
+        number_cols = int(grid.get("numberOfColumns", first_sample + num_samples))
+        out_rows = max(out_rows, row_off + number_rows)
+        out_cols = max(out_cols, col_off + number_cols)
+
+    merged = dict(grids[0])
+    merged.update(
+        {
+            "source": "sentinel-1-merged-tops-bursts",
+            "burstCount": len(bursts),
+            "numberOfRows": int(out_rows),
+            "numberOfColumns": int(out_cols),
+            "sensingStartGPSTime": float(ref_start),
+            "startingRange": float(ref_range),
+            "firstValidLine": 0,
+            "numValidLines": int(out_rows),
+            "firstValidSample": 0,
+            "numValidSamples": int(out_cols),
+        }
+    )
+    if "rangeTimeFirstPixel" in merged:
+        import isce3.core
+
+        merged["rangeTimeFirstPixel"] = 2.0 * float(ref_range) / isce3.core.speed_of_light
+    return merged
+
+
+def _merge_burst_scalar_fields(
+    bursts: list[dict[str, Any]],
+    data_paths: list[str],
+    *,
+    output_path: Path,
+    fill_value: float = np.nan,
+    invalid_mask_fn=None,
+) -> str:
+    if not bursts:
+        raise ValueError("at least one burst is required")
+    if len(bursts) != len(data_paths):
+        raise ValueError("burst metadata and data path lengths do not match")
+
+    merged_grid = _merged_burst_grid_json(bursts)
+    rows = int(merged_grid["numberOfRows"])
+    cols = int(merged_grid["numberOfColumns"])
+    ref_start = float(merged_grid["sensingStartGPSTime"])
+    ref_range = _burst_grid_range_start(merged_grid)
+    dt = float(bursts[0]["radargrid"].get("rowSpacing", 0.0))
+    dr = float(bursts[0]["radargrid"].get("columnSpacing", 0.0))
+    if dt <= 0.0 or dr <= 0.0:
+        raise ValueError("burst radar grid rowSpacing and columnSpacing must be positive")
+
+    out = np.full((rows, cols), fill_value, dtype=np.float64)
+    valid_mask = np.zeros((rows, cols), dtype=bool)
+    for burst, data_path in zip(bursts, data_paths, strict=False):
+        arr = np.asarray(_load_array(data_path), dtype=np.float64)
+        grid = burst["radargrid"]
+        row_off = int(round((float(grid["sensingStartGPSTime"]) - ref_start) / dt))
+        col_off = int(round((_burst_grid_range_start(grid) - ref_range) / dr))
+        first_line = int(grid.get("firstValidLine", 0))
+        num_lines = int(grid.get("numValidLines", grid.get("numberOfRows", arr.shape[0])))
+        first_sample = int(grid.get("firstValidSample", 0))
+        num_samples = int(grid.get("numValidSamples", grid.get("numberOfColumns", arr.shape[1])))
+        dst_row = row_off + first_line
+        dst_col = col_off + first_sample
+        src_rows = min(arr.shape[0], num_lines)
+        src_cols = min(arr.shape[1], num_samples)
+        if src_rows <= 0 or src_cols <= 0:
+            continue
+        dst_row_end = min(rows, dst_row + src_rows)
+        dst_col_end = min(cols, dst_col + src_cols)
+        src_rows = dst_row_end - dst_row
+        src_cols = dst_col_end - dst_col
+        if src_rows <= 0 or src_cols <= 0:
+            continue
+        src = arr[:src_rows, :src_cols]
+        valid = invalid_mask_fn(src) if invalid_mask_fn is not None else np.isfinite(src)
+        target = out[dst_row:dst_row_end, dst_col:dst_col_end]
+        target_mask = valid_mask[dst_row:dst_row_end, dst_col:dst_col_end]
+        write_mask = valid & ~target_mask
+        if np.any(write_mask):
+            target[write_mask] = src[write_mask]
+            target_mask[write_mask] = True
+            out[dst_row:dst_row_end, dst_col:dst_col_end] = target
+            valid_mask[dst_row:dst_row_end, dst_col:dst_col_end] = target_mask
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return _write_float_gtiff(output_path, out.astype(np.float32), dtype=gdal.GDT_Float32, nodata=np.nan)
+
+
+def _write_burst_topo_mosaic(
+    burst_records: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    name: str,
+) -> str:
+    if not burst_records:
+        raise ValueError("at least one burst record is required")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    x_paths = [str(Path(rec["topo_dir"]) / "x.tif") for rec in burst_records]
+    y_paths = [str(Path(rec["topo_dir"]) / "y.tif") for rec in burst_records]
+    z_paths = [str(Path(rec["topo_dir"]) / "z.tif") for rec in burst_records]
+    bursts = [rec["burst"] for rec in burst_records]
+
+    merged_x = _merge_burst_scalar_fields(
+        bursts,
+        x_paths,
+        output_path=output_dir / "x.tif",
+    )
+    merged_y = _merge_burst_scalar_fields(
+        bursts,
+        y_paths,
+        output_path=output_dir / "y.tif",
+    )
+    merged_z = _merge_burst_scalar_fields(
+        bursts,
+        z_paths,
+        output_path=output_dir / "z.tif",
+    )
+
+    return _build_topo_vrt(output_dir, epsg=4326)
+
+
 def _run_rdr2geo_topo(
     *,
     orbit_data: dict,
@@ -2999,6 +3203,227 @@ def _run_rdr2geo_topo(
         raster.close_dataset()
     dem_raster.close_dataset()
     return _build_topo_vrt(output_dir, epsg=int(topo.epsg_out))
+
+
+def _prepare_tops_burst_plan(
+    *,
+    context: PairContext,
+    master_bursts: list[TopsBurstInfo],
+    output_dir: Path,
+) -> dict[str, Any]:
+    slc_path = resolve_manifest_data_path(
+        context.master_manifest_path, (context.master_manifest.get("slc") or {}).get("path")
+    )
+    if not slc_path:
+        raise RuntimeError("missing master slc path")
+
+    acq_start = (
+        context.master_acq_data.get("startTimeUTC")
+        or context.master_acq_data.get("start_time_utc")
+        or context.master_acq_data.get("startTime")
+        or context.master_acq_data.get("start_time")
+    )
+    start_dt = _parse_datetime(str(acq_start)) if acq_start else None
+    gps_epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
+    acq_start_gps = (
+        (start_dt - gps_epoch).total_seconds() if start_dt is not None else float(context.master_acq_data.get("startGPSTime", 0.0) or 0.0)
+    )
+
+    row_spacing = float(context.master_rg_data.get("rowSpacing", 0.0) or 0.0)
+    if row_spacing <= 0:
+        row_spacing = float(context.master_acq_data.get("prf", 0.0) or 0.0)
+        row_spacing = (1.0 / row_spacing) if row_spacing > 0 else 0.0
+    col_spacing = float(context.master_rg_data.get("columnSpacing", 0.0) or 0.0)
+    if col_spacing <= 0:
+        col_spacing = 2.32956
+
+    bursts: list[dict[str, Any]] = []
+    for burst in master_bursts:
+        burst_index = int(burst.burst_index)
+        line_offset = int(burst.line_offset)
+        nrows = int(burst.number_of_lines)
+        ncols = int(burst.number_of_samples)
+        fvl = int(burst.first_valid_line)
+        nvl = int(burst.num_valid_lines)
+        fvs = int(burst.first_valid_sample)
+        nvs = int(burst.num_valid_samples)
+        burst_start = acq_start_gps + line_offset * row_spacing
+        burst_dir = output_dir / f"burst_{burst_index:03d}"
+        bursts.append(
+            {
+                "burstIndex": burst_index + 1,
+                "radargrid": {
+                    "source": "sentinel-1-burst",
+                    "burstIndex": burst_index + 1,
+                    "numberOfRows": nrows,
+                    "numberOfColumns": ncols,
+                    "rowSpacing": row_spacing,
+                    "columnSpacing": col_spacing,
+                    "rangeTimeFirstPixel": float(context.master_rg_data.get("rangeTimeFirstPixel", 0.0) or 0.0),
+                    "startingRange": float(context.master_rg_data.get("startingRange", 0.0) or 0.0),
+                    "prf": float(context.master_acq_data.get("prf", 0.0) or 0.0),
+                    "wavelength": float(getattr(burst, "radar_wavelength", None) or context.wavelength or 0.0),
+                    "sensingStartGPSTime": float(burst_start),
+                    "lineOffset": line_offset,
+                    "firstValidLine": fvl,
+                    "numValidLines": nvl,
+                    "firstValidSample": fvs,
+                    "numValidSamples": nvs,
+                    "swath": context.master_manifest.get("tops", {}).get("swath"),
+                    "polarisation": context.master_manifest.get("tops", {}).get("polarisation"),
+                    "lookDirection": context.master_acq_data.get("lookDirection", "RIGHT"),
+                },
+                "doppler": {"coefficients": [0.0], "t0": 0.0},
+                "slcWindow": {
+                    "xoff": 0,
+                    "yoff": line_offset,
+                    "xsize": ncols,
+                    "ysize": nrows,
+                    "validWindow": {
+                        "xoff": fvs,
+                        "yoff": fvl,
+                        "xsize": nvs,
+                        "ysize": nvl,
+                    },
+                },
+                "outputs": {
+                    "directory": str(burst_dir),
+                    "topo_h5": str(burst_dir / "topo.h5"),
+                    "amplitude_h5": str(burst_dir / "topo.h5"),
+                    "metadata_json": str(burst_dir / "metadata.json"),
+                },
+            }
+        )
+
+    plan = {
+        "version": "1.0",
+        "mode": "tops-burst-geometry",
+        "sensor": "sentinel-1",
+        "swath": context.master_manifest.get("tops", {}).get("swath"),
+        "polarisation": context.master_manifest.get("tops", {}).get("polarisation"),
+        "input_manifest": str(context.master_manifest_path),
+        "slc_path": str(slc_path),
+        "burst_count": len(bursts),
+        "bursts": bursts,
+    }
+    plan_path = output_dir / "tops_burst_plan.json"
+    plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+    plan["plan_path"] = str(plan_path)
+    return plan
+
+
+def run_tops_burst_geometry_stage(
+    context: PairContext,
+    *,
+    master_bursts: list[TopsBurstInfo],
+    slave_bursts: list[TopsBurstInfo],
+    gpu_mode: str,
+    gpu_id: int,
+    block_rows: int,
+) -> tuple[dict[str, Any], str, str | None]:
+    if not master_bursts:
+        raise RuntimeError("tops burst geometry requires non-empty master_bursts")
+    if not slave_bursts:
+        raise RuntimeError("tops burst geometry requires non-empty slave_bursts")
+
+    p0_dir = stage_dir(context.pair_dir, "p0")
+    p1_dir = stage_dir(context.pair_dir, "p1")
+    p0_dir.mkdir(parents=True, exist_ok=True)
+    p1_dir.mkdir(parents=True, exist_ok=True)
+
+    plan = _prepare_tops_burst_plan(context=context, master_bursts=master_bursts, output_dir=p0_dir)
+    plan_path = str(plan["plan_path"])
+    topo_result = tops_rtc.compute_burst_topo(
+        plan_path,
+        context.resolved_dem,
+        burst_limit=len(master_bursts),
+        block_rows=block_rows,
+        orbit_interp=context.orbit_interp,
+        use_gpu=(gpu_mode != "cpu"),
+        gpu_id=gpu_id,
+    )
+    burst_results = topo_result.get("bursts", []) if isinstance(topo_result, dict) else []
+    if len(burst_results) != len(master_bursts):
+        raise RuntimeError("burst topo result count does not match master bursts")
+
+    slave_index = {int(b.burst_index): b for b in slave_bursts}
+    burst_geo2rdr_records: list[dict[str, Any]] = []
+    for burst_info, topo_item in zip(master_bursts, burst_results, strict=False):
+        burst_index = int(burst_info.burst_index)
+        slave_info = slave_index.get(burst_index, burst_info)
+        topo_h5 = str(topo_item.get("topo_h5") or topo_item.get("amplitude_h5") or "")
+        if not topo_h5:
+            raise RuntimeError("missing burst topo HDF in tops_rtc output")
+        topo_dir = p1_dir / f"burst_{burst_index:03d}" / "topo_rasters"
+        topo_dir.mkdir(parents=True, exist_ok=True)
+        with h5py.File(topo_h5, "r") as f:
+            lon = np.asarray(f["longitude"][:], dtype=np.float64)
+            lat = np.asarray(f["latitude"][:], dtype=np.float64)
+            hgt = np.asarray(f["height"][:], dtype=np.float64)
+        x_path = _write_float_gtiff(topo_dir / "x.tif", lon.astype(np.float64), dtype=gdal.GDT_Float64, nodata=np.nan)
+        y_path = _write_float_gtiff(topo_dir / "y.tif", lat.astype(np.float64), dtype=gdal.GDT_Float64, nodata=np.nan)
+        z_path = _write_float_gtiff(topo_dir / "z.tif", hgt.astype(np.float64), dtype=gdal.GDT_Float64, nodata=np.nan)
+        topo_vrt = _build_topo_vrt(topo_dir, epsg=4326)
+
+        burst_offset_dir = p1_dir / f"burst_{burst_index:03d}" / "geo2rdr"
+        burst_offset_dir.mkdir(parents=True, exist_ok=True)
+        coarse_rg_offset_path, coarse_az_offset_path = _run_slave_geo2rdr_from_master_topo(
+            master_topo_vrt_path=topo_vrt,
+            slave_orbit_data=context.slave_orbit_data,
+            slave_acq_data=context.slave_acq_data,
+            slave_rg_data=context.slave_rg_data,
+            slave_dop_data=context.slave_dop_data,
+            output_dir=burst_offset_dir,
+            use_gpu=(gpu_mode != "cpu"),
+            gpu_id=gpu_id,
+            block_rows=block_rows,
+            orbit_interp=context.orbit_interp,
+        )
+        burst_geo2rdr_records.append(
+            {
+                "burst_index": burst_index,
+                "slave_burst_index": int(slave_info.burst_index),
+                "topo_h5": topo_h5,
+                "topo_vrt": topo_vrt,
+                "topo_x": x_path,
+                "topo_y": y_path,
+                "topo_z": z_path,
+                "coarse_geo2rdr_range_offsets": coarse_rg_offset_path,
+                "coarse_geo2rdr_azimuth_offsets": coarse_az_offset_path,
+            }
+        )
+
+    p0_outputs = {
+        "tops_burst_plan": plan_path,
+        "tops_burst_topo": str(p0_dir),
+        "burst_count": len(master_bursts),
+    }
+    _write_stage_outputs_record(
+        output_dir=context.pair_dir,
+        stage="p0",
+        master_manifest_path=context.master_manifest_path,
+        slave_manifest_path=context.slave_manifest_path,
+        backend_used="cpu",
+        output_files=p0_outputs,
+    )
+    p1_outputs = {
+        "tops_burst_geo2rdr_json": str(p1_dir / "burst_geo2rdr.json"),
+        "burst_geo2rdr_records": burst_geo2rdr_records,
+        "burst_count": len(master_bursts),
+    }
+    Path(p1_outputs["tops_burst_geo2rdr_json"]).write_text(
+        json.dumps(p1_outputs, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _write_stage_outputs_record(
+        output_dir=context.pair_dir,
+        stage="p1",
+        master_manifest_path=context.master_manifest_path,
+        slave_manifest_path=context.slave_manifest_path,
+        backend_used="cpu",
+        output_files=p1_outputs,
+    )
+    return p1_outputs, "cpu", None
 
 
 def run_geo2rdr_stage(
@@ -4120,6 +4545,555 @@ def _read_slc_block_as_complex(dataset, row0: int, rows: int, width: int) -> np.
     return block1.astype(np.complex64)
 
 
+def _burst_valid_window_from_info(burst: TopsBurstInfo) -> tuple[int, int, int, int]:
+    row0 = int(burst.line_offset) + int(burst.first_valid_line)
+    row1 = row0 + int(burst.num_valid_lines)
+    col0 = int(burst.first_valid_sample)
+    col1 = col0 + int(burst.num_valid_samples)
+    return row0, row1, col0, col1
+
+
+def _align_tops_valid_window(reference: TopsBurstInfo, secondary: TopsBurstInfo) -> tuple[TopsBurstInfo, TopsBurstInfo]:
+    ref_first_line = int(reference.first_valid_line)
+    ref_last_line = ref_first_line + int(reference.num_valid_lines) - 1
+    ref_first_sample = int(reference.first_valid_sample)
+    ref_last_sample = ref_first_sample + int(reference.num_valid_samples) - 1
+
+    sec_first_line = int(secondary.first_valid_line)
+    sec_last_line = sec_first_line + int(secondary.num_valid_lines) - 1
+    sec_first_sample = int(secondary.first_valid_sample)
+    sec_last_sample = sec_first_sample + int(secondary.num_valid_samples) - 1
+
+    first_line = max(ref_first_line, sec_first_line)
+    last_line = min(ref_last_line, sec_last_line)
+    first_sample = max(ref_first_sample, sec_first_sample)
+    last_sample = min(ref_last_sample, sec_last_sample)
+
+    num_lines = max(0, last_line - first_line + 1)
+    num_samples = max(0, last_sample - first_sample + 1)
+
+    ref_out = TopsBurstInfo(
+        burst_index=int(reference.burst_index),
+        line_offset=int(reference.line_offset),
+        number_of_lines=int(reference.number_of_lines),
+        number_of_samples=int(reference.number_of_samples),
+        first_valid_line=first_line,
+        num_valid_lines=num_lines,
+        first_valid_sample=first_sample,
+        num_valid_samples=num_samples,
+        sensing_start=reference.sensing_start,
+        azimuth_time_interval=reference.azimuth_time_interval,
+        radar_wavelength=reference.radar_wavelength,
+    )
+    sec_out = TopsBurstInfo(
+        burst_index=int(secondary.burst_index),
+        line_offset=int(secondary.line_offset),
+        number_of_lines=int(secondary.number_of_lines),
+        number_of_samples=int(secondary.number_of_samples),
+        first_valid_line=first_line,
+        num_valid_lines=num_lines,
+        first_valid_sample=first_sample,
+        num_valid_samples=num_samples,
+        sensing_start=secondary.sensing_start,
+        azimuth_time_interval=secondary.azimuth_time_interval,
+        radar_wavelength=secondary.radar_wavelength,
+    )
+    return ref_out, sec_out
+
+
+def _slice_offset_to_valid_window(offset: np.ndarray | None, burst: TopsBurstInfo) -> np.ndarray | None:
+    if offset is None:
+        return None
+    arr = np.asarray(offset)
+    if arr.ndim != 2:
+        return None
+    row0 = int(burst.first_valid_line)
+    col0 = int(burst.first_valid_sample)
+    rows = int(burst.num_valid_lines)
+    cols = int(burst.num_valid_samples)
+    if rows <= 0 or cols <= 0:
+        return None
+    row1 = row0 + rows
+    col1 = col0 + cols
+    if row0 < 0 or col0 < 0 or row1 > arr.shape[0] or col1 > arr.shape[1]:
+        row0 = max(0, min(arr.shape[0], row0))
+        col0 = max(0, min(arr.shape[1], col0))
+        row1 = max(row0, min(arr.shape[0], row1))
+        col1 = max(col0, min(arr.shape[1], col1))
+    out = np.asarray(arr[row0:row1, col0:col1], dtype=np.float32)
+    return out if out.size else None
+
+
+def _estimate_phasecorr_shift(
+    reference: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    max_rows: int = 1024,
+    max_cols: int = 2048,
+    stride_az: int = 2,
+    stride_rg: int = 4,
+) -> tuple[float, float, float]:
+    ref = np.asarray(reference, dtype=np.complex64)
+    sec = np.asarray(secondary, dtype=np.complex64)
+    rows = min(ref.shape[0], sec.shape[0])
+    cols = min(ref.shape[1], sec.shape[1])
+    if rows < 16 or cols < 16:
+        return 0.0, 0.0, 0.0
+    ref = ref[:rows, :cols]
+    sec = sec[:rows, :cols]
+
+    valid = (
+        np.isfinite(ref.real)
+        & np.isfinite(ref.imag)
+        & np.isfinite(sec.real)
+        & np.isfinite(sec.imag)
+        & (np.abs(ref) > 0)
+        & (np.abs(sec) > 0)
+    )
+    if not np.any(valid):
+        return 0.0, 0.0, 0.0
+
+    row_ids = np.where(np.any(valid, axis=1))[0]
+    col_ids = np.where(np.any(valid, axis=0))[0]
+    if row_ids.size < 16 or col_ids.size < 16:
+        return 0.0, 0.0, 0.0
+
+    r0 = int(row_ids[0])
+    r1 = int(row_ids[-1]) + 1
+    c0 = int(col_ids[0])
+    c1 = int(col_ids[-1]) + 1
+    if (r1 - r0) > max_rows:
+        center = (r0 + r1) // 2
+        half = max_rows // 2
+        r0 = max(0, center - half)
+        r1 = min(rows, r0 + max_rows)
+        r0 = max(0, r1 - max_rows)
+    if (c1 - c0) > max_cols:
+        center = (c0 + c1) // 2
+        half = max_cols // 2
+        c0 = max(0, center - half)
+        c1 = min(cols, c0 + max_cols)
+        c0 = max(0, c1 - max_cols)
+
+    ref_crop = ref[r0:r1, c0:c1]
+    sec_crop = sec[r0:r1, c0:c1]
+    valid_crop = valid[r0:r1, c0:c1]
+
+    ref_obs = np.abs(ref_crop).astype(np.float32)
+    sec_obs = np.abs(sec_crop).astype(np.float32)
+    ref_obs[~valid_crop] = 0.0
+    sec_obs[~valid_crop] = 0.0
+    ref_obs = ref_obs[:: max(1, stride_az), :: max(1, stride_rg)]
+    sec_obs = sec_obs[:: max(1, stride_az), :: max(1, stride_rg)]
+    if ref_obs.shape[0] < 16 or ref_obs.shape[1] < 16:
+        return 0.0, 0.0, 0.0
+
+    ref_obs = ref_obs - float(np.mean(ref_obs, dtype=np.float64))
+    sec_obs = sec_obs - float(np.mean(sec_obs, dtype=np.float64))
+
+    fa = np.fft.fft2(ref_obs)
+    fb = np.fft.fft2(sec_obs)
+    cps = fa * np.conj(fb)
+    denom = np.abs(cps)
+    denom[denom <= 1.0e-9] = 1.0
+    cps /= denom
+    corr = np.fft.ifft2(cps)
+    corr_abs = np.abs(corr)
+    peak = int(np.argmax(corr_abs))
+    pr, pc = np.unravel_index(peak, corr_abs.shape)
+    pval = float(corr_abs[pr, pc])
+    mean_corr = float(np.mean(corr_abs, dtype=np.float64)) + 1.0e-9
+    snr = pval / mean_corr
+
+    def _subpixel_parabola(v_m1: float, v0: float, v_p1: float) -> float:
+        denom = (v_m1 - 2.0 * v0 + v_p1)
+        if abs(denom) < 1.0e-9:
+            return 0.0
+        return 0.5 * (v_m1 - v_p1) / denom
+
+    nrows, ncols = corr_abs.shape
+    r_m1 = corr_abs[(pr - 1) % nrows, pc]
+    r_0 = corr_abs[pr, pc]
+    r_p1 = corr_abs[(pr + 1) % nrows, pc]
+    c_m1 = corr_abs[pr, (pc - 1) % ncols]
+    c_0 = corr_abs[pr, pc]
+    c_p1 = corr_abs[pr, (pc + 1) % ncols]
+    dr_sub = _subpixel_parabola(float(r_m1), float(r_0), float(r_p1))
+    dc_sub = _subpixel_parabola(float(c_m1), float(c_0), float(c_p1))
+
+    dy = float(pr if pr <= nrows // 2 else pr - nrows) + float(dr_sub)
+    dx = float(pc if pc <= ncols // 2 else pc - ncols) + float(dc_sub)
+    dy *= float(max(1, stride_az))
+    dx *= float(max(1, stride_rg))
+    return float(dy), float(dx), float(snr)
+
+
+def _read_complex_slc_valid_window(slc_path: str, burst: TopsBurstInfo) -> np.ndarray:
+    ds = gdal.Open(str(slc_path), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"failed to open SLC: {slc_path}")
+    try:
+        row0, row1, col0, col1 = _burst_valid_window_from_info(burst)
+        rows = max(0, row1 - row0)
+        cols = max(0, col1 - col0)
+        if rows <= 0 or cols <= 0:
+            return np.zeros((0, 0), dtype=np.complex64)
+        if ds.RasterCount >= 2:
+            i = _read_band_array(ds.GetRasterBand(1), col0, row0, cols, rows).astype(np.float32)
+            q = _read_band_array(ds.GetRasterBand(2), col0, row0, cols, rows).astype(np.float32)
+            return (i + 1j * q).astype(np.complex64)
+        real = _read_band_array(ds.GetRasterBand(1), col0, row0, cols, rows)
+        return np.asarray(real, dtype=np.complex64)
+    finally:
+        ds = None
+
+
+def run_burst_ifg_stage(
+    context: PairContext,
+    *,
+    master_bursts: list[TopsBurstInfo],
+    slave_bursts: list[TopsBurstInfo],
+    range_looks: int = 1,
+    azimuth_looks: int = 1,
+    esd_azimuth_offsets: list[float] | None = None,
+) -> tuple[dict, str, str | None]:
+    processing_options = {
+        "range_looks": int(range_looks),
+        "azimuth_looks": int(azimuth_looks),
+        "esd_azimuth_offsets": [float(v) for v in esd_azimuth_offsets] if esd_azimuth_offsets is not None else None,
+    }
+    cached_outputs = _load_cached_stage_outputs(
+        context.pair_dir,
+        "p2",
+        required_keys=("burst_interferograms", "burst_coherences"),
+        expected_processing_options=processing_options,
+    )
+    if cached_outputs is not None:
+        return cached_outputs, "cache", None
+
+    master_slc = resolve_manifest_data_path(
+        context.master_manifest_path,
+        context.master_manifest["slc"]["path"],
+    )
+    slave_slc = _select_registered_slave_slc(
+        load_stage_record(context.pair_dir, "p1").get("output_files") if load_stage_record(context.pair_dir, "p1") else None,
+        resolve_manifest_data_path(
+            context.slave_manifest_path,
+            context.slave_manifest["slc"]["path"],
+        ),
+    )
+
+    if not master_slc or not slave_slc:
+        raise RuntimeError("missing master/slave SLC path for burst IFG stage")
+
+    slave_index = {int(b.burst_index): b for b in slave_bursts}
+    bursts = list(master_bursts)
+    if not bursts:
+        raise RuntimeError("burst IFG stage requires non-empty master_bursts")
+
+    def _shift_azimuth(arr: np.ndarray, shift_px: float) -> np.ndarray:
+        if abs(float(shift_px)) < 1.0e-6:
+            return np.asarray(arr, dtype=np.complex64)
+        src = np.asarray(arr, dtype=np.complex64)
+        rows = src.shape[0]
+        if rows <= 1:
+            return src.copy()
+        y = np.arange(rows, dtype=np.float32)
+        src_y = y - np.float32(shift_px)
+        src0 = np.floor(src_y).astype(np.int32)
+        frac = (src_y - src0).astype(np.float32)
+        src1 = src0 + 1
+        valid = (src0 >= 0) & (src1 < rows)
+        out = np.zeros_like(src)
+        if np.any(valid):
+            idx0 = src0[valid]
+            idx1 = src1[valid]
+            w = frac[valid][:, None]
+            out[valid, :] = (1.0 - w) * src[idx0, :] + w * src[idx1, :]
+        return out
+
+    p1_record = load_stage_record(context.pair_dir, "p1") or {}
+    p1_outputs = p1_record.get("output_files") or {}
+    burst_geo2rdr_records = p1_outputs.get("burst_geo2rdr_records") or []
+    burst_fine_offsets = p1_outputs.get("burst_fine_offsets") or []
+    burst_offset_index: dict[int, tuple[np.ndarray | None, np.ndarray | None]] = {}
+    burst_fine_index: dict[int, tuple[float, float]] = {}
+    if isinstance(burst_geo2rdr_records, list):
+        for item in burst_geo2rdr_records:
+            if not isinstance(item, dict):
+                continue
+            idx = int(item.get("burst_index", -1))
+            if idx < 0:
+                continue
+            rg_off = _load_float_offset_raster(item.get("coarse_geo2rdr_range_offsets"))
+            az_off = _load_float_offset_raster(item.get("coarse_geo2rdr_azimuth_offsets"))
+            burst_offset_index[idx] = (rg_off, az_off)
+    if isinstance(burst_fine_offsets, list):
+        for item in burst_fine_offsets:
+            if not isinstance(item, dict):
+                continue
+            idx = int(item.get("burst_index", -1))
+            if idx < 0:
+                continue
+            az_res = float(item.get("fine_azimuth_offset_px", 0.0) or 0.0)
+            rg_res = float(item.get("fine_range_offset_px", 0.0) or 0.0)
+            burst_fine_index[idx] = (az_res, rg_res)
+
+    burst_ifg_paths: list[str] = []
+    burst_coh_paths: list[str] = []
+    overlap_records: list[dict[str, Any]] = []
+
+    for i, mb in enumerate(bursts):
+        sb = slave_index.get(int(mb.burst_index), mb)
+        mb_aligned, sb_aligned = _align_tops_valid_window(mb, sb)
+        m_win = _read_complex_slc_valid_window(master_slc, mb_aligned)
+        s_win = _read_complex_slc_valid_window(slave_slc, sb_aligned)
+        range_off, az_off = burst_offset_index.get(int(mb.burst_index), (None, None))
+        fine_az_res, fine_rg_res = burst_fine_index.get(int(mb.burst_index), (0.0, 0.0))
+        if range_off is not None or az_off is not None:
+            rg_win = _slice_offset_to_valid_window(range_off, mb_aligned)
+            az_win = _slice_offset_to_valid_window(az_off, mb_aligned)
+            if abs(float(fine_rg_res)) > 1.0e-6:
+                if rg_win is None:
+                    rg_win = np.full(s_win.shape, float(fine_rg_res), dtype=np.float32)
+                else:
+                    rg_win = np.asarray(rg_win, dtype=np.float32)
+                    rg_valid = np.isfinite(rg_win)
+                    rg_win[rg_valid] = rg_win[rg_valid] + float(fine_rg_res)
+            if abs(float(fine_az_res)) > 1.0e-6:
+                if az_win is None:
+                    az_win = np.full(s_win.shape, float(fine_az_res), dtype=np.float32)
+                else:
+                    az_win = np.asarray(az_win, dtype=np.float32)
+                    az_valid = np.isfinite(az_win)
+                    az_win[az_valid] = az_win[az_valid] + float(fine_az_res)
+            s_resampled = _resample_complex_with_offsets(s_win, rg_win, az_win)
+            # Guardrail: if offset-resampled slave collapses to nearly empty,
+            # keep the pre-resample window to avoid invalid all-zero burst IFG.
+            src_nonzero = int(np.count_nonzero(np.abs(s_win) > 0))
+            out_nonzero = int(np.count_nonzero(np.abs(s_resampled) > 0))
+            if src_nonzero > 0 and out_nonzero < max(64, int(0.01 * src_nonzero)):
+                s_win = np.asarray(s_win, dtype=np.complex64)
+            else:
+                s_win = s_resampled
+        elif abs(float(fine_az_res)) > 1.0e-6 or abs(float(fine_rg_res)) > 1.0e-6:
+            rg_win = np.full(s_win.shape, float(fine_rg_res), dtype=np.float32) if abs(float(fine_rg_res)) > 1.0e-6 else None
+            az_win = np.full(s_win.shape, float(fine_az_res), dtype=np.float32) if abs(float(fine_az_res)) > 1.0e-6 else None
+            s_win = _resample_complex_with_offsets(s_win, rg_win, az_win)
+        rows = min(m_win.shape[0], s_win.shape[0])
+        cols = min(m_win.shape[1], s_win.shape[1])
+        if rows <= 0 or cols <= 0:
+            raise RuntimeError(f"empty burst window for burst index {mb.burst_index}")
+        m_win = np.asarray(m_win[:rows, :cols], dtype=np.complex64)
+        s_win = np.asarray(s_win[:rows, :cols], dtype=np.complex64)
+        if esd_azimuth_offsets is not None and i < len(esd_azimuth_offsets):
+            s_win = _shift_azimuth(s_win, float(esd_azimuth_offsets[i]))
+        ifg = (m_win * np.conj(s_win)).astype(np.complex64)
+        coh = _estimate_coherence(m_win, s_win, size=5).astype(np.float32)
+        if azimuth_looks > 1 or range_looks > 1:
+            ifg = _multilook_mean(ifg, azimuth_looks, range_looks).astype(np.complex64)
+            coh = _multilook_mean(coh, azimuth_looks, range_looks).astype(np.float32)
+
+        burst_dir = stage_dir(context.pair_dir, "p2") / f"burst_{int(mb.burst_index):03d}"
+        burst_dir.mkdir(parents=True, exist_ok=True)
+        ifg_path = _save_stage_array(context.pair_dir, "p2", f"burst_{int(mb.burst_index):03d}_interferogram", ifg)
+        coh_path = _save_stage_array(context.pair_dir, "p2", f"burst_{int(mb.burst_index):03d}_coherence", coh)
+        burst_ifg_paths.append(ifg_path)
+        burst_coh_paths.append(coh_path)
+
+    for i in range(len(bursts) - 1):
+        b0 = bursts[i]
+        b1 = bursts[i + 1]
+        m0 = _read_complex_slc_valid_window(master_slc, b0)
+        m1 = _read_complex_slc_valid_window(master_slc, b1)
+        s0 = _read_complex_slc_valid_window(slave_slc, slave_index.get(int(b0.burst_index), b0))
+        s1 = _read_complex_slc_valid_window(slave_slc, slave_index.get(int(b1.burst_index), b1))
+        rows = min(m0.shape[0], m1.shape[0], s0.shape[0], s1.shape[0])
+        cols = min(m0.shape[1], m1.shape[1], s0.shape[1], s1.shape[1])
+        if rows <= 1 or cols <= 0:
+            continue
+        m0 = np.asarray(m0[:rows, :cols], dtype=np.complex64)
+        m1 = np.asarray(m1[:rows, :cols], dtype=np.complex64)
+        s0 = np.asarray(s0[:rows, :cols], dtype=np.complex64)
+        s1 = np.asarray(s1[:rows, :cols], dtype=np.complex64)
+        if esd_azimuth_offsets is not None:
+            if i < len(esd_azimuth_offsets):
+                s0 = _shift_azimuth(s0, float(esd_azimuth_offsets[i]))
+            if i + 1 < len(esd_azimuth_offsets):
+                s1 = _shift_azimuth(s1, float(esd_azimuth_offsets[i + 1]))
+
+        ifg0 = (m0 * np.conj(s0)).astype(np.complex64)
+        ifg1 = (m1 * np.conj(s1)).astype(np.complex64)
+        esd_ifg = (ifg0 * np.conj(ifg1)).astype(np.complex64)
+        esd_coh = np.clip(
+            _estimate_coherence(m0, s0, size=5) * _estimate_coherence(m1, s1, size=5),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        if azimuth_looks > 1 or range_looks > 1:
+            esd_ifg = _multilook_mean(esd_ifg, azimuth_looks, range_looks).astype(np.complex64)
+            esd_coh = _multilook_mean(esd_coh, azimuth_looks, range_looks).astype(np.float32)
+
+        ov_dir = stage_dir(context.pair_dir, "p2") / f"overlap_{int(b0.burst_index):03d}_{int(b1.burst_index):03d}"
+        ov_dir.mkdir(parents=True, exist_ok=True)
+        ov_ifg = _save_stage_array(
+            context.pair_dir,
+            "p2",
+            f"overlap_{int(b0.burst_index):03d}_{int(b1.burst_index):03d}_ifg",
+            esd_ifg,
+        )
+        ov_coh = _save_stage_array(
+            context.pair_dir,
+            "p2",
+            f"overlap_{int(b0.burst_index):03d}_{int(b1.burst_index):03d}_coh",
+            esd_coh,
+        )
+        overlap_records.append(
+            {
+                "previous_burst_index": int(b0.burst_index),
+                "next_burst_index": int(b1.burst_index),
+                "estimated_overlap_lines": int(min(rows, max(1, rows // 4))),
+                "ifg_path": str(ov_ifg),
+                "coh_path": str(ov_coh),
+            }
+        )
+
+    output_files = {
+        "burst_interferograms": burst_ifg_paths,
+        "burst_coherences": burst_coh_paths,
+        "overlap_ifgs": [item["ifg_path"] for item in overlap_records],
+        "overlap_cohs": [item["coh_path"] for item in overlap_records],
+        "overlap_pairs": overlap_records,
+    }
+    _write_stage_outputs_record(
+        output_dir=context.pair_dir,
+        stage="p2",
+        master_manifest_path=context.master_manifest_path,
+        slave_manifest_path=context.slave_manifest_path,
+        backend_used="cpu",
+        output_files=output_files,
+        processing_options=processing_options,
+    )
+    return output_files, "cpu", None
+
+
+def run_tops_burst_fine_offsets_stage(
+    context: PairContext,
+    *,
+    master_bursts: list[TopsBurstInfo],
+    slave_bursts: list[TopsBurstInfo],
+) -> tuple[dict[str, Any], str, str | None]:
+    p1_record = load_stage_record(context.pair_dir, "p1") or {}
+    p1_outputs = dict(p1_record.get("output_files") or {})
+    burst_geo2rdr_records = p1_outputs.get("burst_geo2rdr_records") or []
+    if not isinstance(burst_geo2rdr_records, list):
+        burst_geo2rdr_records = []
+
+    master_slc = resolve_manifest_data_path(context.master_manifest_path, (context.master_manifest.get("slc") or {}).get("path"))
+    slave_slc = resolve_manifest_data_path(context.slave_manifest_path, (context.slave_manifest.get("slc") or {}).get("path"))
+    if not master_slc or not slave_slc:
+        return p1_outputs, "cpu", "missing master/slave SLC path for burst fine registration"
+    if not _gdal_path_exists(master_slc) or not _gdal_path_exists(slave_slc):
+        return p1_outputs, "cpu", "master/slave SLC not accessible; skip burst fine registration"
+
+    slave_index = {int(b.burst_index): b for b in slave_bursts}
+    coarse_index: dict[int, tuple[np.ndarray | None, np.ndarray | None]] = {}
+    for item in burst_geo2rdr_records:
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("burst_index", -1))
+        if idx < 0:
+            continue
+        rg_off = _load_float_offset_raster(item.get("coarse_geo2rdr_range_offsets"))
+        az_off = _load_float_offset_raster(item.get("coarse_geo2rdr_azimuth_offsets"))
+        coarse_index[idx] = (rg_off, az_off)
+
+    fine_records: list[dict[str, Any]] = []
+    for mb in master_bursts:
+        sb = slave_index.get(int(mb.burst_index), mb)
+        mb_aligned, sb_aligned = _align_tops_valid_window(mb, sb)
+        m_win = _read_complex_slc_valid_window(master_slc, mb_aligned)
+        s_win = _read_complex_slc_valid_window(slave_slc, sb_aligned)
+        rg_off, az_off = coarse_index.get(int(mb.burst_index), (None, None))
+        rg_win = _slice_offset_to_valid_window(rg_off, mb_aligned)
+        az_win = _slice_offset_to_valid_window(az_off, mb_aligned)
+        if rg_win is not None or az_win is not None:
+            s_base = _resample_complex_with_offsets(s_win, rg_win, az_win)
+        else:
+            s_base = np.asarray(s_win, dtype=np.complex64)
+
+        rows = min(m_win.shape[0], s_base.shape[0])
+        cols = min(m_win.shape[1], s_base.shape[1])
+        window_info = {
+            "master_rows": int(m_win.shape[0]),
+            "master_cols": int(m_win.shape[1]),
+            "slave_rows": int(s_win.shape[0]),
+            "slave_cols": int(s_win.shape[1]),
+            "aligned_rows": rows,
+            "aligned_cols": cols,
+        }
+        if rows < 32 or cols < 32:
+            fine_records.append(
+                {
+                    "burst_index": int(mb.burst_index),
+                    "fine_azimuth_offset_px": 0.0,
+                    "fine_range_offset_px": 0.0,
+                    "snr": 0.0,
+                    "method": "spectral-phasecorr",
+                    "status": "insufficient_window",
+                    "window": window_info,
+                    "coarse_offset_applied": rg_off is not None or az_off is not None,
+                }
+            )
+            continue
+        dy, dx, snr = _estimate_phasecorr_shift(m_win[:rows, :cols], s_base[:rows, :cols])
+        if not np.isfinite(dy) or not np.isfinite(dx):
+            dy = 0.0
+            dx = 0.0
+        if abs(float(dy)) > 64.0 or abs(float(dx)) > 64.0:
+            dy = 0.0
+            dx = 0.0
+        fine_records.append(
+            {
+                "burst_index": int(mb.burst_index),
+                "fine_azimuth_offset_px": float(dy),
+                "fine_range_offset_px": float(dx),
+                "snr": float(snr),
+                "method": "spectral-phasecorr",
+                "status": "ok",
+                "window": window_info,
+                "coarse_offset_applied": rg_off is not None or az_off is not None,
+            }
+        )
+
+    fine_json_path = stage_dir(context.pair_dir, "p1") / "burst_fine_offsets.json"
+    fine_json_payload = {
+        "method": "spectral-phasecorr",
+        "burst_count": len(fine_records),
+        "records": fine_records,
+        "summary": {
+            "total_bursts": len(fine_records),
+            "ok_count": sum(1 for r in fine_records if r.get("status") == "ok"),
+            "insufficient_window_count": sum(1 for r in fine_records if r.get("status") == "insufficient_window"),
+            "all_offsets_applied": all(r.get("coarse_offset_applied", False) for r in fine_records),
+        },
+    }
+    fine_json_path.write_text(json.dumps(fine_json_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    p1_outputs["burst_fine_offsets_json"] = str(fine_json_path)
+    p1_outputs["burst_fine_offsets"] = fine_records
+
+    _write_stage_outputs_record(
+        output_dir=context.pair_dir,
+        stage="p1",
+        master_manifest_path=context.master_manifest_path,
+        slave_manifest_path=context.slave_manifest_path,
+        backend_used="cpu",
+        output_files=p1_outputs,
+        processing_options={"burst_fine_offset_method": "spectral-phasecorr"},
+    )
+    return p1_outputs, "cpu", None
+
+
 def _inject_constant_azimuth_esd_offset(
     *,
     azimuth_offset_path: str,
@@ -4179,7 +5153,7 @@ def _apply_esd_azimuth_shift_to_slc(
 
 
 def _load_tops_bursts_from_manifest(manifest_path: Path, manifest: dict) -> list[dict]:
-    tops_meta_path = resolve_manifest_metadata_path(manifest_path, (manifest.get("metadata") or {}).get("tops"))
+    tops_meta_path = resolve_manifest_metadata_path(manifest_path, manifest, "tops")
     if not tops_meta_path:
         return []
     try:
@@ -4188,6 +5162,124 @@ def _load_tops_bursts_from_manifest(manifest_path: Path, manifest: dict) -> list
         return []
     bursts = data.get("bursts", [])
     return bursts if isinstance(bursts, list) else []
+
+
+def _sinc_interpolate_kernel(x: np.ndarray, a: int = 3) -> np.ndarray:
+    """加窗 sinc 插值核（Lanczos 核）。
+
+    Args:
+        x: 输入坐标数组
+        a: Lanczos 参数，决定截断半径
+
+    Returns:
+        插值核权重
+    """
+    x = np.asarray(x, dtype=np.float32)
+    result = np.zeros_like(x, dtype=np.float32)
+    small = np.abs(x) < 1.0e-6
+    result[small] = 1.0
+    nonzero = ~small & (np.abs(x) <= float(a))
+    if np.any(nonzero):
+        x_nz = x[nonzero]
+        arg = np.pi * x_nz
+        window = 2.0 * a * np.sin(arg) * np.sin(arg / a) / (arg * arg + 1.0e-10)
+        sinc_term = np.sin(arg) / (arg + 1.0e-10)
+        result[nonzero] = window * sinc_term
+    return result
+
+
+def _resample_complex_with_offsets(
+    slave: np.ndarray,
+    range_off: np.ndarray | None,
+    az_off: np.ndarray | None,
+    *,
+    method: str = "lanczos",
+    lanczos_a: int = 3,
+) -> np.ndarray:
+    """使用 offset 场对 slave SLC 进行重采样。
+
+    Args:
+        slave: 输入的复数 SLC 数据
+        range_off: range 方向偏移量（像素）
+        az_off: azimuth 方向偏移量（像素）
+        method: 插值方法，"bilinear" 或 "lanczos"
+        lanczos_a: Lanczos 核的截断半径
+
+    Returns:
+        重采样后的复数数据
+    """
+    from scipy.ndimage import map_coordinates
+
+    src = np.asarray(slave, dtype=np.complex64)
+    rows, cols = src.shape[:2]
+    if rows <= 0 or cols <= 0:
+        return src.copy()
+    if range_off is None and az_off is None:
+        return src.copy()
+
+    rg = np.zeros((rows, cols), dtype=np.float32) if range_off is None else np.asarray(range_off, dtype=np.float32)
+    az = np.zeros((rows, cols), dtype=np.float32) if az_off is None else np.asarray(az_off, dtype=np.float32)
+    rows = min(rows, rg.shape[0], az.shape[0])
+    cols = min(cols, rg.shape[1], az.shape[1])
+    src = src[:rows, :cols]
+    rg = rg[:rows, :cols]
+    az = az[:rows, :cols]
+
+    yy, xx = np.meshgrid(np.arange(rows, dtype=np.float32), np.arange(cols, dtype=np.float32), indexing="ij")
+    src_y = yy - az
+    src_x = xx - rg
+
+    if method == "bilinear":
+        finite = np.isfinite(src_y) & np.isfinite(src_x)
+        y0 = np.zeros((rows, cols), dtype=np.int32)
+        x0 = np.zeros((rows, cols), dtype=np.int32)
+        y0[finite] = np.floor(src_y[finite]).astype(np.int32)
+        x0[finite] = np.floor(src_x[finite]).astype(np.int32)
+        y1 = y0 + 1
+        x1 = x0 + 1
+        wy = (src_y - y0).astype(np.float32)
+        wx = (src_x - x0).astype(np.float32)
+
+        valid = finite & (y0 >= 0) & (x0 >= 0) & (y1 < rows) & (x1 < cols)
+        out = np.zeros((rows, cols), dtype=np.complex64)
+        if not np.any(valid):
+            return out
+
+        flat = src.reshape(-1)
+        idx00 = y0[valid] * cols + x0[valid]
+        idx01 = y0[valid] * cols + x1[valid]
+        idx10 = y1[valid] * cols + x0[valid]
+        idx11 = y1[valid] * cols + x1[valid]
+        w00 = (1.0 - wy[valid]) * (1.0 - wx[valid])
+        w01 = (1.0 - wy[valid]) * wx[valid]
+        w10 = wy[valid] * (1.0 - wx[valid])
+        w11 = wy[valid] * wx[valid]
+        out[valid] = (
+            flat[idx00] * w00 + flat[idx01] * w01 + flat[idx10] * w10 + flat[idx11] * w11
+        ).astype(np.complex64)
+        return out
+
+    # Lanczos (sinc) interpolation using scipy.ndimage.map_coordinates
+    # 将复数数组拆分为实部和虚部分别插值
+    finite = np.isfinite(src_y) & np.isfinite(src_x)
+    if not np.any(finite):
+        return np.zeros((rows, cols), dtype=np.complex64)
+
+    # 坐标（scipy 的坐标顺序是 (x, y) 即 (cols, rows)）
+    coords = np.array([src_x.flatten(), src_y.flatten()], dtype=np.float64)
+
+    # 分别对实部和虚部进行插值
+    order = min(int(lanczos_a), 5)  # scipy 的 order 参数范围是 0-5
+    real_interp = map_coordinates(src.real, coords, order=order, mode="constant", cval=0.0)
+    imag_interp = map_coordinates(src.imag, coords, order=order, mode="constant", cval=0.0)
+
+    # 处理无效像素
+    valid_mask = finite.flatten()
+    real_interp[~valid_mask] = 0.0
+    imag_interp[~valid_mask] = 0.0
+
+    out = (real_interp + 1j * imag_interp).reshape(rows, cols).astype(np.complex64)
+    return out
 
 
 def _build_isce2_style_valid_segments(
@@ -4266,6 +5358,70 @@ def _repair_burst_seams_isce2_style(
     out_ifg[~valid_mask] = np.complex64(0.0 + 0.0j)
     out_coh[~valid_mask] = np.float32(0.0)
     return out_ifg, out_coh
+
+
+def _collect_burst_seam_diagnostics(
+    *,
+    interferogram: np.ndarray,
+    coherence: np.ndarray,
+    segments: list[tuple[int, int, int, int]],
+) -> dict[str, Any]:
+    rows, cols = interferogram.shape[:2]
+    seam_records: list[dict[str, Any]] = []
+    if not segments:
+        return {
+            "rows": int(rows),
+            "cols": int(cols),
+            "segment_count": 0,
+            "seam_count": 0,
+            "seams": seam_records,
+        }
+
+    coh_arr = np.asarray(coherence, dtype=np.float32)
+    for i in range(len(segments) - 1):
+        py0, py1, px0, px1 = segments[i]
+        cy0, cy1, cx0, cx1 = segments[i + 1]
+        seam_row_top = int(py1 - 1)
+        seam_row_bottom = int(cy0)
+        overlap_x0 = int(max(px0, cx0))
+        overlap_x1 = int(min(px1, cx1))
+        gap_lines = int(max(0, cy0 - py1))
+        valid = (
+            seam_row_top >= 0
+            and seam_row_bottom < rows
+            and overlap_x1 > overlap_x0
+            and seam_row_top < rows
+        )
+        record: dict[str, Any] = {
+            "pair_index": int(i),
+            "top_segment": [int(py0), int(py1), int(px0), int(px1)],
+            "bottom_segment": [int(cy0), int(cy1), int(cx0), int(cx1)],
+            "gap_lines": int(gap_lines),
+            "seam_row_top": int(seam_row_top),
+            "seam_row_bottom": int(seam_row_bottom),
+            "overlap_x0": int(overlap_x0),
+            "overlap_x1": int(overlap_x1),
+            "valid": bool(valid),
+        }
+        if valid:
+            top = coh_arr[seam_row_top, overlap_x0:overlap_x1]
+            bottom = coh_arr[seam_row_bottom, overlap_x0:overlap_x1]
+            top_mean = float(np.nanmean(top)) if top.size else float("nan")
+            bottom_mean = float(np.nanmean(bottom)) if bottom.size else float("nan")
+            record["top_coherence_mean"] = top_mean if np.isfinite(top_mean) else None
+            record["bottom_coherence_mean"] = bottom_mean if np.isfinite(bottom_mean) else None
+            if top.size and bottom.size:
+                jump_mean = float(np.nanmean(np.abs(top - bottom)))
+                record["coherence_jump_mean"] = jump_mean if np.isfinite(jump_mean) else None
+        seam_records.append(record)
+
+    return {
+        "rows": int(rows),
+        "cols": int(cols),
+        "segment_count": int(len(segments)),
+        "seam_count": int(len(seam_records)),
+        "seams": seam_records,
+    }
 
 
 def _merge_tops_burst_interferograms(
@@ -4510,6 +5666,74 @@ def _merge_tops_burst_interferograms(
 
 def _tops_esd_stage_dir(output_dir: Path) -> Path:
     return stage_dir(output_dir, "p3") / "tops_esd"
+
+
+def _estimate_esd_local_frequency(ifg: np.ndarray) -> np.ndarray:
+    phase = np.unwrap(np.angle(np.asarray(ifg, dtype=np.complex64)), axis=0)
+    if phase.shape[0] <= 1:
+        return np.zeros_like(phase, dtype=np.float32)
+    freq = np.gradient(phase, axis=0).astype(np.float32)
+    try:
+        freq = _boxcar_mean2d(freq, 5).astype(np.float32)
+    except Exception:
+        pass
+    freq[np.abs(freq) < 1.0e-6] = np.nan
+    return freq
+
+
+def _compute_esd_spectral_diversity(
+    overlap_ifgs: list[np.ndarray],
+    overlap_cohs: list[np.ndarray],
+    *,
+    azimuth_looks: int = 5,
+    range_looks: int = 15,
+    coherence_threshold: float = 0.85,
+    extra_esd_cycles: float = 0.0,
+) -> tuple[float, float, float, np.ndarray]:
+    if len(overlap_ifgs) != len(overlap_cohs):
+        raise ValueError("overlap_ifgs and overlap_cohs must have the same length")
+
+    extra_offset = float(extra_esd_cycles) * 2.0 * np.pi
+    all_offsets: list[np.ndarray] = []
+
+    for ifg, cor in zip(overlap_ifgs, overlap_cohs, strict=False):
+        ifg_arr = np.asarray(ifg, dtype=np.complex64)
+        cor_arr = np.asarray(cor, dtype=np.float32)
+        rows = min(ifg_arr.shape[0], cor_arr.shape[0])
+        cols = min(ifg_arr.shape[1], cor_arr.shape[1])
+        if rows <= 0 or cols <= 0:
+            continue
+        ifg_arr = ifg_arr[:rows, :cols]
+        cor_arr = cor_arr[:rows, :cols]
+
+        if azimuth_looks > 1 or range_looks > 1:
+            ifg_arr = _multilook_mean(ifg_arr, azimuth_looks, range_looks).astype(np.complex64)
+            cor_arr = _multilook_mean(cor_arr, azimuth_looks, range_looks).astype(np.float32)
+
+        rows, cols = ifg_arr.shape[:2]
+        if rows <= 0 or cols <= 0:
+            continue
+
+        freq = _estimate_esd_local_frequency(ifg_arr)
+        phase = np.angle(ifg_arr).astype(np.float32)
+        off = np.full((rows, cols), np.nan, dtype=np.float32)
+        valid_freq = np.isfinite(freq) & (np.abs(freq) > 1.0e-6)
+        off[valid_freq] = (phase[valid_freq] + extra_offset) / freq[valid_freq]
+
+        mask = (np.abs(ifg_arr) > 0) & (cor_arr > float(coherence_threshold)) & np.isfinite(off)
+        if np.any(mask):
+            all_offsets.append(off[mask].astype(np.float32))
+
+    if not all_offsets:
+        raise RuntimeError("Coherence threshold too strict. No points left for reliable ESD estimate")
+
+    offsets = np.concatenate(all_offsets).astype(np.float64)
+    return (
+        float(np.median(offsets)),
+        float(np.mean(offsets)),
+        float(np.std(offsets)),
+        offsets.astype(np.float32),
+    )
 
 
 def _load_tops_burst_patches_from_p2(
@@ -5936,22 +7160,56 @@ def run_burst_merge_stage(
             az_reference_offsets=az_reference_offsets,
         )
 
+    # The burst mosaic is re-based to the minimum valid row/column during merge;
+    # seam repair must use that same origin instead of the original crop window.
+    merge_row0s: list[int] = []
+    merge_col0s: list[int] = []
+    for burst in bursts:
+        burst_idx = int(getattr(burst, "burst_index", 0))
+        ref_offset = 0
+        if az_reference_offsets is not None and 0 <= burst_idx < len(az_reference_offsets):
+            ref_vals: list[float] = []
+            for value in az_reference_offsets[burst_idx]:
+                try:
+                    value_f = float(value)
+                except Exception:
+                    continue
+                if np.isfinite(value_f):
+                    ref_vals.append(value_f)
+            if ref_vals:
+                ref_offset = int(round(float(np.mean(ref_vals))))
+        merge_row0s.append(int(getattr(burst, "line_offset", 0)) + int(getattr(burst, "first_valid_line", 0)) + ref_offset)
+        merge_col0s.append(int(getattr(burst, "first_valid_sample", 0)))
+    segments = _build_isce2_style_valid_segments(
+        bursts=[_burst_to_dict(b) for b in bursts],
+        crop_window={
+            "row0": int(min(merge_row0s)) if merge_row0s else 0,
+            "col0": int(min(merge_col0s)) if merge_col0s else 0,
+        },
+        rows=int(merged_interferogram.shape[0]),
+        cols=int(merged_interferogram.shape[1]),
+    )
     if do_burst_seam_repair:
-        segments = _build_isce2_style_valid_segments(
-            bursts=[_burst_to_dict(b) for b in bursts],
-            crop_window=context.effective_crop_window,
-            rows=int(merged_interferogram.shape[0]),
-            cols=int(merged_interferogram.shape[1]),
-        )
         merged_interferogram, merged_coherence = _repair_burst_seams_isce2_style(
             interferogram=merged_interferogram,
             coherence=merged_coherence,
             segments=segments,
         )
+    seam_diag = _collect_burst_seam_diagnostics(
+        interferogram=merged_interferogram,
+        coherence=merged_coherence,
+        segments=segments,
+    )
+    seam_diag["seam_repair_enabled"] = bool(do_burst_seam_repair)
+    seam_diag["merge_method"] = "avg" if use_topo_flattening else "top"
+    seam_diag_path = stage_dir(context.pair_dir, "p3") / "burst_seam_diagnostics.json"
+    seam_diag_path.parent.mkdir(parents=True, exist_ok=True)
+    seam_diag_path.write_text(json.dumps(seam_diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
     output_files = {
         "merged_interferogram": _save_stage_array(context.pair_dir, "p3", "merged_interferogram", merged_interferogram),
         "merged_coherence": _save_stage_array(context.pair_dir, "p3", "merged_coherence", merged_coherence),
+        "burst_seam_diagnostics_json": str(seam_diag_path),
     }
     for key, value in existing_p3_outputs.items():
         if key not in output_files:
@@ -6013,50 +7271,24 @@ def run_esd_estimation_stage(
         except Exception:
             pass
 
-    ifg, coh = _load_tops_burst_patches_from_p2(context, master_bursts or slave_bursts or [])
-    if not ifg:
-        raise RuntimeError("ESD estimation requires burst metadata")
-
+    p2_record = load_stage_record(context.pair_dir, "p2") or {}
+    p2_outputs = p2_record.get("output_files") or {}
+    overlap_ifg_paths = p2_outputs.get("overlap_ifgs") or []
+    overlap_coh_paths = p2_outputs.get("overlap_cohs") or []
     overlap_ifgs: list[np.ndarray] = []
     overlap_cohs: list[np.ndarray] = []
-    burst_list = list(master_bursts or slave_bursts)
-    if overlap_pairs:
-        pair_iter = overlap_pairs
-    else:
-        pair_iter = [
-            {
-                "previous_burst_index": i,
-                "next_burst_index": i + 1,
-                "estimated_overlap_lines": max(1, min(burst_list[i].num_valid_lines, burst_list[i + 1].num_valid_lines) // 4),
-            }
-            for i in range(max(0, len(burst_list) - 1))
-        ]
+    for ifg_path, coh_path in zip(overlap_ifg_paths, overlap_coh_paths, strict=False):
+        if not ifg_path or not coh_path:
+            continue
+        ifg_p = Path(str(ifg_path))
+        coh_p = Path(str(coh_path))
+        if not ifg_p.is_file() or not coh_p.is_file():
+            continue
+        overlap_ifgs.append(np.asarray(np.load(ifg_p), dtype=np.complex64))
+        overlap_cohs.append(np.asarray(np.load(coh_p), dtype=np.float32))
 
-    full_ifg = _load_cached_array(context.pair_dir, "p2", "interferogram")
-    full_coh = _load_cached_array(context.pair_dir, "p2", "coherence")
-    for item in pair_iter:
-        if isinstance(item, dict):
-            prev_idx = int(item.get("previous_burst_index", item.get("prev_idx", 0)))
-            next_idx = int(item.get("next_burst_index", item.get("next_idx", prev_idx + 1)))
-            overlap_lines = int(item.get("estimated_overlap_lines", item.get("overlap_lines", 0)))
-        else:
-            prev_idx, next_idx, overlap_lines = item
-        if prev_idx < 0 or next_idx >= len(burst_list) or next_idx <= prev_idx:
-            continue
-        prev_b = burst_list[prev_idx]
-        next_b = burst_list[next_idx]
-        y0 = max(int(prev_b.line_offset + prev_b.first_valid_line), int(next_b.line_offset + next_b.first_valid_line))
-        y1 = min(
-            int(prev_b.line_offset + prev_b.first_valid_line + prev_b.num_valid_lines),
-            int(next_b.line_offset + next_b.first_valid_line + next_b.num_valid_lines),
-            y0 + max(1, int(overlap_lines)),
-        )
-        x0 = max(int(prev_b.first_valid_sample), int(next_b.first_valid_sample))
-        x1 = min(int(prev_b.first_valid_sample + prev_b.num_valid_samples), int(next_b.first_valid_sample + next_b.num_valid_samples))
-        if y1 <= y0 or x1 <= x0:
-            continue
-        overlap_ifgs.append(np.asarray(full_ifg[y0:y1, x0:x1], dtype=np.complex64).copy())
-        overlap_cohs.append(np.asarray(full_coh[y0:y1, x0:x1], dtype=np.float32).copy())
+    if not overlap_ifgs or not overlap_cohs:
+        raise RuntimeError("ESD estimation requires overlap burst interferograms from p2")
 
     median_offset, mean_offset, std_offset, all_offsets = _compute_esd_spectral_diversity(
         overlap_ifgs,
@@ -6418,33 +7650,47 @@ def _unwrap_with_snaphu(
     if ntiles_dict == "auto":
         ntiles_dict = _compute_auto_ntiles(interferogram.shape, cfg.get("auto_tile_max_pixels", 4_000_000), cfg.get("nproc", 4))
 
-    row_overlap = cfg.get("row_overlap", 0)
-    col_overlap = cfg.get("col_overlap", 0)
-
     unw = np.zeros(interferogram.shape, dtype=np.float32)
     conncomp = np.zeros(interferogram.shape, dtype=np.uint32)
-    snaphu.unwrap(
-        interferogram.astype(np.complex64),
-        coherence.astype(np.float32),
-        cfg["nlooks"],
-        unw=unw,
-        conncomp=conncomp,
-        cost=cfg["cost_mode"],
-        init=cfg["initialization_method"],
-        min_conncomp_frac=cfg["min_conncomp_frac"],
-        phase_grad_window=cfg["phase_grad_window"],
-        ntiles=ntiles_dict,
-        tile_overlap=cfg["tile_overlap"],
-        nproc=cfg["nproc"],
-        tile_cost_thresh=cfg["tile_cost_thresh"],
-        min_region_size=cfg["min_region_size"],
-        single_tile_reoptimize=cfg["single_tile_reoptimize"],
-        regrow_conncomps=cfg["regrow_conncomps"],
-        scratchdir=scratch_dir,
-        delete_scratch=True,
-        row_overlap=row_overlap,
-        col_overlap=col_overlap,
-    )
+    unwrap_kwargs = {
+        "unw": unw,
+        "conncomp": conncomp,
+        "cost": cfg["cost_mode"],
+        "init": cfg["initialization_method"],
+        "min_conncomp_frac": cfg["min_conncomp_frac"],
+        "phase_grad_window": cfg["phase_grad_window"],
+        "ntiles": ntiles_dict,
+        "tile_overlap": cfg["tile_overlap"],
+        "nproc": cfg["nproc"],
+        "tile_cost_thresh": cfg["tile_cost_thresh"],
+        "min_region_size": cfg["min_region_size"],
+        "single_tile_reoptimize": cfg["single_tile_reoptimize"],
+        "regrow_conncomps": cfg["regrow_conncomps"],
+        "scratchdir": scratch_dir,
+        "delete_scratch": True,
+    }
+    row_overlap = cfg.get("row_overlap", 0)
+    col_overlap = cfg.get("col_overlap", 0)
+    unwrap_kwargs_with_overlap = dict(unwrap_kwargs)
+    unwrap_kwargs_with_overlap["row_overlap"] = row_overlap
+    unwrap_kwargs_with_overlap["col_overlap"] = col_overlap
+    try:
+        snaphu.unwrap(
+            interferogram.astype(np.complex64),
+            coherence.astype(np.float32),
+            cfg["nlooks"],
+            **unwrap_kwargs_with_overlap,
+        )
+    except TypeError as exc:
+        msg = str(exc)
+        if "unexpected keyword argument 'row_overlap'" not in msg and "unexpected keyword argument 'col_overlap'" not in msg:
+            raise
+        snaphu.unwrap(
+            interferogram.astype(np.complex64),
+            coherence.astype(np.float32),
+            cfg["nlooks"],
+            **unwrap_kwargs,
+        )
     if not np.any(np.isfinite(unw)):
         raise RuntimeError("SNAPHU produced no finite pixels")
     return unw.astype(np.float32)
@@ -6526,10 +7772,14 @@ def run_unwrap_stage(
         return cached_outputs, "cache", None
 
     try:
-        interferogram = _load_cached_array(context.pair_dir, "p2", "filtered_interferogram")
+        interferogram = _load_cached_array(context.pair_dir, "p3", "merged_interferogram")
+        coherence = _load_cached_array(context.pair_dir, "p3", "merged_coherence")
     except RuntimeError:
-        interferogram = _load_cached_array(context.pair_dir, "p2", "interferogram")
-    coherence = _load_cached_array(context.pair_dir, "p2", "coherence")
+        try:
+            interferogram = _load_cached_array(context.pair_dir, "p2", "filtered_interferogram")
+        except RuntimeError:
+            interferogram = _load_cached_array(context.pair_dir, "p2", "interferogram")
+        coherence = _load_cached_array(context.pair_dir, "p2", "coherence")
 
     fallback_reason = None
     with tempfile.TemporaryDirectory(prefix="strip_insar2_unwrap_", dir=str(context.pair_dir)) as tmpdir:
@@ -6630,9 +7880,10 @@ def run_unwrap_stage(
             else:
                 raise ValueError(f"unsupported unwrap method: {unwrap_method}")
 
-    output_files = {
-        "unwrapped_phase": _save_stage_array(context.pair_dir, "p3", "unwrapped_phase", unwrapped_phase)
-    }
+    existing_p3 = load_stage_record(context.pair_dir, "p3") or {}
+    existing_outputs = existing_p3.get("output_files") if isinstance(existing_p3.get("output_files"), dict) else {}
+    output_files = dict(existing_outputs or {})
+    output_files["unwrapped_phase"] = _save_stage_array(context.pair_dir, "p3", "unwrapped_phase", unwrapped_phase)
     _write_stage_outputs_record(
         output_dir=context.pair_dir,
         stage="p3",
@@ -6782,9 +8033,14 @@ def write_primary_product(
             context.slave_manifest["slc"]["path"],
         ),
     )
-    interferogram = _load_cached_array(context.pair_dir, "p2", "interferogram")
-    filtered_interferogram = _load_cached_array(context.pair_dir, "p2", "filtered_interferogram")
-    coherence = _load_cached_array(context.pair_dir, "p2", "coherence")
+    try:
+        interferogram = _load_cached_array(context.pair_dir, "p3", "merged_interferogram")
+        coherence = _load_cached_array(context.pair_dir, "p3", "merged_coherence")
+        filtered_interferogram = interferogram
+    except RuntimeError:
+        interferogram = _load_cached_array(context.pair_dir, "p2", "interferogram")
+        filtered_interferogram = _load_cached_array(context.pair_dir, "p2", "filtered_interferogram")
+        coherence = _load_cached_array(context.pair_dir, "p2", "coherence")
     unwrapped_phase = _load_cached_array(context.pair_dir, "p3", "unwrapped_phase")
     los_displacement = _load_cached_array(context.pair_dir, "p4", "los_displacement")
     output_h5 = context.output_paths["interferogram_h5"]
@@ -6806,61 +8062,39 @@ def write_primary_product(
     )
     progress = _StageProgress("p5")
     try:
-        # Geocoding topology selection matrix:
-        # - full-res: rerun/add coordinates directly from the current master manifest grid
-        # - window crop: cropped/prepared master manifest defines the runtime radar grid
-        # - multilook without crop: full-scene p0 topo may be multilooked and reused
-        # - window crop + multilook: rerun rdr2geo from the prepared/cropped master manifest, then
-        #   multilook lon/lat/hgt onto the product grid. Reusing p0 topo here risks stale
-        #   full-scene geometry or cache/window mismatches.
+        # Final product geocoding should always use a global rdr2geo run at p5.
+        # Do not reuse intermediate p0 burst/swath topology.
         if int(range_looks) > 1 or int(azimuth_looks) > 1:
-            if context.effective_crop_window is not None:
-                def _gpu_multilook():
-                    progress.running(backend="gpu", detail="rdr2geo/topo-multilook", elapsed=0.0, force=True)
-                    return _append_multilooked_topo_coordinates_hdf(
-                        context=context,
-                        output_h5=output_h5,
-                        block_rows=block_rows,
-                        range_looks=range_looks,
-                        azimuth_looks=azimuth_looks,
-                        use_gpu=True,
-                        gpu_id=gpu_id,
-                    )
-
-                def _cpu_multilook():
-                    return _append_multilooked_topo_coordinates_hdf(
-                        context=context,
-                        output_h5=output_h5,
-                        block_rows=block_rows,
-                        range_looks=range_looks,
-                        azimuth_looks=azimuth_looks,
-                        use_gpu=False,
-                        gpu_id=gpu_id,
-                    )
-
-                _, backend_used, fallback_reason = run_stage_with_fallback(
-                    stage_name="coordinates-multilook",
-                    gpu_mode=gpu_mode,
-                    gpu_id=gpu_id,
-                    gpu_runner=_gpu_multilook,
-                    cpu_runner=_cpu_multilook,
-                )
-            else:
-                p0_record = load_stage_record(context.pair_dir, "p0") or {}
-                p0_outputs = p0_record.get("output_files") or {}
-                master_topo_vrt = p0_outputs.get("master_topo_vrt") or p0_outputs.get("master_topo")
-                if not master_topo_vrt or not Path(str(master_topo_vrt)).exists():
-                    raise RuntimeError("p0 master_topo_vrt is required for multilook coordinate export")
-                progress.running(backend="cpu", detail="topo-from-p0-vrt", elapsed=0.0, force=True)
-                append_topo_coordinates_hdf_from_vrt(
-                    master_topo_vrt,
-                    output_h5,
+            def _gpu_multilook():
+                progress.running(backend="gpu", detail="rdr2geo/topo-multilook", elapsed=0.0, force=True)
+                return _append_multilooked_topo_coordinates_hdf(
+                    context=context,
+                    output_h5=output_h5,
                     block_rows=block_rows,
                     range_looks=range_looks,
                     azimuth_looks=azimuth_looks,
+                    use_gpu=True,
+                    gpu_id=gpu_id,
                 )
-                backend_used = "cpu"
-                fallback_reason = None
+
+            def _cpu_multilook():
+                return _append_multilooked_topo_coordinates_hdf(
+                    context=context,
+                    output_h5=output_h5,
+                    block_rows=block_rows,
+                    range_looks=range_looks,
+                    azimuth_looks=azimuth_looks,
+                    use_gpu=False,
+                    gpu_id=gpu_id,
+                )
+
+            _, backend_used, fallback_reason = run_stage_with_fallback(
+                stage_name="coordinates-multilook",
+                gpu_mode=gpu_mode,
+                gpu_id=gpu_id,
+                gpu_runner=_gpu_multilook,
+                cpu_runner=_cpu_multilook,
+            )
         else:
             def _gpu():
                 progress.running(backend="gpu", detail="rdr2geo/topo", elapsed=0.0, force=True)
@@ -7222,7 +8456,7 @@ def process_strip_insar2(
     esd_coherence_threshold: float = 0.85,
     do_burst_seam_repair: bool = True,
 ) -> dict:
-    valid_stops = {"p0", "p2", "p3", "p4", "p5", "p6"}
+    valid_stops = {"p0", "p1", "p2", "p3", "p4", "p5", "p6"}
     if stop_after_stage not in valid_stops:
         raise ValueError(f"unsupported stop_after_stage: {stop_after_stage}")
     pair_name, pair_dir = _derive_pair_identity(
@@ -7265,17 +8499,38 @@ def process_strip_insar2(
         flush=True,
     )
 
-    _log_stage_status("p0", "START")
-    _, backend_used, fallback_reason = run_geo2rdr_stage(
-        context,
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        block_rows=geometry_block_rows,
-    )
-    stage_backends["geo2rdr"] = backend_used
-    if fallback_reason:
-        fallback_reasons["geo2rdr"] = fallback_reason
-    _log_stage_status("p0", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+    if tops_mode:
+        _log_stage_status("p0", "START", label_override="burst-topo/geo2rdr")
+        p1_outputs, backend_used, fallback_reason = run_tops_burst_geometry_stage(
+            context,
+            master_bursts=master_bursts or [],
+            slave_bursts=slave_bursts or [],
+            gpu_mode=gpu_mode,
+            gpu_id=gpu_id,
+            block_rows=geometry_block_rows,
+        )
+        stage_backends["burst_geometry"] = backend_used
+        if fallback_reason:
+            fallback_reasons["burst_geometry"] = fallback_reason
+        _log_stage_status(
+            "p0",
+            "DONE",
+            label_override="burst-topo/geo2rdr",
+            backend_used=backend_used,
+            fallback_reason=fallback_reason,
+        )
+    else:
+        _log_stage_status("p0", "START")
+        _, backend_used, fallback_reason = run_geo2rdr_stage(
+            context,
+            gpu_mode=gpu_mode,
+            gpu_id=gpu_id,
+            block_rows=geometry_block_rows,
+        )
+        stage_backends["geo2rdr"] = backend_used
+        if fallback_reason:
+            fallback_reasons["geo2rdr"] = fallback_reason
+        _log_stage_status("p0", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
     if stop_after_stage == "p0":
         return {
             "pair_name": context.pair_name,
@@ -7287,32 +8542,75 @@ def process_strip_insar2(
             "stopped_after_stage": "p0",
         }
 
-    _log_stage_status("p1", "START")
-    p1_outputs, backend_used, fallback_reason = run_resample_stage(
-        context,
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        esd_azimuth_offset_px=float(esd_azimuth_offset_px),
-    )
-    stage_backends["resample"] = backend_used
-    if fallback_reason:
-        fallback_reasons["resample"] = fallback_reason
-    _log_stage_status("p1", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+    if tops_mode:
+        _log_stage_status("p1", "START", label_override="burst-registration-ready")
+        _, backend_used, fallback_reason = run_tops_burst_fine_offsets_stage(
+            context,
+            master_bursts=master_bursts or [],
+            slave_bursts=slave_bursts or [],
+        )
+        stage_backends["burst_registration"] = backend_used
+        if fallback_reason:
+            fallback_reasons["burst_registration"] = fallback_reason
+        _log_stage_status(
+            "p1",
+            "DONE",
+            label_override="burst-registration-ready",
+            backend_used=backend_used,
+            fallback_reason=fallback_reason,
+        )
+    else:
+        _log_stage_status("p1", "START")
+        p1_outputs, backend_used, fallback_reason = run_resample_stage(
+            context,
+            gpu_mode=gpu_mode,
+            gpu_id=gpu_id,
+            esd_azimuth_offset_px=float(esd_azimuth_offset_px),
+        )
+        stage_backends["resample"] = backend_used
+        if fallback_reason:
+            fallback_reasons["resample"] = fallback_reason
+        _log_stage_status("p1", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+    if stop_after_stage == "p1":
+        return {
+            "pair_name": context.pair_name,
+            "pair_dir": str(context.pair_dir),
+            "output_paths": context.output_paths,
+            "exports": {},
+            "stage_backends": stage_backends,
+            "fallback_reasons": fallback_reasons,
+            "stopped_after_stage": "p1",
+        }
 
-    _log_stage_status("p2", "START")
-    _, backend_used, fallback_reason = run_crossmul_stage(
-        context,
-        gpu_mode=gpu_mode,
-        gpu_id=gpu_id,
-        block_rows=crossmul_block_rows,
-        range_looks=range_looks,
-        azimuth_looks=azimuth_looks,
-        esd_azimuth_offset_px=float(esd_azimuth_offset_px),
-    )
-    stage_backends["crossmul"] = backend_used
-    if fallback_reason:
-        fallback_reasons["crossmul"] = fallback_reason
-    _log_stage_status("p2", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+    if tops_mode:
+        _log_stage_status("p2", "START")
+        _, backend_used, fallback_reason = run_burst_ifg_stage(
+            context,
+            master_bursts=master_bursts or [],
+            slave_bursts=slave_bursts or [],
+            range_looks=range_looks,
+            azimuth_looks=azimuth_looks,
+            esd_azimuth_offsets=None,
+        )
+        stage_backends["burst_ifg"] = backend_used
+        if fallback_reason:
+            fallback_reasons["burst_ifg"] = fallback_reason
+        _log_stage_status("p2", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+    else:
+        _log_stage_status("p2", "START")
+        _, backend_used, fallback_reason = run_crossmul_stage(
+            context,
+            gpu_mode=gpu_mode,
+            gpu_id=gpu_id,
+            block_rows=crossmul_block_rows,
+            range_looks=range_looks,
+            azimuth_looks=azimuth_looks,
+            esd_azimuth_offset_px=float(esd_azimuth_offset_px),
+        )
+        stage_backends["crossmul"] = backend_used
+        if fallback_reason:
+            fallback_reasons["crossmul"] = fallback_reason
+        _log_stage_status("p2", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
     if stop_after_stage == "p2":
         return {
             "pair_name": context.pair_name,
@@ -7325,7 +8623,7 @@ def process_strip_insar2(
         }
 
     if tops_mode:
-        _log_stage_status("p3", "START", detail="burst-merge")
+        _log_stage_status("p3", "START", label_override="burst-merge/esd")
         burst_count = len(master_bursts or slave_bursts or [])
         overlap_records = [
             {
@@ -7337,21 +8635,38 @@ def process_strip_insar2(
         ]
         esd_offsets = None
         if burst_count >= 2 and overlap_records:
-            esd_output_files, esd_backend, esd_fallback_reason = run_esd_estimation_stage(
-                context,
-                master_bursts=master_bursts or [],
-                slave_bursts=slave_bursts or [],
-                overlap_pairs=overlap_records,
-                esd_azimuth_looks=max(1, int(azimuth_looks)),
-                esd_range_looks=max(1, int(range_looks)),
-                esd_coherence_threshold=float(esd_coherence_threshold),
-                extra_esd_cycles=float(extra_esd_cycles),
-            )
-            stage_backends["esd"] = esd_backend
-            if esd_fallback_reason:
-                fallback_reasons["esd"] = esd_fallback_reason
-            esd_median_offset = float(np.asarray(np.load(esd_output_files["median_offset_px"]), dtype=np.float32).reshape(()))
-            esd_offsets = [float(i * esd_median_offset) for i in range(burst_count)]
+            try:
+                esd_output_files, esd_backend, esd_fallback_reason = run_esd_estimation_stage(
+                    context,
+                    master_bursts=master_bursts or [],
+                    slave_bursts=slave_bursts or [],
+                    overlap_pairs=overlap_records,
+                    esd_azimuth_looks=max(1, int(azimuth_looks)),
+                    esd_range_looks=max(1, int(range_looks)),
+                    esd_coherence_threshold=float(esd_coherence_threshold),
+                    extra_esd_cycles=float(extra_esd_cycles),
+                )
+                stage_backends["esd"] = esd_backend
+                if esd_fallback_reason:
+                    fallback_reasons["esd"] = esd_fallback_reason
+                esd_median_offset = float(np.asarray(np.load(esd_output_files["median_offset_px"]), dtype=np.float32).reshape(()))
+                esd_offsets = [float(i * esd_median_offset) for i in range(burst_count)]
+                # Recompute burst IFG after ESD offsets so merge/unwrap consume corrected bursts.
+                run_burst_ifg_stage(
+                    context,
+                    master_bursts=master_bursts or [],
+                    slave_bursts=slave_bursts or [],
+                    range_looks=range_looks,
+                    azimuth_looks=azimuth_looks,
+                    esd_azimuth_offsets=esd_offsets,
+                )
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "No points left for reliable ESD estimate" in msg or "Coherence threshold too strict" in msg:
+                    stage_backends["esd"] = "skipped"
+                    fallback_reasons["esd"] = msg
+                else:
+                    raise
         az_reference_offsets = [[int(round(off))] for off in esd_offsets] if esd_offsets else None
         _, backend_used, fallback_reason = run_burst_merge_stage(
             context,
@@ -7366,9 +8681,9 @@ def process_strip_insar2(
         stage_backends["burst_merge"] = backend_used
         if fallback_reason:
             fallback_reasons["burst_merge"] = fallback_reason
-        _log_stage_status("p3", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+        _log_stage_status("p3", "DONE", label_override="burst-merge/esd", backend_used=backend_used, fallback_reason=fallback_reason)
 
-    _log_stage_status("p3", "START")
+    _log_stage_status("p3", "START", label_override="unwrap")
     _, backend_used, fallback_reason = run_unwrap_stage(
         context,
         unwrap_method=unwrap_method,
@@ -7379,7 +8694,7 @@ def process_strip_insar2(
     stage_backends["unwrap"] = backend_used
     if fallback_reason:
         fallback_reasons["unwrap"] = fallback_reason
-    _log_stage_status("p3", "DONE", backend_used=backend_used, fallback_reason=fallback_reason)
+    _log_stage_status("p3", "DONE", label_override="unwrap", backend_used=backend_used, fallback_reason=fallback_reason)
     if stop_after_stage == "p3":
         return {
             "pair_name": context.pair_name,

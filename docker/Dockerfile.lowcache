@@ -14,12 +14,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MAKEFLAGS="-j4" \
     HOME=/tmp \
     XDG_CACHE_HOME=/tmp/.cache \
-    MPLCONFIGDIR=/tmp/matplotlib
+    MPLCONFIGDIR=/tmp/matplotlib \
+    PIP_NO_CACHE_DIR=1
 
 # Tsinghua apt mirror + install system dependencies
 # Keep libgdal-dev (3.4.1): needed for building GDAL 3.8 from source
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
+    apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         wget \
@@ -56,7 +57,8 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.ed
         swig \
         nano \
         python3-numpy \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
 # pip mirror
 RUN mkdir -p /root/.config/pip && \
@@ -179,9 +181,11 @@ RUN python3 -m pip install --upgrade --no-cache-dir \
         scikit-build-core \
         setuptools_scm \
         pysolid && \
-    python3 -c "import cupy; print('cupy:', cupy.__version__)"
+    python3 -c "import cupy; print('cupy:', cupy.__version__)" && \
+    rm -rf /root/.cache/pip /tmp/pip-*
 
-RUN python3 -m pip install --prefix=/opt/isce3 backoff requests
+RUN python3 -m pip install --no-cache-dir --prefix=/opt/isce3 backoff requests && \
+    rm -rf /root/.cache/pip /tmp/pip-*
 
 # =============================================================================
 # STEP 5: Install isce3 Python bindings (use local source)
@@ -193,7 +197,7 @@ ENV PYTHONPATH=/opt/gdal38/lib/python3/dist-packages:/usr/local/lib/python3.10/d
 WORKDIR /opt/build/isce3_py
 COPY isce3 /opt/build/isce3_py/src
 RUN pip install /opt/build/isce3_py/src --prefix=/opt/isce3 --no-build-isolation && \
-    rm -rf /opt/build/isce3_py
+    rm -rf /opt/build/isce3_py /root/.cache/pip /tmp/pip-*
 
 # =============================================================================
 # STEP 6: plant, dolphin, plant-isce3
@@ -201,12 +205,12 @@ RUN pip install /opt/build/isce3_py/src --prefix=/opt/isce3 --no-build-isolation
 WORKDIR /opt/build/plant
 RUN git clone https://gitlab.com/plant/plant /opt/build/plant/src && \
     pip install /opt/build/plant/src --prefix=/opt/isce3 --no-deps && \
-    rm -rf /opt/build/plant
+    rm -rf /opt/build/plant /root/.cache/pip /tmp/pip-*
 
 WORKDIR /opt/build/plant-isce3
 COPY plant-isce3/ /opt/build/plant-isce3/src/
 RUN pip install /opt/build/plant-isce3/src --prefix=/opt/isce3 --no-build-isolation && \
-    rm -rf /opt/build/plant-isce3
+    rm -rf /opt/build/plant-isce3 /root/.cache/pip /tmp/pip-*
 
 WORKDIR /opt/build/dolphin
 COPY dolphin /opt/dolphin_src/
@@ -223,11 +227,11 @@ RUN rm -rf /opt/dolphin_src /opt/build/dolphin
 # Final cleanup: remove conflicting 'io' namespace package from opera-utils
 RUN rm -rf /opt/isce3/local/lib/python3.10/dist-packages/io
 
+# Final cleanup: remove transient caches and temp build leftovers
+RUN rm -rf /root/.cache /tmp/* /var/tmp/*
+
 WORKDIR /work
 COPY scripts/ ./scripts/
 COPY *.md ./
-
-RUN apt clean -y
-RUN pip cache purge
 
 CMD ["bash"]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import h5py
@@ -20,6 +23,40 @@ from common_processing import (
     write_geocoded_png,
 )
 from tops_geometry import iter_burst_radar_grids, load_tops_metadata, select_burst_doppler
+
+
+@contextlib.contextmanager
+def _silence_process_stdio():
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        saved_out = os.dup(1)
+        saved_err = os.dup(2)
+        try:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            yield
+        finally:
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
+            os.close(saved_out)
+            os.close(saved_err)
+
+
+def _run_topo_quietly(*, topo_func, manifest_path: str, dem_path: str, output_h5: str, block_rows: int, orbit_interp: str | None, use_gpu: bool, gpu_id: int) -> None:
+    with _silence_process_stdio():
+        topo_func(
+            manifest_path,
+            dem_path,
+            output_h5,
+            block_rows=block_rows,
+            orbit_interp=orbit_interp,
+            use_gpu=use_gpu,
+            gpu_id=gpu_id,
+        )
+
+
+def _run_rtc_factor_quietly(*, compute_func, manifest_path: str, dem_path: str, output_path: str, orbit_interp: str) -> None:
+    with _silence_process_stdio():
+        compute_func(manifest_path, dem_path, output_path, orbit_interp=orbit_interp)
 
 
 def prepare_tops_rtc(manifest_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
@@ -199,7 +236,7 @@ def compute_burst_rtc_factor(
     plan_path: str | Path,
     dem_path: str | Path,
     *,
-    burst_limit: int = 1,
+    burst_limit: int | None = None,
     orbit_interp: str = "Legendre",
     compute_func=compute_rtc_factor,
 ) -> dict[str, Any]:
@@ -208,7 +245,9 @@ def compute_burst_rtc_factor(
         plan = json.load(f)
     plan["plan_path"] = str(plan_path)
 
-    bursts = plan.get("bursts", [])[: max(0, int(burst_limit))]
+    bursts = plan.get("bursts", [])
+    if burst_limit is not None:
+        bursts = bursts[: max(0, int(burst_limit))]
     if len(bursts) > 1:
         return compute_merged_rtc_factor(
             plan,
@@ -220,11 +259,19 @@ def compute_burst_rtc_factor(
 
     outputs = []
     work_dir = plan_path.parent / "burst_manifests"
-    for burst in bursts:
+    total = len(bursts)
+    for idx, burst in enumerate(bursts, start=1):
+        print(f"\rRTC factor progress burst {idx}/{total}", end="", flush=True)
         burst_manifest = write_burst_metadata_manifest(plan, burst, work_dir)
         output_path = burst["outputs"]["rtc_factor_tif"]
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        compute_func(str(burst_manifest), str(dem_path), output_path, orbit_interp=orbit_interp)
+        _run_rtc_factor_quietly(
+            compute_func=compute_func,
+            manifest_path=str(burst_manifest),
+            dem_path=str(dem_path),
+            output_path=output_path,
+            orbit_interp=orbit_interp,
+        )
         outputs.append(
             {
                 "burstIndex": burst["burstIndex"],
@@ -232,6 +279,8 @@ def compute_burst_rtc_factor(
                 "burst_manifest": str(burst_manifest),
             }
         )
+    if total:
+        print(file=sys.stdout, flush=True)
     return {"plan_path": str(plan_path), "burst_count": len(outputs), "bursts": outputs}
 
 
@@ -345,7 +394,16 @@ def compute_merged_rtc_factor(
     work_dir = plan_path.parent / "burst_manifests"
     merged_manifest = write_merged_metadata_manifest(plan, bursts, work_dir)
     output_path = plan_path.parent / "mosaic_rtc_factor.tif"
-    compute_func(str(merged_manifest), str(dem_path), str(output_path), orbit_interp=orbit_interp)
+    swath_label = str(plan.get("swath") or "unknown-swath")
+    print(f"\r[{swath_label}] RTC factor progress burst merged", end="", flush=True)
+    _run_rtc_factor_quietly(
+        compute_func=compute_func,
+        manifest_path=str(merged_manifest),
+        dem_path=str(dem_path),
+        output_path=str(output_path),
+        orbit_interp=orbit_interp,
+    )
+    print(file=sys.stdout, flush=True)
     return {
         "plan_path": str(plan_path),
         "processing_mode": "radar_mosaic",
@@ -409,7 +467,7 @@ def compute_burst_topo(
     plan_path: str | Path,
     dem_path: str | Path,
     *,
-    burst_limit: int = 1,
+    burst_limit: int | None = None,
     block_rows: int = 256,
     orbit_interp: str | None = None,
     use_gpu: bool = False,
@@ -420,18 +478,23 @@ def compute_burst_topo(
     with plan_path.open(encoding="utf-8") as f:
         plan = json.load(f)
 
-    bursts = plan.get("bursts", [])[: max(0, int(burst_limit))]
+    bursts = plan.get("bursts", [])
+    if burst_limit is not None:
+        bursts = bursts[: max(0, int(burst_limit))]
     work_dir = plan_path.parent / "burst_manifests"
     outputs = []
-    for burst in bursts:
+    total = len(bursts)
+    for idx, burst in enumerate(bursts, start=1):
+        print(f"\rTopo progress burst {idx}/{total}", end="", flush=True)
         burst_manifest = write_burst_metadata_manifest(plan, burst, work_dir)
         output_h5 = burst["outputs"]["amplitude_h5"]
         if not Path(output_h5).is_file():
             write_burst_amplitude_hdf(plan["slc_path"], burst, output_h5, block_rows=block_rows)
-        topo_func(
-            str(burst_manifest),
-            str(dem_path),
-            output_h5,
+        _run_topo_quietly(
+            topo_func=topo_func,
+            manifest_path=str(burst_manifest),
+            dem_path=str(dem_path),
+            output_h5=output_h5,
             block_rows=block_rows,
             orbit_interp=orbit_interp,
             use_gpu=use_gpu,
@@ -445,6 +508,8 @@ def compute_burst_topo(
                 "burst_manifest": str(burst_manifest),
             }
         )
+    if total:
+        print(file=sys.stdout, flush=True)
     return {"plan_path": str(plan_path), "burst_count": len(outputs), "bursts": outputs}
 
 
@@ -532,18 +597,22 @@ def apply_burst_rtc_factor(
 def apply_burst_rtc(
     plan_path: str | Path,
     *,
-    burst_limit: int = 1,
+    burst_limit: int | None = None,
     dem_path: str | Path | None = None,
     block_rows: int = 256,
     orbit_interp: str | None = None,
     resolution_meters: float = 20.0,
+    use_gpu: bool = False,
+    gpu_id: int = 0,
 ) -> dict[str, Any]:
     plan_path = Path(plan_path)
     with plan_path.open(encoding="utf-8") as f:
         plan = json.load(f)
     plan["plan_path"] = str(plan_path)
 
-    bursts = plan.get("bursts", [])[: max(0, int(burst_limit))]
+    bursts = plan.get("bursts", [])
+    if burst_limit is not None:
+        bursts = bursts[: max(0, int(burst_limit))]
     if len(bursts) > 1:
         return apply_merged_rtc(
             plan,
@@ -552,6 +621,8 @@ def apply_burst_rtc(
             block_rows=block_rows,
             orbit_interp=orbit_interp,
             resolution_meters=resolution_meters,
+            use_gpu=use_gpu,
+            gpu_id=gpu_id,
         )
 
     outputs = []
@@ -560,12 +631,27 @@ def apply_burst_rtc(
         rtc_factor_tif = burst["outputs"]["rtc_factor_tif"]
         rtc_h5 = str(Path(burst["outputs"]["directory"]) / "amplitude_rtc.h5")
         result_path = apply_burst_rtc_factor(amplitude_h5, rtc_factor_tif, rtc_h5)
+        rtc_geocoded = None
+        # When DEM/topo exists, export geocoded products for single-burst mode too.
+        if dem_path is not None:
+            try:
+                _require_topo_datasets(result_path, "rtc_amplitude")
+                rtc_geocoded = export_radar_hdf_geocoded(
+                    result_path,
+                    "rtc_amplitude",
+                    Path(burst["outputs"]["directory"]) / "amplitude_rtc_geocoded",
+                    resolution_meters=resolution_meters,
+                    block_rows=block_rows,
+                )
+            except ValueError:
+                rtc_geocoded = None
         outputs.append(
             {
                 "burstIndex": burst["burstIndex"],
                 "amplitude_h5": amplitude_h5,
                 "rtc_factor_tif": rtc_factor_tif,
                 "rtc_h5": result_path,
+                "rtc_geocoded": rtc_geocoded,
             }
         )
     return {"plan_path": str(plan_path), "burst_count": len(outputs), "bursts": outputs}
@@ -579,6 +665,8 @@ def apply_merged_rtc(
     block_rows: int = 256,
     orbit_interp: str | None = None,
     resolution_meters: float = 20.0,
+    use_gpu: bool = False,
+    gpu_id: int = 0,
 ) -> dict[str, Any]:
     plan_path = Path(plan["plan_path"])
     merged_h5 = plan_path.parent / "mosaic_slc_amplitude_radar.h5"
@@ -598,13 +686,18 @@ def apply_merged_rtc(
             bursts,
             plan_path.parent / "burst_manifests",
         )
-        append_topo_coordinates_hdf(
-            str(topo_manifest),
-            str(dem_path),
-            str(merged_h5),
+        print("\rTopo progress burst merged", end="", flush=True)
+        _run_topo_quietly(
+            topo_func=append_topo_coordinates_hdf,
+            manifest_path=str(topo_manifest),
+            dem_path=str(dem_path),
+            output_h5=str(merged_h5),
             block_rows=block_rows,
             orbit_interp=orbit_interp,
+            use_gpu=use_gpu,
+            gpu_id=gpu_id,
         )
+        print(file=sys.stdout, flush=True)
     result_path = apply_burst_rtc_factor(merged_h5, factor_path, rtc_h5)
     if dem_path is not None:
         with h5py.File(merged_h5, "r") as f_in, h5py.File(result_path, "a") as f_out:
@@ -973,9 +1066,15 @@ def export_radar_hdf_geocoded(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare a Sentinel TOPS per-burst RTC execution plan")
-    parser.add_argument("manifest", help="Path to Sentinel importer manifest.json")
+    parser = argparse.ArgumentParser(description="Sentinel TOPS RTC unified pipeline")
+    parser.add_argument("manifest", nargs="?", help="Path to Sentinel importer manifest.json")
     parser.add_argument("output_dir", help="Output directory for tops_rtc_plan.json")
+    parser.add_argument("--product-path", default=None, help="Sentinel SAFE/ZIP/TAR path (unified mode)")
+    parser.add_argument(
+        "--swath",
+        default="all",
+        help="Swath selector for --product-path: IW1|IW2|IW3|IW1,IW2|IW2,IW3|IW1,IW3|all",
+    )
     parser.add_argument("--materialize", action="store_true", help="Write per-burst amplitude HDF5 files")
     parser.add_argument("--burst-limit", type=int, default=None, help="Limit materialization to first N bursts")
     parser.add_argument("--block-rows", type=int, default=256, help="Rows per SLC read block")
@@ -987,44 +1086,180 @@ def main() -> None:
     parser.add_argument("--gpu-id", type=int, default=0, help="GPU id for topo when --topo-gpu is set")
     parser.add_argument("--apply-rtc", action="store_true", help="Apply RTC factor to amplitude to produce RTC amplitude HDF5")
     parser.add_argument("--resolution", type=float, default=20.0, help="Geocoded output resolution in meters")
+    parser.add_argument(
+        "--mosaic-only",
+        action="store_true",
+        help="Only run final cross-swath mosaic using existing per-swath geocoded RTC TIFFs",
+    )
     args = parser.parse_args()
-    result = prepare_tops_rtc(args.manifest, args.output_dir)
-    if args.materialize:
-        result["materialized"] = materialize_tops_rtc_plan(
-            result["plan_path"], burst_limit=args.burst_limit, block_rows=args.block_rows
-        )
-    if args.compute_rtc_factor:
-        if not args.dem:
-            raise SystemExit("--dem is required with --compute-rtc-factor")
-        result["rtc_factor"] = compute_burst_rtc_factor(
-            result["plan_path"],
-            args.dem,
-            burst_limit=args.burst_limit or 1,
-            orbit_interp=args.orbit_interp,
-        )
-    if args.compute_topo:
-        if not args.dem:
-            raise SystemExit("--dem is required with --compute-topo")
-        result["topo"] = compute_burst_topo(
-            result["plan_path"],
-            args.dem,
-            burst_limit=args.burst_limit or 1,
-            block_rows=args.block_rows,
-            orbit_interp=args.orbit_interp,
-            use_gpu=args.topo_gpu,
-            gpu_id=args.gpu_id,
-        )
-    if args.apply_rtc:
-        if (args.burst_limit or 1) > 1 and not args.dem:
-            raise SystemExit("--dem is required with --apply-rtc when processing multiple bursts")
-        result["rtc_applied"] = apply_burst_rtc(
-            result["plan_path"],
-            burst_limit=args.burst_limit or 1,
-            dem_path=args.dem,
-            block_rows=args.block_rows,
-            orbit_interp=args.orbit_interp,
-            resolution_meters=args.resolution,
-        )
+
+    def run_one_manifest(manifest_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
+        result = prepare_tops_rtc(manifest_path, out_dir)
+        if args.materialize:
+            result["materialized"] = materialize_tops_rtc_plan(
+                result["plan_path"], burst_limit=args.burst_limit, block_rows=args.block_rows
+            )
+        if args.compute_rtc_factor:
+            if not args.dem:
+                raise SystemExit("--dem is required with --compute-rtc-factor")
+            result["rtc_factor"] = compute_burst_rtc_factor(
+                result["plan_path"],
+                args.dem,
+                burst_limit=args.burst_limit,
+                orbit_interp=args.orbit_interp,
+            )
+        if args.compute_topo:
+            if not args.dem:
+                raise SystemExit("--dem is required with --compute-topo")
+            result["topo"] = compute_burst_topo(
+                result["plan_path"],
+                args.dem,
+                burst_limit=args.burst_limit,
+                block_rows=args.block_rows,
+                orbit_interp=args.orbit_interp,
+                use_gpu=args.topo_gpu,
+                gpu_id=args.gpu_id,
+            )
+        if args.apply_rtc:
+            if args.burst_limit is not None and args.burst_limit > 1 and not args.dem:
+                raise SystemExit("--dem is required with --apply-rtc when processing multiple bursts")
+            result["rtc_applied"] = apply_burst_rtc(
+                result["plan_path"],
+                burst_limit=args.burst_limit,
+                dem_path=args.dem,
+                block_rows=args.block_rows,
+                orbit_interp=args.orbit_interp,
+                resolution_meters=args.resolution,
+                use_gpu=args.topo_gpu,
+                gpu_id=args.gpu_id,
+            )
+        return result
+
+    if args.product_path:
+        from sentinel_importer import SentinelImporter
+
+        def find_existing_swath_rtc_geotiff(swath: str) -> str | None:
+            swath_rtc_dir = Path(args.output_dir) / swath / "rtc"
+            preferred = swath_rtc_dir / "mosaic_rtc_amplitude_geocoded.tif"
+            if preferred.is_file():
+                return str(preferred)
+            candidates = sorted(swath_rtc_dir.rglob("*rtc*geocoded*.tif"))
+            if candidates:
+                return str(candidates[0])
+            return None
+
+        swath_text = str(args.swath).strip().upper()
+        if swath_text == "ALL":
+            swaths = ["IW1", "IW2", "IW3"]
+        elif "," in swath_text:
+            swaths = [part.strip() for part in swath_text.split(",") if part.strip()]
+        else:
+            swaths = [swath_text]
+        valid_swaths = {"IW1", "IW2", "IW3"}
+        if not swaths or any(sw not in valid_swaths for sw in swaths):
+            raise SystemExit(
+                "--swath must be one of: IW1, IW2, IW3, IW1,IW2, IW2,IW3, IW1,IW3, all"
+            )
+        # Preserve input order while removing duplicates.
+        swaths = list(dict.fromkeys(swaths))
+        all_results: dict[str, Any] = {
+            "mode": "product",
+            "product_path": args.product_path,
+            "swath": swath_text,
+            "swaths": {},
+        }
+        rtc_geocoded_list: list[str] = []
+        vrt_path = Path(args.output_dir) / "iw123_rtc.vrt"
+        tif_path = Path(args.output_dir) / "iw123_rtc_mosaic.tif"
+        # Remove stale merge artifacts from previous runs (e.g. different swath sets).
+        for stale in (vrt_path, tif_path):
+            if stale.exists():
+                stale.unlink()
+        if args.mosaic_only:
+            all_results["mode"] = "product-mosaic-only"
+            for sw in swaths:
+                rtc_geocoded = find_existing_swath_rtc_geotiff(sw)
+                all_results["swaths"][sw] = {
+                    "mosaic_only": True,
+                    "rtc_geocoded": rtc_geocoded,
+                }
+                if rtc_geocoded and Path(rtc_geocoded).is_file():
+                    rtc_geocoded_list.append(rtc_geocoded)
+        else:
+            orbit_dir = Path(args.output_dir) / "orbits"
+            orbit_dir.mkdir(parents=True, exist_ok=True)
+            for sw in swaths:
+                import_dir = Path(args.output_dir) / sw / "import"
+                rtc_dir = Path(args.output_dir) / sw / "rtc"
+                manifest_path = SentinelImporter(
+                    args.product_path,
+                    swath=sw,
+                    orbit_dir=orbit_dir,
+                    download_orbit=True,
+                ).run(
+                    str(import_dir), download_dem=False
+                )
+                sw_result = run_one_manifest(manifest_path, rtc_dir)
+                all_results["swaths"][sw] = sw_result
+                rtc_geocoded = (
+                    sw_result.get("rtc_applied", {})
+                    .get("mosaic", {})
+                    .get("rtc_geocoded", {})
+                    .get("geotiff")
+                )
+                if not rtc_geocoded:
+                    burst_geocoded = sw_result.get("rtc_applied", {}).get("bursts", [])
+                    rtc_geocoded = next(
+                        (
+                            item.get("rtc_geocoded", {}).get("geotiff")
+                            for item in burst_geocoded
+                            if isinstance(item, dict)
+                        ),
+                        None,
+                    )
+                if rtc_geocoded and Path(rtc_geocoded).is_file():
+                    rtc_geocoded_list.append(rtc_geocoded)
+
+        swath_set = set(swaths)
+        allow_merge = len(rtc_geocoded_list) >= 2
+        if swath_set == {"IW1", "IW3"}:
+            allow_merge = False
+            all_results["warning"] = "IW1,IW3 are non-adjacent; skip cross-swath merge."
+        if allow_merge:
+            # Use Warp for cross-swath merge so adjacent swaths in different UTM zones
+            # (e.g. IW2=32646 and IW3=32647) can still be mosaicked.
+            warp_ds = gdal.Warp(
+                str(tif_path),
+                rtc_geocoded_list,
+                format="GTiff",
+                srcNodata=0,
+                dstNodata=0,
+                warpOptions=["UNIFIED_SRC_NODATA=YES"],
+                creationOptions=["COMPRESS=LZW", "TILED=YES"],
+                multithread=True,
+            )
+            if warp_ds is not None:
+                warp_ds = None
+                all_results["swath_merge"] = {
+                    "inputs": rtc_geocoded_list,
+                    "tif": str(tif_path),
+                    "method": "gdal.Warp",
+                }
+            else:
+                all_results["warning"] = (
+                    "cross-swath merge failed: gdal.Warp returned None; "
+                    "check CRS/data overlap for input geocoded TIFFs"
+                )
+        elif len(rtc_geocoded_list) < 2:
+            all_results["warning"] = (
+                f"skip cross-swath merge: only {len(rtc_geocoded_list)} valid geocoded RTC TIFF(s)"
+            )
+        print(json.dumps(all_results, indent=2, ensure_ascii=False))
+        return
+
+    if not args.manifest:
+        raise SystemExit("manifest is required unless --product-path is provided")
+    result = run_one_manifest(args.manifest, args.output_dir)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
