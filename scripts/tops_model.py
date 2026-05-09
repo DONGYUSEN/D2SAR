@@ -257,20 +257,38 @@ class Geo2RdrOffsets:
 
 @dataclass(frozen=True)
 class RangeCoregEstimate:
-    """Range residual coregistration estimate derived from overlap interferogram."""
-    median_range_correction_pixels: float
-    std_range_correction_pixels: float
+    """Range (and azimuth) residual coregistration estimate from overlap interferogram.
+
+    Attributes
+    ----------
+    median_range_offset : float
+        Robust median of range-direction offset estimates (pixels).
+    std_range_offset : float
+        Robust standard deviation of range-direction offset estimates (pixels).
+    median_azimuth_offset : float
+        Robust median of azimuth-direction offset estimates (pixels).
+    std_azimuth_offset : float
+        Robust standard deviation of azimuth-direction offset estimates (pixels).
+    sample_count : int
+        Number of valid (coherent, in-bounds) pixels used in the estimate.
+    usable_fraction : float
+        Fraction of coherent pixels that passed outlier rejection (0–1).
+    """
+    median_range_offset: float
+    std_range_offset: float
+    median_azimuth_offset: float
+    std_azimuth_offset: float
     sample_count: int
-    rejected_count: int
+    usable_fraction: float
 
     def __post_init__(self) -> None:
         if self.sample_count < 0:
             raise ValueError(
                 f"sample_count must be non-negative, got {self.sample_count}"
             )
-        if self.rejected_count < 0:
+        if not (0.0 <= self.usable_fraction <= 1.0):
             raise ValueError(
-                f"rejected_count must be non-negative, got {self.rejected_count}"
+                f"usable_fraction must be in [0,1], got {self.usable_fraction}"
             )
 
 
