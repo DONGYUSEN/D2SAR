@@ -27,6 +27,8 @@ from __future__ import annotations
 
 __all__ = [
     "run_coarse_registration",
+    "fine_resample_with_timing",
+    "filter_ifg",
     "_resample_sliding_window",
 ]
 
@@ -35,7 +37,7 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.tops_model import BurstRadarGrid, Geo2RdrOffsets
+from scripts.tops_model import BurstRadarGrid, Geo2RdrOffsets, RangeCoregEstimate, TimingCorrection
 from scripts.tops_deramp import deramp_slc, reramp_slc
 
 log = logging.getLogger(__name__)
@@ -380,3 +382,276 @@ def run_coarse_registration(
         resampled_sec_path,
         resampled_sec.dtype,
     )
+
+
+# ---------------------------------------------------------------------------
+# Fine resampling with ESD timing + range coregistration
+# ---------------------------------------------------------------------------
+
+def fine_resample_with_timing(
+    ref_slc: np.ndarray,
+    sec_slc: np.ndarray,
+    ref_burst: BurstRadarGrid,
+    sec_burst: BurstRadarGrid,
+    coarse_offsets: Geo2RdrOffsets,
+    timing_correction: TimingCorrection | None,
+    range_coreg_estimate: RangeCoregEstimate | None,
+    *,
+    work_dir: Path | str,
+    fine_resampled_path: Path | str,
+) -> None:
+    """Fine coregistration of a secondary SLC onto a reference SLC after coarse
+    registration, applying ESD timing and range coregistration corrections.
+
+    This function is called after ``run_coarse_registration`` to refine the
+    coregistration using:
+    - ESD-derived azimuth timing correction (added to azimuth offsets)
+    - Range coregistration estimate (added to range offsets)
+
+    Algorithm
+    ---------
+    1. Deramp secondary SLC: ``sec_der = deramp_slc(sec_slc, sec_burst)``.
+    2. Load coarse Geo2Rdr range and azimuth offset grids from disk.
+    3. Apply ESD timing correction: ``azimuth_off += timing_correction.secondary_timing_pixels``.
+    4. Apply range coreg correction: ``range_off += range_coreg_estimate.median_range_offset``.
+    5. Resample deramped secondary using corrected offsets:
+       ``sec_der_fine = _resample_sliding_window(sec_der, azimuth_off, range_off)``.
+    6. Reramp the fine-resampled secondary onto the reference burst TOPS carrier:
+       ``fine_resampled_sec = reramp_slc(sec_der_fine, ref_burst)``.
+    7. Save the fine resampled secondary SLC to ``fine_resampled_path``.
+
+    Parameters
+    ----------
+    ref_slc : np.ndarray
+        Reference SLC (complex64 array).
+    sec_slc : np.ndarray
+        Secondary SLC (complex64 array).
+    ref_burst : BurstRadarGrid
+        Reference burst metadata.
+    sec_burst : BurstRadarGrid
+        Secondary burst metadata.
+    coarse_offsets : Geo2RdrOffsets
+        Geo2Rdr offsets from the coarse registration step.
+        Contains paths to ``range.off`` and ``azimuth.off`` numpy arrays.
+    timing_correction : TimingCorrection | None
+        ESD-derived timing correction. If None, no timing correction is applied.
+        ``timing_correction.secondary_timing_pixels`` is added to the azimuth offsets.
+    range_coreg_estimate : RangeCoregEstimate | None
+        Range coregistration estimate from overlap interferogram. If None,
+        no range correction is applied.
+        ``range_coreg_estimate.median_range_offset`` is added to the range offsets.
+    work_dir : Path | str
+        Working directory.  Created if it does not exist.
+    fine_resampled_path : Path | str
+        Output path for the fine resampled secondary SLC (.npz, complex64).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the range or azimuth offset files from coarse registration are not found.
+    ValueError
+        If offset array shapes do not match the reference burst valid window shape.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    out_shape = (
+        ref_burst.valid_window.num_lines,
+        ref_burst.valid_window.num_samples,
+    )
+
+    log.info(
+        "fine_resample_with_timing  ref=%s[%d]  sec=%s[%d]  shape=%s  "
+        "timing=%s  range_coreg=%s",
+        ref_burst.identity.swath, ref_burst.identity.burst_index,
+        sec_burst.identity.swath, sec_burst.identity.burst_index,
+        out_shape,
+        timing_correction is not None,
+        range_coreg_estimate is not None,
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 1: Deramp secondary
+    # -------------------------------------------------------------------------
+    sec_der = deramp_slc(sec_slc, sec_burst)
+
+    # -------------------------------------------------------------------------
+    # Step 2: Load coarse offsets from disk
+    # -------------------------------------------------------------------------
+    range_off_path = Path(coarse_offsets.range_off_path)
+    azimuth_off_path = Path(coarse_offsets.azimuth_off_path)
+
+    if not range_off_path.exists():
+        raise FileNotFoundError(f"range.off not found: {range_off_path}")
+    if not azimuth_off_path.exists():
+        raise FileNotFoundError(f"azimuth.off not found: {azimuth_off_path}")
+
+    with np.load(range_off_path) as npz:
+        range_off = npz["data"].astype(np.float64).copy()
+    with np.load(azimuth_off_path) as npz:
+        azimuth_off = npz["data"].astype(np.float64).copy()
+
+    if range_off.shape != out_shape:
+        raise ValueError(
+            f"range.off shape {range_off.shape} != expected {out_shape}"
+        )
+    if azimuth_off.shape != out_shape:
+        raise ValueError(
+            f"azimuth.off shape {azimuth_off.shape} != expected {out_shape}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Step 3: Apply ESD timing correction to azimuth offsets
+    # -------------------------------------------------------------------------
+    if timing_correction is not None:
+        azimuth_off = azimuth_off + timing_correction.secondary_timing_pixels
+        log.debug(
+            "Applied ESD timing correction: +%.4f pixels",
+            timing_correction.secondary_timing_pixels,
+        )
+
+    # -------------------------------------------------------------------------
+    # Step 4: Apply range coregistration correction
+    # -------------------------------------------------------------------------
+    if range_coreg_estimate is not None:
+        range_off = range_off + range_coreg_estimate.median_range_offset
+        log.debug(
+            "Applied range coreg correction: +%.4f pixels",
+            range_coreg_estimate.median_range_offset,
+        )
+
+    # -------------------------------------------------------------------------
+    # Step 5: Resample deramped secondary with corrected offsets
+    # -------------------------------------------------------------------------
+    sec_der_fine = _resample_sliding_window(
+        sec_der,
+        offset_rows=azimuth_off,
+        offset_cols=range_off,
+    )
+    sec_der_fine = sec_der_fine.astype(np.complex64)
+
+    # -------------------------------------------------------------------------
+    # Step 6: Reramp onto the reference burst TOPS carrier
+    # -------------------------------------------------------------------------
+    fine_resampled_sec = reramp_slc(sec_der_fine, ref_burst)
+    fine_resampled_sec = fine_resampled_sec.astype(np.complex64)
+
+    # -------------------------------------------------------------------------
+    # Step 7: Save the fine resampled secondary
+    # -------------------------------------------------------------------------
+    _save_slc_npz(fine_resampled_sec, fine_resampled_path)
+
+    log.info(
+        "Fine resampling complete  ref=%s[%d]  sec=%s[%d]  "
+        "fine_resampled=%s  dtype=%s",
+        ref_burst.identity.swath, ref_burst.identity.burst_index,
+        sec_burst.identity.swath, sec_burst.identity.burst_index,
+        fine_resampled_path,
+        fine_resampled_sec.dtype,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Goldstein phase filtering
+# ---------------------------------------------------------------------------
+
+def filter_ifg(
+    ifg: np.ndarray, coherence: np.ndarray, *, alpha: float = 0.5
+) -> np.ndarray:
+    """Apply Goldstein phase filtering to an interferogram.
+
+    The filter adapts the strength of filtering to local coherence, smoothing
+    areas of high coherence while preserving detail in decorrelated regions.
+
+    Algorithm
+    ---------
+    1. Compute local intensity ``I = |ifg|`` for pixels where ``coherence > 0.3``.
+    2. Apply boxcar multi-looking to ``I`` with a window of 8×8 pixels.
+    3. Compute filter power ``F = I_ml ** alpha`` where ``I_ml`` is the
+       multi-looked intensity.
+    4. Apply the filter: ``ifg_filtered = ifg * F / mean(F)``.
+
+    Parameters
+    ----------
+    ifg : np.ndarray
+        2-D complex interferogram (complex64 or complex128).
+    coherence : np.ndarray
+        2-D float array of coherence values (same shape as ``ifg``).
+        Values should be in the range [0, 1].
+    alpha : float, optional
+        Filter exponent controlling the strength of filtering.
+        - ``alpha = 0.0``: no filtering (identity operation).
+        - ``alpha = 1.0``: maximum filtering.
+        - Default: 0.5.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered interferogram (complex64).  Pixels with ``coherence <= 0.3``
+        are set to zero.
+
+    Raises
+    ------
+    ValueError
+        If ``ifg`` and ``coherence`` have different shapes.
+    ValueError
+        If ``alpha`` is outside the range [0, 1].
+    """
+    if ifg.shape != coherence.shape:
+        raise ValueError(
+            f"ifg.shape {ifg.shape} != coherence.shape {coherence.shape}"
+        )
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+
+    # --- Identity case: no filtering ----------------------------------------
+    if alpha == 0.0:
+        return ifg.astype(np.complex64)
+
+    # --- Compute intensity for coherent pixels --------------------------------
+    intensity = np.abs(ifg).astype(np.float32)
+
+    # Mask: only filter coherent regions (coherence > 0.3)
+    mask = coherence > 0.3
+    intensity_filtered = np.where(mask, intensity, 0.0)
+
+    # --- Boxcar multi-looking (8×8 window) ---------------------------------
+    # Simple explicit convolution (no scipy dependency for this step)
+    window = 8
+    from scipy.ndimage import uniform_filter
+
+    intensity_ml = uniform_filter(
+        intensity_filtered,
+        size=window,
+        mode="constant",
+        cval=0.0,
+    )
+
+    # Normalize by the number of valid (non-zero) pixels in the window
+    # for edge handling similar to the mean filter
+    count_ml = uniform_filter(
+        mask.astype(np.float32),
+        size=window,
+        mode="constant",
+        cval=0.0,
+    )
+    # Avoid division by zero
+    count_ml = np.maximum(count_ml, 1e-8)
+    intensity_ml = intensity_ml / count_ml
+
+    # --- Compute filter strength ----------------------------------------------
+    filter_power = np.power(intensity_ml, alpha, where=intensity_ml > 0)
+    filter_power = np.maximum(filter_power, 0.0)  # ensure non-negative
+
+    # --- Normalize and apply filter ------------------------------------------
+    mean_power = float(np.mean(filter_power))
+    if mean_power == 0.0:
+        return np.full_like(ifg, 0.0, dtype=np.complex64)
+
+    filter_factor = filter_power / mean_power
+
+    # Apply filter and zero out decorrelated pixels
+    ifg_filtered = ifg.astype(np.complex64) * filter_factor.astype(np.complex64)
+    ifg_filtered = np.where(mask, ifg_filtered, 0.0 + 0.0j)
+
+    return ifg_filtered.astype(np.complex64)

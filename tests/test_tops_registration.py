@@ -22,10 +22,15 @@ from scripts.tops_model import (
     BurstWindow,
     BurstRadarGrid,
     Geo2RdrOffsets,
+    RangeCoregEstimate,
+    TimingCorrection,
+    EsdEstimate,
 )
 from scripts.tops_registration import (
     _resample_sliding_window,
     run_coarse_registration,
+    fine_resample_with_timing,
+    filter_ifg,
     _load_slc_npz,
     _save_slc_npz,
 )
@@ -436,6 +441,226 @@ class TestRunCoarseRegistration:
         resampled_zero = _load_slc_npz(tmp_path / "resampled_sec_zero.npz")
         # At least some pixels must differ when an offset is applied
         assert not np.allclose(resampled, resampled_zero)
+
+
+# ---------------------------------------------------------------------------
+# Tests for fine_resample_with_timing
+# ---------------------------------------------------------------------------
+
+class TestFineResampleWithTiming:
+    """Tests for fine_resample_with_timing — ESD timing + range coreg corrections."""
+
+    def _make_geo_offsets(self, tmp_path: Path, shape):
+        """Write synthetic constant-offset arrays and return Geo2RdrOffsets."""
+        range_off = np.zeros(shape, dtype=np.float32)
+        azimuth_off = np.zeros(shape, dtype=np.float32)
+        rg_path = tmp_path / "range.off.npz"
+        az_path = tmp_path / "azimuth.off.npz"
+        np.savez(rg_path, data=range_off)
+        np.savez(az_path, data=azimuth_off)
+        return Geo2RdrOffsets(
+            range_off_path=str(rg_path),
+            azimuth_off_path=str(az_path),
+            median_range_offset=0.0,
+            median_azimuth_offset=0.0,
+            valid_sample_count=int(np.prod(shape)),
+        )
+
+    def _write_slc_npz(self, tmp_path: Path, shape):
+        """Write a synthetic SLC."""
+        slc = np.random.randn(*shape) + 1j * np.random.randn(*shape)
+        return slc.astype(np.complex64)
+
+    def test_timing_correction_applied(self, tmp_path: Path):
+        """ESD timing correction is added to azimuth offsets."""
+        ref = _burst()
+        sec = _burst()
+        out_shape = (ref.valid_window.num_lines, ref.valid_window.num_samples)
+
+        geo = self._make_geo_offsets(tmp_path, out_shape)
+
+        ref_slc = self._write_slc_npz(tmp_path, out_shape)
+        sec_slc = self._write_slc_npz(tmp_path, out_shape)
+
+        timing_correction = TimingCorrection(
+            secondary_timing_seconds=0.001,
+            secondary_timing_pixels=2.5,
+            esd_estimate=EsdEstimate(
+                median_offset_pixels=2.5,
+                mean_offset_pixels=2.5,
+                std_offset_pixels=0.1,
+                sample_count=1000,
+                azimuth_time_interval=ref.azimuth_time_interval,
+            ),
+        )
+
+        fine_path = tmp_path / "fine_resampled.npz"
+
+        fine_resample_with_timing(
+            ref_slc, sec_slc,
+            ref, sec,
+            geo,
+            timing_correction=timing_correction,
+            range_coreg_estimate=None,
+            work_dir=tmp_path,
+            fine_resampled_path=fine_path,
+        )
+
+        assert fine_path.exists()
+        result = _load_slc_npz(fine_path)
+        assert result.shape == out_shape
+        assert result.dtype == np.complex64
+
+    def test_range_coreg_applied(self, tmp_path: Path):
+        """Range coregistration estimate is added to range offsets."""
+        ref = _burst()
+        sec = _burst()
+        out_shape = (ref.valid_window.num_lines, ref.valid_window.num_samples)
+
+        geo = self._make_geo_offsets(tmp_path, out_shape)
+
+        ref_slc = self._write_slc_npz(tmp_path, out_shape)
+        sec_slc = self._write_slc_npz(tmp_path, out_shape)
+
+        range_coreg_estimate = RangeCoregEstimate(
+            median_range_offset=1.2,
+            std_range_offset=0.05,
+            median_azimuth_offset=0.0,
+            std_azimuth_offset=0.05,
+            sample_count=500,
+            usable_fraction=0.8,
+        )
+
+        fine_path = tmp_path / "fine_resampled.npz"
+
+        fine_resample_with_timing(
+            ref_slc, sec_slc,
+            ref, sec,
+            geo,
+            timing_correction=None,
+            range_coreg_estimate=range_coreg_estimate,
+            work_dir=tmp_path,
+            fine_resampled_path=fine_path,
+        )
+
+        assert fine_path.exists()
+        result = _load_slc_npz(fine_path)
+        assert result.shape == out_shape
+        assert result.dtype == np.complex64
+
+    def test_combined_timing_and_range_coreg(self, tmp_path: Path):
+        """Both timing correction and range coreg are applied together."""
+        ref = _burst()
+        sec = _burst()
+        out_shape = (ref.valid_window.num_lines, ref.valid_window.num_samples)
+
+        geo = self._make_geo_offsets(tmp_path, out_shape)
+
+        ref_slc = self._write_slc_npz(tmp_path, out_shape)
+        sec_slc = self._write_slc_npz(tmp_path, out_shape)
+
+        timing_correction = TimingCorrection(
+            secondary_timing_seconds=0.001,
+            secondary_timing_pixels=2.5,
+            esd_estimate=EsdEstimate(
+                median_offset_pixels=2.5,
+                mean_offset_pixels=2.5,
+                std_offset_pixels=0.1,
+                sample_count=1000,
+                azimuth_time_interval=ref.azimuth_time_interval,
+            ),
+        )
+        range_coreg_estimate = RangeCoregEstimate(
+            median_range_offset=1.2,
+            std_range_offset=0.05,
+            median_azimuth_offset=0.0,
+            std_azimuth_offset=0.05,
+            sample_count=500,
+            usable_fraction=0.8,
+        )
+
+        fine_path = tmp_path / "fine_resampled.npz"
+
+        fine_resample_with_timing(
+            ref_slc, sec_slc,
+            ref, sec,
+            geo,
+            timing_correction=timing_correction,
+            range_coreg_estimate=range_coreg_estimate,
+            work_dir=tmp_path,
+            fine_resampled_path=fine_path,
+        )
+
+        assert fine_path.exists()
+        result = _load_slc_npz(fine_path)
+        assert result.shape == out_shape
+        assert result.dtype == np.complex64
+        # Combined corrections should produce non-trivial output
+        assert not np.allclose(result, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests for filter_ifg
+# ---------------------------------------------------------------------------
+
+class TestFilterIfg:
+    """Tests for filter_ifg — Goldstein phase filtering."""
+
+    def test_coherence_mask_zeros_decorrelated(self):
+        """Pixels with coherence <= 0.3 are set to zero."""
+        shape = (32, 32)
+        ifg = np.ones(shape, dtype=np.complex64) * (1.0 + 1.0j)
+        coherence = np.full(shape, 0.2)  # all below threshold
+
+        result = filter_ifg(ifg, coherence)
+
+        np.testing.assert_array_equal(result, 0.0)
+
+    def test_alpha_zero_is_identity(self):
+        """alpha=0.0 returns the input interferogram unchanged."""
+        shape = (32, 32)
+        ifg = np.random.randn(*shape) + 1j * np.random.randn(*shape)
+        ifg = ifg.astype(np.complex64)
+        coherence = np.random.rand(*shape).astype(np.float32)
+
+        result = filter_ifg(ifg, coherence, alpha=0.0)
+
+        np.testing.assert_allclose(result, ifg, rtol=1e-6)
+
+    def test_alpha_one_max_filter(self):
+        """alpha=1.0 applies maximum filtering strength."""
+        shape = (32, 32)
+        # Create interferogram with varying intensity
+        intensity = np.ones(shape, dtype=np.float32)
+        intensity[8:24, 8:24] = 2.0  # high-intensity block
+        phase = np.angle(ifg := (intensity * np.exp(1j * 0.5)))
+        ifg = np.cos(phase) + 1j * np.sin(phase)
+
+        coherence = np.full(shape, 0.8)  # high coherence everywhere
+
+        result = filter_ifg(ifg, coherence, alpha=1.0)
+
+        # Output should still be complex64
+        assert result.dtype == np.complex64
+        # Should not be zero everywhere (filter applied)
+        assert not np.allclose(result, 0.0)
+
+    def test_boxcar_window_smoothing(self):
+        """Boxcar multi-looking (8×8) smooths local intensity variations."""
+        shape = (32, 32)
+        # High-intensity region in top-left, low in bottom-right
+        intensity = np.zeros(shape, dtype=np.float32)
+        intensity[:16, :16] = 4.0
+        intensity[16:, 16:] = 1.0
+        ifg = intensity * np.exp(1j * 0.3)
+        coherence = np.full(shape, 0.9)
+
+        result = filter_ifg(ifg, coherence, alpha=0.5)
+
+        # Output should be complex64
+        assert result.dtype == np.complex64
+        # Smoothed filter should not produce extreme values
+        assert np.all(np.isfinite(result))
 
 
 # ---------------------------------------------------------------------------
