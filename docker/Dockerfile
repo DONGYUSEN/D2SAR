@@ -181,6 +181,11 @@ RUN python3 -m pip install --upgrade --no-cache-dir \
         pysolid && \
     python3 -c "import cupy; print('cupy:', cupy.__version__)"
 
+RUN python3 -m pip install --upgrade --no-cache-dir pyproj && \
+    python3 -c "import pyproj; print('pyproj:', pyproj.__version__)"
+
+COPY dolphin/docker/proj.db /usr/share/proj/proj.db
+
 RUN python3 -m pip install --prefix=/opt/isce3 backoff requests
 
 # =============================================================================

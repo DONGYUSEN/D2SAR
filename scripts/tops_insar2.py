@@ -94,7 +94,7 @@ from scripts.tops_model import (
 from scripts.tops_common_bursts import match_common_bursts, write_common_bursts_json
 from scripts.tops_overlap import materialize_overlaps, write_overlaps_json
 from scripts.tops_geometry import run_geo2rdr_single_burst
-from scripts.tops_registration import run_coarse_registration
+from scripts.tops_registration import run_coarse_registration, fine_resample_with_timing
 from scripts.tops_esd import (
     estimate_esd_timing,
     compute_esd_timing_correction,
@@ -993,7 +993,7 @@ def _stage_range_coreg(
 
 
 # ---------------------------------------------------------------------------
-# Stage 11: fine_resamp (spike)
+# Stage 11: fine_resamp
 # ---------------------------------------------------------------------------
 
 def _stage_fine_resamp(
@@ -1004,12 +1004,85 @@ def _stage_fine_resamp(
     slave_bursts: list[BurstRadarGrid],
     state: dict[str, Any],
 ) -> bool:
-    """Fine resampling stage (spike — NotImplementedError with warning)."""
-    log.warning(
-        "[%s] Stage 'fine_resamp' is not yet implemented (spike). "
-        "Skipping; coarse-resampled SLCs will be used for burst IFG generation.",
-        swath,
-    )
+    """Fine resampling: apply ESD timing + range coreg corrections."""
+    log.info("[%s] stage_fine_resamp: running fine resampling", swath)
+
+    common: CommonBurstSelection | None = state.get("common")
+    esd_corrections: list[TimingCorrection] | None = state.get("esd_corrections")
+    range_coreg_estimate: Any | None = state.get("range_coreg_estimate")
+    geo2rdr_offsets: list[Geo2RdrOffsets] | None = state.get("geo2rdr_offsets")
+
+    if common is None:
+        log.error("[%s] common_bursts not yet computed.", swath)
+        return False
+
+    if not esd_corrections:
+        log.info(
+            "[%s] No ESD corrections available; skipping fine resamp "
+            "(coarse-resampled SLCs will be used).",
+            swath,
+        )
+        return True
+
+    if geo2rdr_offsets is None:
+        log.warning(
+            "[%s] Geo2Rdr offsets not available; skipping fine resamp.",
+            swath,
+        )
+        return True
+
+    skipped = False
+
+    for i, pair in enumerate(common.pairs):
+        pair_dir = work_dir / f"burst_{pair.pair_index:03d}"
+
+        # Load reference and secondary SLCs from coarse-resamp outputs
+        ref_path = pair_dir / "deramped_ref.npz"
+        sec_path = pair_dir / "deramped_sec.npz"
+        if not ref_path.exists() or not sec_path.exists():
+            log.warning(
+                "[%s] SLC files not found for burst pair %d; skipping fine resamp.",
+                swath, pair.pair_index,
+            )
+            skipped = True
+            continue
+
+        ref_slc = _load_slc_from_npz(ref_path)
+        sec_slc = _load_slc_from_npz(sec_path)
+
+        fine_resampled_path = pair_dir / "fine_resampled_sec.npz"
+        coarse_offsets = geo2rdr_offsets[i]
+        timing_correction = esd_corrections[i] if i < len(esd_corrections) else None
+
+        try:
+            fine_resample_with_timing(
+                ref_slc=ref_slc,
+                sec_slc=sec_slc,
+                ref_burst=pair.reference,
+                sec_burst=pair.secondary,
+                coarse_offsets=coarse_offsets,
+                timing_correction=timing_correction,
+                range_coreg_estimate=range_coreg_estimate,
+                work_dir=pair_dir,
+                fine_resampled_path=fine_resampled_path,
+            )
+            log.info(
+                "[%s] Fine resamp burst %d complete: %s",
+                swath, pair.pair_index, fine_resampled_path,
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] Fine resamp failed for burst %d: %s; "
+                "continuing with coarse-resampled SLC.",
+                swath, pair.pair_index, exc,
+            )
+            skipped = True
+            continue
+
+    if skipped:
+        log.warning("[%s] stage_fine_resamp: some bursts skipped", swath)
+
+    log.info("[%s] stage_fine_resamp complete", swath)
     return True
 
 
