@@ -407,38 +407,45 @@ class TestGeo2RdrOffsets:
 class TestRangeCoregEstimate:
     def test_construction(self):
         est = RangeCoregEstimate(
-            median_range_correction_pixels=0.05,
-            std_range_correction_pixels=0.02,
+            median_range_offset=0.05,
+            std_range_offset=0.02,
+            median_azimuth_offset=0.0,
+            std_azimuth_offset=0.01,
             sample_count=5000,
-            rejected_count=200,
+            usable_fraction=0.96,
         )
-        assert est.median_range_correction_pixels == 0.05
+        assert est.median_range_offset == 0.05
         assert est.sample_count == 5000
 
     def test_frozen(self):
         est = RangeCoregEstimate(
-            median_range_correction_pixels=0.0, std_range_correction_pixels=0.0,
-            sample_count=0, rejected_count=0,
+            median_range_offset=0.0, std_range_offset=0.0,
+            median_azimuth_offset=0.0, std_azimuth_offset=0.0,
+            sample_count=0, usable_fraction=0.0,
         )
         with pytest.raises(Exception):
             est.sample_count = 1
 
     def test_zero_valid_count_rejected(self):
-        # sample_count=0 is valid (empty estimate); rejected_count=0 is valid.
+        # sample_count=0 is valid (empty estimate); usable_fraction=0.0 is valid.
         # Only strictly negative values are rejected.
         with pytest.raises(ValueError, match="sample_count must be non-negative"):
             RangeCoregEstimate(
-                median_range_correction_pixels=0.0,
-                std_range_correction_pixels=0.0,
+                median_range_offset=0.0,
+                std_range_offset=0.0,
+                median_azimuth_offset=0.0,
+                std_azimuth_offset=0.0,
                 sample_count=-1,   # negative invalid
-                rejected_count=0,
+                usable_fraction=1.0,
             )
-        with pytest.raises(ValueError, match="rejected_count must be non-negative"):
+        with pytest.raises(ValueError, match="usable_fraction must be in"):
             RangeCoregEstimate(
-                median_range_correction_pixels=0.0,
-                std_range_correction_pixels=0.0,
+                median_range_offset=0.0,
+                std_range_offset=0.0,
+                median_azimuth_offset=0.0,
+                std_azimuth_offset=0.0,
                 sample_count=0,
-                rejected_count=-1,
+                usable_fraction=-0.1,   # out of bounds invalid
             )
 
 
