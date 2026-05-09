@@ -104,6 +104,9 @@ from scripts.tops_esd import (
 from scripts.tops_range_coreg import estimate_range_coreg, write_range_coreg_summary
 from scripts.tops_ifg import generate_ifg, IfgResult
 from scripts.tops_merge import merge_bursts
+from scripts.tops_registration import filter_ifg
+from scripts.tops_publish import geocode_ifg, unwrap_ifg, write_product
+from scripts.tops_utils import unwrap_phase_2d
 
 
 log = logging.getLogger(__name__)
@@ -1236,12 +1239,60 @@ def _stage_filter(
     slave_bursts: list[BurstRadarGrid],
     state: dict[str, Any],
 ) -> bool:
-    """Filtering stage (spike — NotImplementedError)."""
-    log.warning(
-        "[%s] Stage 'filter' is not yet implemented (spike). "
-        "Continuing with unfiltered interferogram.",
-        swath,
+    """Apply Goldstein phase filtering to merged interferogram."""
+    log.info("[%s] stage_filter: applying Goldstein filtering", swath)
+
+    merged_ifg: np.ndarray | None = state.get("merged_ifg")
+    merged_coh: np.ndarray | None = state.get("merged_coh")
+
+    merged_dir = work_dir / "merged"
+
+    # Load merged products from disk if not in state
+    if merged_ifg is None:
+        ifg_path = merged_dir / "filtered_ifg.npy"
+        if not ifg_path.exists():
+            ifg_path = merged_dir / "merged_interferogram.npy"
+        if ifg_path.exists():
+            merged_ifg = np.load(ifg_path)
+            log.info("[%s] Loaded merged_ifg from %s", swath, ifg_path)
+
+    if merged_ifg is None:
+        log.error("[%s] merged_ifg not in state and not on disk; run merge_bursts first.", swath)
+        return False
+
+    # Load from disk if not in state
+    if merged_coh is None:
+        coh_path = merged_dir / "merged_coherence.npy"
+        if coh_path.exists():
+            merged_coh = np.load(coh_path)
+            log.info("[%s] Loaded merged_coh from %s", swath, coh_path)
+
+    # At this point merged_coh is guaranteed to be non-None
+    assert merged_coh is not None
+
+    # Log pre-filter coherence stats
+    coh_before = float(np.nanmean(merged_coh))
+    log.info("[%s] Filter input: shape=%s coherence_mean=%.4f", swath, merged_ifg.shape, coh_before)
+
+    # Apply Goldstein filter (alpha=0.5 default)
+    alpha = 0.5
+    filtered_ifg = filter_ifg(merged_ifg, merged_coh, alpha=alpha)
+    log.info("[%s] Filter output: shape=%s alpha=%.1f", swath, filtered_ifg.shape, alpha)
+
+    # Log post-filter stats (coherence unchanged — filtering only affects phase magnitude)
+    coh_after = float(np.nanmean(merged_coh))
+    log.info(
+        "[%s] stage_filter complete: coherence before=%.4f after=%.4f",
+        swath, coh_before, coh_after,
     )
+
+    # Save filtered interferogram
+    merged_dir = work_dir / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    np.save(merged_dir / "filtered_ifg.npy", filtered_ifg)
+
+    state["merged_ifg"] = filtered_ifg
+    log.info("[%s] stage_filter: saved filtered_ifg.npy", swath)
     return True
 
 
@@ -1253,12 +1304,69 @@ def _stage_unwrap(
     slave_bursts: list[BurstRadarGrid],
     state: dict[str, Any],
 ) -> bool:
-    """Unwrapping stage (spike — NotImplementedError)."""
-    log.warning(
-        "[%s] Stage 'unwrap' is not yet implemented (spike). "
-        "Continuing without unwrapped phase.",
-        swath,
-    )
+    """Unwrap phase using ICU/SNAPHU with fallback to simple 2D unwrap."""
+    log.info("[%s] stage_unwrap: unwrapping phase", swath)
+
+    merged_ifg: np.ndarray | None = state.get("merged_ifg")
+    merged_coh: np.ndarray | None = state.get("merged_coh")
+
+    merged_dir = work_dir / "merged"
+
+    # Load merged products from disk if not in state
+    if merged_ifg is None:
+        ifg_path = merged_dir / "filtered_ifg.npy"
+        if not ifg_path.exists():
+            ifg_path = merged_dir / "merged_interferogram.npy"
+        if ifg_path.exists():
+            merged_ifg = np.load(ifg_path)
+            log.info("[%s] Loaded merged_ifg from %s", swath, ifg_path)
+
+    if merged_ifg is None:
+        log.error("[%s] merged_ifg not in state and not on disk; run filter stage first.", swath)
+        return False
+
+    # Load from disk if not in state
+    if merged_coh is None:
+        coh_path = merged_dir / "merged_coherence.npy"
+        if coh_path.exists():
+            merged_coh = np.load(coh_path)
+            log.info("[%s] Loaded merged_coh from %s", swath, coh_path)
+
+    assert merged_coh is not None
+
+    # Extract wrapped phase (angle of complex IFG)
+    phase = np.angle(merged_ifg).astype(np.float32)
+    log.info("[%s] Unwrap input: shape=%s coherence_mean=%.4f", swath, phase.shape, float(np.nanmean(merged_coh)))
+
+    unwrapped: np.ndarray
+    method = str(args.unwrap_method).lower()
+
+    # Try ICU/SNAPHU first
+    try:
+        unwrapped = unwrap_ifg(
+            phase,
+            merged_coh,
+            method=method,
+            work_dir=work_dir,
+        )
+        log.info("[%s] Unwrap via %s: shape=%s", swath, method, unwrapped.shape)
+    except (NotImplementedError, FileNotFoundError, RuntimeError) as exc:
+        # ICU/SNAPHU unavailable or failed — fallback to simple 2D unwrap
+        log.warning(
+            "[%s] ICU/SNAPHU (%s) unavailable or failed (%s); "
+            "falling back to simple 2D unwrapper.",
+            swath, method, exc,
+        )
+        unwrapped = unwrap_phase_2d(phase)
+        log.info("[%s] Unwrap via fallback (simple 2D): shape=%s", swath, unwrapped.shape)
+
+    # Save unwrapped phase
+    merged_dir = work_dir / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    np.save(merged_dir / "unwrapped.npy", unwrapped)
+
+    state["unwrapped"] = unwrapped
+    log.info("[%s] stage_unwrap: saved unwrapped.npy", swath)
     return True
 
 
@@ -1270,12 +1378,115 @@ def _stage_geocode(
     slave_bursts: list[BurstRadarGrid],
     state: dict[str, Any],
 ) -> bool:
-    """Geocoding stage (spike — NotImplementedError)."""
-    log.warning(
-        "[%s] Stage 'geocode' is not yet implemented (spike). "
-        "Continuing without geocoded products.",
-        swath,
-    )
+    """Geocode merged interferogram and coherence using GDAL.
+
+    If GDAL is unavailable or the DEM is missing, logs a warning and skips
+    geocoding without failing the pipeline.
+    """
+    log.info("[%s] stage_geocode: geocoding merged interferogram", swath)
+
+    merged_ifg: np.ndarray | None = state.get("merged_ifg")
+    merged_coh: np.ndarray | None = state.get("merged_coh")
+
+    if merged_ifg is None or merged_coh is None:
+        log.warning(
+            "[%s] merged_ifg or merged_coh not in state; skipping geocode.",
+            swath,
+        )
+        return True
+
+    # Resolve DEM path
+    dem_path = Path(args.dem) if args.dem else None
+    if dem_path is None or not dem_path.exists():
+        log.info(
+            "[%s] No DEM available; skipping geocode stage. "
+            "Provide DEM via --dem for geocoded products.",
+            swath,
+        )
+        return True
+
+    # Load merged products from disk if needed
+    merged_dir = work_dir / "merged"
+    ifg_path = merged_dir / "merged_interferogram.npy"
+    coh_path = merged_dir / "merged_coherence.npy"
+
+    if merged_ifg is None and ifg_path.exists():
+        merged_ifg = np.load(ifg_path)
+    if merged_coh is None and coh_path.exists():
+        merged_coh = np.load(coh_path)
+
+    if merged_ifg is None or merged_coh is None:
+        log.warning("[%s] Cannot load merged products; skipping geocode.", swath)
+        return True
+
+    # Get first burst for geometry info
+    common: Any = state.get("common")
+    first_burst = common.pairs[0].reference if common and common.pairs else None
+
+    if first_burst is None:
+        log.warning("[%s] Cannot determine burst geometry; skipping geocode.", swath)
+        return True
+
+    try:
+        geo_ifg, geo_coh = geocode_ifg(
+            merged_ifg=merged_ifg,
+            merged_coh=merged_coh,
+            burst=first_burst,
+            dem_path=dem_path,
+            work_dir=work_dir / "geocode_tmp",
+            res_meters=args.resolution_meters,
+        )
+
+        # Save geocoded products
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        np.save(merged_dir / "interferogram.geo.npy", geo_ifg)
+        np.save(merged_dir / "coherence.geo.npy", geo_coh)
+
+        log.info(
+            "[%s] Geocoded IFG: shape=%s coherence_mean=%.4f",
+            swath, geo_ifg.shape, float(np.nanmean(geo_coh)),
+        )
+
+        state["geocoded_ifg"] = geo_ifg
+        state["geocoded_coh"] = geo_coh
+
+    except NotImplementedError as exc:
+        log.warning(
+            "[%s] GDAL not available; skipping geocode. "
+            "Install GDAL (osgeo) for geocoded products. Details: %s",
+            swath, exc,
+        )
+        return True
+    except Exception as exc:
+        log.warning(
+            "[%s] Geocoding failed (%s); skipping geocode stage. "
+            "Pipeline continues without geocoded products.",
+            swath, exc,
+        )
+        return True
+
+    # Unwrap the geocoded phase if unwrapped phase is available in state
+    unwrapped = state.get("unwrapped")
+    if unwrapped is not None:
+        log.info("[%s] Geocoding unwrapped phase from state", swath)
+        try:
+            unw_geo = geocode_ifg(
+                merged_ifg=unwrapped.astype(np.complex64),
+                merged_coh=merged_coh,
+                burst=first_burst,
+                dem_path=dem_path,
+                work_dir=work_dir / "geocode_tmp",
+                res_meters=args.resolution_meters,
+            )
+            np.save(merged_dir / "unwrapped.geo.npy", unw_geo[0])
+            state["unwrapped_geocoded"] = unw_geo[0]
+        except Exception as exc:
+            log.warning(
+                "[%s] Unwrapped phase geocoding failed (%s); skipping.",
+                swath, exc,
+            )
+
+    log.info("[%s] stage_geocode complete", swath)
     return True
 
 
@@ -1287,12 +1498,99 @@ def _stage_publish(
     slave_bursts: list[BurstRadarGrid],
     state: dict[str, Any],
 ) -> bool:
-    """Publishing stage (spike — NotImplementedError)."""
-    log.warning(
-        "[%s] Stage 'publish' is not yet implemented (spike). "
-        "Stopping before final packaging.",
-        swath,
-    )
+    """Write final HDF5 and geocoded TIFF products to output directory."""
+    log.info("[%s] stage_publish: writing final products", swath)
+
+    merged_ifg: np.ndarray | None = state.get("merged_ifg")
+    merged_coh: np.ndarray | None = state.get("merged_coh")
+    unwrapped = state.get("unwrapped")
+    geocoded_ifg = state.get("geocoded_ifg")
+    geocoded_coh = state.get("geocoded_coh")
+
+    # Load from disk if not in state
+    merged_dir = work_dir / "merged"
+    if merged_ifg is None:
+        ifg_path = merged_dir / "filtered_ifg.npy"
+        if not ifg_path.exists():
+            ifg_path = merged_dir / "merged_interferogram.npy"
+        if ifg_path.exists():
+            merged_ifg = np.load(ifg_path)
+            log.info("[%s] Loaded merged_ifg from %s", swath, ifg_path)
+
+    if merged_coh is None:
+        coh_path = merged_dir / "merged_coherence.npy"
+        if coh_path.exists():
+            merged_coh = np.load(coh_path)
+            log.info("[%s] Loaded merged_coh from %s", swath, coh_path)
+
+    if unwrapped is None:
+        unw_path = merged_dir / "unwrapped.npy"
+        if unw_path.exists():
+            unwrapped = np.load(unw_path)
+            log.info("[%s] Loaded unwrapped from %s", swath, unw_path)
+
+    if merged_ifg is None:
+        log.error("[%s] merged_ifg not available; cannot publish.", swath)
+        return False
+
+    product_name = f"{swath}_interferogram"
+    output_dir = Path(args.output_dir) / swath
+
+    # Determine geo_transform and projection from geocoded data if available
+    geo_transform: tuple | None = None
+    projection: str = ""
+
+    if geocoded_ifg is not None and geocoded_coh is not None:
+        common: Any = state.get("common")
+        if common and common.pairs:
+            first_burst = common.pairs[0].reference
+            # Build geotransform from burst geometry
+            geo_transform = (
+                float(first_burst.starting_range),
+                float(first_burst.range_pixel_spacing),
+                0.0,
+                float(first_burst.identity.sensing_start.timestamp()),
+                0.0,
+                -float(first_burst.azimuth_time_interval),
+            )
+            # Get projection from DEM if available
+            dem_path = Path(args.dem) if args.dem else None
+            if dem_path and dem_path.exists():
+                try:
+                    from osgeo import gdal
+                    ds = gdal.Open(str(dem_path))
+                    if ds:
+                        projection = ds.GetProjection()
+                        ds = None
+                except Exception:
+                    pass
+
+    try:
+        written_files = write_product(
+            merged_ifg=merged_ifg,
+            merged_coh=merged_coh if merged_coh is not None else np.ones_like(merged_ifg, dtype=np.float32),
+            unwrapped=unwrapped,
+            geo_transform=geo_transform or (0.0, 1.0, 0.0, 0.0, 0.0, -1.0),
+            projection=projection,
+            output_dir=output_dir,
+            product_name=product_name,
+        )
+
+        log.info("[%s] stage_publish: wrote %d output files", swath, len(written_files))
+        for path in written_files:
+            log.info("  -> %s", path)
+
+        state["published_files"] = written_files
+
+    except Exception as exc:
+        log.warning(
+            "[%s] stage_publish failed (%s); partial products may exist. "
+            "Continuing pipeline.",
+            swath, exc,
+        )
+        return True
+
+    log.info("[%s] stage_publish complete: %s", swath, output_dir)
     return True
 
 

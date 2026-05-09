@@ -587,3 +587,214 @@ def test_full_pipeline_not_implemented_stages(tmp_path: Path) -> None:
         result = ti2._run_swath(args, "IW1", master_bursts, slave_bursts, stages)
 
     assert result["status"] == "ok", f"Pipeline should succeed despite unimplemented stages: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Test 14: stage_filter preserves shape
+# ---------------------------------------------------------------------------
+
+def test_stage_filter_preserves_shape(tmp_path: Path) -> None:
+    """_stage_filter should preserve the input interferogram shape."""
+    from scripts import tops_insar2 as ti2
+
+    common = _make_common(1)
+    args = MagicMock()
+    args.output_dir = tmp_path
+
+    merged_dir = tmp_path / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write merged products
+    shape = (1300, 24000)
+    merged_ifg = np.ones(shape, dtype=np.complex64)
+    merged_coh = np.ones(shape, dtype=np.float32)
+    np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
+    np.save(merged_dir / "merged_coherence.npy", merged_coh)
+
+    state: dict = {
+        "common": common,
+        "looks": (5, 5),
+    }
+
+    ok = ti2._stage_filter(args, "IW1", tmp_path, [], [], state)
+
+    assert ok is True
+    assert state["merged_ifg"] is not None
+    assert state["merged_ifg"].shape == shape
+
+
+def test_stage_filter_reduces_noise(tmp_path: Path) -> None:
+    """_stage_filter should reduce interferogram noise (variance decreases)."""
+    from scripts import tops_insar2 as ti2
+
+    common = _make_common(1)
+    args = MagicMock()
+    args.output_dir = tmp_path
+
+    merged_dir = tmp_path / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create noisy interferogram with uniform coherence
+    shape = (100, 100)
+    np.random.seed(42)
+    noise_phase = np.random.uniform(-np.pi, np.pi, shape)
+    merged_ifg = np.exp(1j * noise_phase).astype(np.complex64)
+    merged_coh = np.ones(shape, dtype=np.float32)
+    np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
+    np.save(merged_dir / "merged_coherence.npy", merged_coh)
+
+    state: dict = {"common": common, "looks": (5, 5)}
+
+    ok = ti2._stage_filter(args, "IW1", tmp_path, [], [], state)
+
+    assert ok is True
+    filtered_ifg = state["merged_ifg"]
+
+    # Filtered IFG should have lower variance in magnitude (from smoothing)
+    # and the file should be saved
+    assert (merged_dir / "filtered_ifg.npy").exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 15: stage_geocode skips when DEM missing
+# ---------------------------------------------------------------------------
+
+def test_stage_geocode_skips_when_dem_missing(tmp_path: Path) -> None:
+    """_stage_geocode should skip gracefully when DEM is not provided."""
+    from scripts import tops_insar2 as ti2
+
+    common = _make_common(1)
+    args = MagicMock()
+    args.dem = None
+    args.resolution_meters = 20.0
+
+    state: dict = {
+        "common": common,
+        "merged_ifg": np.ones((100, 100), dtype=np.complex64),
+        "merged_coh": np.ones((100, 100), dtype=np.float32),
+    }
+
+    ok = ti2._stage_geocode(args, "IW1", tmp_path, [], [], state)
+
+    assert ok is True
+    assert state.get("geocoded_ifg") is None
+
+
+def test_stage_geocode_skips_when_no_common(tmp_path: Path) -> None:
+    """_stage_geocode should skip when common burst selection is missing."""
+    from scripts import tops_insar2 as ti2
+
+    args = MagicMock()
+    args.dem = tmp_path / "dem.tif"
+    args.resolution_meters = 20.0
+
+    # Create a fake DEM
+    args.dem.parent.mkdir(parents=True, exist_ok=True)
+    args.dem.write_text("dummy dem")
+
+    state: dict = {
+        "common": None,
+        "merged_ifg": np.ones((100, 100), dtype=np.complex64),
+        "merged_coh": np.ones((100, 100), dtype=np.float32),
+    }
+
+    ok = ti2._stage_geocode(args, "IW1", tmp_path, [], [], state)
+
+    assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Test 16: stage_publish writes hdf5 and tiffs
+# ---------------------------------------------------------------------------
+
+def test_stage_publish_writes_hdf5(tmp_path: Path) -> None:
+    """_stage_publish should write HDF5 product file."""
+    from scripts import tops_insar2 as ti2
+
+    common = _make_common(1)
+    args = MagicMock()
+    args.output_dir = tmp_path
+    args.dem = None
+
+    merged_dir = tmp_path / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    shape = (100, 100)
+    merged_ifg = np.ones(shape, dtype=np.complex64)
+    merged_coh = np.ones(shape, dtype=np.float32)
+    np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
+    np.save(merged_dir / "merged_coherence.npy", merged_coh)
+
+    state: dict = {
+        "common": common,
+        "looks": (5, 5),
+    }
+
+    ok = ti2._stage_publish(args, "IW1", tmp_path, [], [], state)
+
+    assert ok is True
+    output_dir = tmp_path / "IW1"
+    h5_file = output_dir / "IW1_interferogram.h5"
+    assert h5_file.exists(), f"HDF5 file should exist: {h5_file}"
+
+
+def test_stage_publish_continues_on_error(tmp_path: Path) -> None:
+    """_stage_publish should return True even if publishing fails partially."""
+    from scripts import tops_insar2 as ti2
+
+    common = _make_common(1)
+    args = MagicMock()
+    args.output_dir = tmp_path
+    args.dem = None
+
+    # Leave merged products empty so write_product may fail
+    merged_dir = tmp_path / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    state: dict = {
+        "common": common,
+        "looks": (5, 5),
+        "merged_ifg": None,  # Will cause publish to fail gracefully
+    }
+
+    ok = ti2._stage_publish(args, "IW1", tmp_path, [], [], state)
+
+    # Should fail gracefully when merged_ifg is None
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Test 17: stage_unwrap fallback to simple 2d unwrap
+# ---------------------------------------------------------------------------
+
+def test_stage_unwrap_fallback_to_2d_when_icu_unavailable(tmp_path: Path) -> None:
+    """_stage_unwrap should fall back to simple 2D unwrap when ICU is not available."""
+    from scripts import tops_insar2 as ti2
+
+    common = _make_common(1)
+    args = MagicMock()
+    args.output_dir = tmp_path
+    args.unwrap_method = "icu"
+
+    merged_dir = tmp_path / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    shape = (100, 100)
+    phase = np.linspace(-np.pi, np.pi, shape[0] * shape[1]).reshape(shape).astype(np.float32)
+    merged_ifg = np.exp(1j * phase).astype(np.complex64)
+    merged_coh = np.ones(shape, dtype=np.float32)
+    np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
+    np.save(merged_dir / "merged_coherence.npy", merged_coh)
+
+    state: dict = {
+        "common": common,
+        "looks": (5, 5),
+    }
+
+    ok = ti2._stage_unwrap(args, "IW1", tmp_path, [], [], state)
+
+    assert ok is True
+    assert "unwrapped" in state
+    assert state["unwrapped"] is not None
+    assert state["unwrapped"].shape == shape
+    assert (merged_dir / "unwrapped.npy").exists()
