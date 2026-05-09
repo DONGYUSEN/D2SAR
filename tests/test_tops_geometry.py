@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,6 +22,8 @@ from scripts.tops_geometry import (
     build_isce3_orbit_from_safe,
     build_doppler_lut,
     run_geo2rdr_single_burst,
+    _parse_eof_state_vectors,
+    _find_eof_file,
 )
 
 
@@ -404,33 +407,129 @@ class TestBurstToRadarGrid:
 
 
 # ---------------------------------------------------------------------------
-# Spike functions — NotImplementedError
+# Spike functions — ISCE3 integration tests
 # ---------------------------------------------------------------------------
 
-class TestSpikeFunctions:
-    """Spike stubs raise NotImplementedError with descriptive messages."""
+# Path to real EOF file for testing
+_EOF_PATH = Path(__file__).parents[1] / "result" / "orbits" / "S1A_OPER_AUX_POEORB_OPOD_20230715T080803_V20230624T225942_20230626T005942.EOF"
 
-    def test_build_isce3_orbit_from_safe_raises(self):
-        with pytest.raises(NotImplementedError, match="spike stub"):
-            build_isce3_orbit_from_safe(
-                Path("/fake/safe"),
-                datetime(2024, 1, 15, tzinfo=UTC),
-                datetime(2024, 1, 15, tzinfo=UTC),
-            )
 
-    def test_build_doppler_lut_raises(self):
-        with pytest.raises(NotImplementedError, match="spike stub"):
-            build_doppler_lut(_make_burst())
+class TestParseEofStateVectors:
+    """Test EOF parsing directly (no ISCE3 dependency)."""
 
-    def test_run_geo2rdr_single_burst_raises(self):
-        with pytest.raises(NotImplementedError, match="spike stub"):
-            run_geo2rdr_single_burst(
-                _make_burst(idx=0),
-                _make_burst(idx=1),
-                dem_path=Path("/fake/dem.tif"),
-                work_dir=Path("/tmp/geo2rdr_work"),
-                use_gpu=False,
-            )
+    def test_parse_eof_returns_list_of_tuples(self):
+        """_parse_eof_state_vectors returns list of (datetime, x, y, z, vx, vy, vz)."""
+        if not _EOF_PATH.exists():
+            pytest.skip(f"EOF file not found: {_EOF_PATH}")
+
+        state_vectors = _parse_eof_state_vectors(_EOF_PATH)
+        assert isinstance(state_vectors, list)
+        assert len(state_vectors) > 0
+        assert all(len(sv) == 7 for sv in state_vectors)
+
+    def test_parse_eof_sorted_by_datetime(self):
+        """State vectors are sorted by datetime."""
+        if not _EOF_PATH.exists():
+            pytest.skip(f"EOF file not found: {_EOF_PATH}")
+
+        state_vectors = _parse_eof_state_vectors(_EOF_PATH)
+        datetimes = [sv[0] for sv in state_vectors]
+        assert datetimes == sorted(datetimes)
+
+    def test_parse_eof_positions_valid(self):
+        """State vector positions are realistic (ECEF in km scale)."""
+        if not _EOF_PATH.exists():
+            pytest.skip(f"EOF file not found: {_EOF_PATH}")
+
+        state_vectors = _parse_eof_state_vectors(_EOF_PATH)
+        for dt, x, y, z, vx, vy, vz in state_vectors:
+            # ECEF positions should be ~7000 km magnitude
+            assert -1e7 < x < 1e7
+            assert -1e7 < y < 1e7
+            assert -1e7 < z < 1e7
+            # Velocities should be ~7000 m/s scale
+            assert -1e4 < vx < 1e4
+            assert -1e4 < vy < 1e4
+            assert -1e4 < vz < 1e4
+
+
+class TestFindEofFile:
+    """Test EOF file discovery."""
+
+    def test_find_eof_file_returns_none_for_empty_dir(self, tmp_path):
+        """_find_eof_file returns None when no EOF files exist."""
+        result = _find_eof_file(tmp_path)
+        assert result is None
+
+    def test_find_eof_file_finds_poeorb(self, tmp_path):
+        """_find_eof_file finds POEORB files."""
+        # Create a fake EOF file
+        fake_eof = tmp_path / "aux" / "S1A_OPER_AUX_POEORB_TEST.EOF"
+        fake_eof.parent.mkdir()
+        fake_eof.write_text("<?xml version='1.0'?><Earth_Explorer_File></Earth_Explorer_File>")
+
+        result = _find_eof_file(tmp_path)
+        assert result is not None
+        assert result.name == "S1A_OPER_AUX_POEORB_TEST.EOF"
+
+
+class TestBuildIsce3OrbitFromSafe:
+    """Test ISCE3 orbit building from SAFE."""
+
+    def test_raises_not_implemented_when_isce3_unavailable(self):
+        """Raises NotImplementedError when ISCE3 C++ bindings are not available."""
+        with patch("scripts.tops_geometry._get_isce3", side_effect=NotImplementedError("isce3 C++ bindings are not available")):
+            with pytest.raises(NotImplementedError):
+                build_isce3_orbit_from_safe(
+                    Path("/fake/safe"),
+                    datetime(2024, 1, 15, tzinfo=UTC),
+                    datetime(2024, 1, 15, tzinfo=UTC),
+                )
+
+    def test_raises_file_not_found_for_missing_eof(self):
+        """Raises FileNotFoundError when no EOF file is found."""
+        # Need to mock the entire isce3 module to prevent import failures
+        mock_isce3 = MagicMock()
+        mock_core = MagicMock()
+        mock_isce3.core = mock_core
+        mock_isce3.core.DateTime = MagicMock()
+        mock_isce3.core.StateVector = MagicMock()
+        mock_isce3.core.Orbit = MagicMock()
+        mock_isce3.core.OrbitInterpMethod = MagicMock()
+
+        with patch("scripts.tops_geometry._find_eof_file", return_value=None):
+            with patch.dict("sys.modules", {"isce3": mock_isce3, "isce3.core": mock_core}):
+                with pytest.raises(FileNotFoundError, match="No POEORB or RESORB"):
+                    build_isce3_orbit_from_safe(
+                        Path("/fake/safe"),
+                        datetime(2024, 1, 15, tzinfo=UTC),
+                        datetime(2024, 1, 15, tzinfo=UTC),
+                    )
+
+
+class TestBuildDopplerLut:
+    """Test Doppler LUT building."""
+
+    def test_raises_not_implemented_when_isce3_unavailable(self):
+        """Raises NotImplementedError when ISCE3 C++ bindings are not available."""
+        with patch("scripts.tops_geometry._get_isce3", side_effect=NotImplementedError("isce3 C++ bindings are not available")):
+            with pytest.raises(NotImplementedError):
+                build_doppler_lut(_make_burst())
+
+
+class TestRunGeo2RdrSingleBurst:
+    """Test Geo2Rdr single burst execution."""
+
+    def test_raises_not_implemented_when_isce3_unavailable(self):
+        """Raises NotImplementedError when ISCE3 C++ bindings are not available."""
+        with patch("scripts.tops_geometry._get_isce3", side_effect=NotImplementedError("isce3 C++ bindings are not available")):
+            with pytest.raises(NotImplementedError):
+                run_geo2rdr_single_burst(
+                    _make_burst(idx=0),
+                    _make_burst(idx=1),
+                    dem_path=Path("/fake/dem.tif"),
+                    work_dir=Path("/tmp/geo2rdr_work"),
+                )
 
 
 # ---------------------------------------------------------------------------
