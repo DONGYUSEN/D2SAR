@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from scripts.tops_model import (
@@ -16,6 +17,7 @@ from scripts.tops_model import (
     CommonBurstPair,
     CommonBurstSelection,
     OverlapPair,
+    OverlapSlice,
 )
 from scripts.tops_overlap import (
     materialize_overlaps,
@@ -25,6 +27,7 @@ from scripts.tops_overlap import (
     _valid_window_intersect,
     overlaps_to_dict,
     write_overlaps_json,
+    read_overlap_window,
 )
 
 
@@ -537,3 +540,148 @@ def test_write_overlaps_json_creates_parent_dirs(tmp_path: Path):
     out_path = tmp_path / "subdir" / "overlaps.json"
     write_overlaps_json(pairs, out_path)
     assert out_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# read_overlap_window tests
+# ---------------------------------------------------------------------------
+
+class TestReadOverlapWindow:
+    """Tests for read_overlap_window using GDAL-backed temporary TIFFs."""
+
+    @staticmethod
+    def _make_overlap_slice(
+        first_line: int = 0,
+        num_lines: int = 10,
+        first_sample: int = 0,
+        num_samples: int = 20,
+    ) -> OverlapSlice:
+        """Minimal OverlapSlice for testing."""
+        ref = [_grid(0, 0), _grid(1, 3)]
+        sec = [_grid(0, 0), _grid(1, 3)]
+        sel = _sel(list(zip(ref, sec)))
+        pair = sel.pairs[0]
+        start = pair.reference.identity.sensing_start
+        stop = start + timedelta(seconds=1)
+        return OverlapSlice(
+            burst_pair=pair,
+            is_top=True,
+            first_line=first_line,
+            num_lines=num_lines,
+            first_sample=first_sample,
+            num_samples=num_samples,
+            sensing_start=start,
+            sensing_stop=stop,
+        )
+
+    def _create_temp_tiff(self, tmp_path: Path) -> Path:
+        """Create a 50×30 float32 ENVI TIFF with known pattern."""
+        try:
+            import osgeo.gdal as gdal
+        except ImportError:
+            pytest.skip("GDAL not available")
+
+        rows, cols = 50, 30
+        tiff_path = tmp_path / "test_float.tif"
+
+        # Use ENVI driver for complex support; fallback to GTiff
+        for driver_name in ("ENVI", "GTiff"):
+            driver = gdal.GetDriverByName(driver_name)
+            if driver is not None:
+                break
+        else:  # pragma: no cover
+            pytest.skip("No suitable GDAL driver available")
+
+        ds = driver.Create(str(tiff_path), cols, rows, 1, gdal.GDT_Float32)
+        if ds is None:  # pragma: no cover
+            pytest.skip("GDAL driver failed to create file")
+
+        # Write deterministic data: line index + sample index (as float)
+        band = ds.GetRasterBand(1)
+        for line in range(rows):
+            row_data = np.arange(cols, dtype=np.float32) + line * 1000.0
+            band.WriteArray(row_data.reshape(1, -1), xoff=0, yoff=line)
+
+        band.FlushCache()
+        ds = None
+        return tiff_path
+
+    def test_read_overlap_window_shape_correct(self, tmp_path: Path):
+        """Shape of returned array matches the requested window."""
+        try:
+            import osgeo.gdal as gdal
+        except ImportError:
+            pytest.skip("GDAL not available")
+
+        tiff_path = self._create_temp_tiff(tmp_path)
+
+        overlap_slice = self._make_overlap_slice(
+            first_line=10,
+            num_lines=5,
+            first_sample=5,
+            num_samples=8,
+        )
+        result = read_overlap_window(tiff_path, overlap_slice)
+
+        assert result is not None
+        assert result.shape == (5, 8)
+
+    def test_read_overlap_window_data_preserved(self, tmp_path: Path):
+        """Data round-trips correctly through write + read."""
+        try:
+            import osgeo.gdal as gdal
+        except ImportError:
+            pytest.skip("GDAL not available")
+
+        tiff_path = self._create_temp_tiff(tmp_path)
+
+        first_line, num_lines = 5, 4
+        first_sample, num_samples = 10, 6
+        overlap_slice = self._make_overlap_slice(
+            first_line=first_line,
+            num_lines=num_lines,
+            first_sample=first_sample,
+            num_samples=num_samples,
+        )
+        result = read_overlap_window(tiff_path, overlap_slice)
+
+        assert result is not None
+        # Manually compute expected: value at tile[i, j] = (first_sample + j) + (first_line + i) * 1000
+        i_vals = np.arange(num_lines, dtype=np.float32).reshape(-1, 1)   # (num_lines, 1)
+        j_vals = np.arange(num_samples, dtype=np.float32).reshape(1, -1)  # (1, num_samples)
+        expected = (first_sample + j_vals) + (first_line + i_vals) * 1000.0
+        assert np.allclose(result, expected)
+
+    def test_read_overlap_window_returns_none_for_missing_file(self, tmp_path: Path):
+        """Missing TIFF file returns None."""
+        overlap_slice = self._make_overlap_slice()
+        result = read_overlap_window(tmp_path / "nonexistent.tif", overlap_slice)
+        assert result is None
+
+    def test_read_overlap_window_returns_none_for_zero_dimensions(self, tmp_path: Path):
+        """Zero num_lines or num_samples returns None."""
+        tiff_path = self._create_temp_tiff(tmp_path)
+
+        slice_zero_lines = self._make_overlap_slice(
+            first_line=0, num_lines=0, first_sample=0, num_samples=10
+        )
+        assert read_overlap_window(tiff_path, slice_zero_lines) is None
+
+        slice_zero_samps = self._make_overlap_slice(
+            first_line=0, num_lines=10, first_sample=0, num_samples=0
+        )
+        assert read_overlap_window(tiff_path, slice_zero_samps) is None
+
+    def test_read_overlap_window_returns_none_for_negative_origin(self, tmp_path: Path):
+        """Negative first_line or first_sample returns None."""
+        tiff_path = self._create_temp_tiff(tmp_path)
+
+        slice_bad_line = self._make_overlap_slice(
+            first_line=-1, num_lines=5, first_sample=0, num_samples=10
+        )
+        assert read_overlap_window(tiff_path, slice_bad_line) is None
+
+        slice_bad_samp = self._make_overlap_slice(
+            first_line=0, num_lines=5, first_sample=-5, num_samples=10
+        )
+        assert read_overlap_window(tiff_path, slice_bad_samp) is None

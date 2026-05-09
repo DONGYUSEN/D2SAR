@@ -15,9 +15,12 @@ No imports from strip/tops_insar backends.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence, Tuple
+
+import numpy as np
 
 from scripts.tops_model import (
     BurstRadarGrid,
@@ -30,10 +33,20 @@ from scripts.tops_model import (
 
 UTC = timezone.utc
 
+log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+__all__ = [
+    "materialize_overlaps",
+    "overlaps_to_dict",
+    "write_overlaps_json",
+    "read_overlap_window",
+]
+
 
 def materialize_overlaps(common: CommonBurstSelection) -> list[OverlapPair]:
     """Materialize top/bottom overlap slices for all adjacent burst pairs.
@@ -260,3 +273,78 @@ def write_overlaps_json(pairs: Sequence[OverlapPair], path: Path) -> None:
     with path.open("w") as fh:
         json.dump(overlaps_to_dict(pairs), fh, indent=2)
         fh.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# GDAL-based window read
+# ---------------------------------------------------------------------------
+
+def read_overlap_window(
+    tiff_path: Path,
+    overlap_slice: OverlapSlice,
+    *, band: int = 1,
+) -> np.ndarray | None:
+    """Read the specified overlap window pixels from a Sentinel-1 TOPS full-swath TIFF.
+
+    Parameters
+    ----------
+    tiff_path : Path
+        Path to the full-swath TIFF file.
+    overlap_slice : OverlapSlice
+        OverlapSlice defining the window to read (absolute line/sample coordinates).
+    band : int, default=1
+        Band number to read (1-indexed for GDAL).
+
+    Returns
+    -------
+    np.ndarray or None
+        Array of shape (num_lines, num_samples) with dtype float32/float64 or
+        complex64 for complex (ENVI) data.  Returns None on failure (missing file,
+        GDAL unavailable, or invalid dimensions).
+    """
+    try:
+        import osgeo.gdal as gdal
+    except ImportError:
+        log.warning("GDAL not available; read_overlap_window returns None")
+        return None
+
+    if not tiff_path.exists():
+        log.warning("TIFF file not found: %s", tiff_path)
+        return None
+
+    if overlap_slice.num_lines <= 0 or overlap_slice.num_samples <= 0:
+        log.warning(
+            "Invalid overlap dimensions: num_lines=%d, num_samples=%d",
+            overlap_slice.num_lines, overlap_slice.num_samples,
+        )
+        return None
+
+    if overlap_slice.first_line < 0 or overlap_slice.first_sample < 0:
+        log.warning(
+            "Negative window origin: first_line=%d, first_sample=%d",
+            overlap_slice.first_line, overlap_slice.first_sample,
+        )
+        return None
+
+    try:
+        ds = gdal.Open(str(tiff_path), gdal.GA_ReadOnly)
+        if ds is None:
+            log.warning("GDAL failed to open: %s", tiff_path)
+            return None
+
+        data = ds.GetRasterBand(band).ReadAsArray(
+            overlap_slice.first_sample,
+            overlap_slice.first_line,
+            overlap_slice.num_samples,
+            overlap_slice.num_lines,
+        )
+        if data is None:
+            log.warning("ReadAsArray returned None for window in: %s", tiff_path)
+            return None
+
+        # GDAL returns (num_lines, num_samples) in row-major order
+        return np.asarray(data)
+
+    except Exception as exc:  # pragma: no cover
+        log.warning("Error reading overlap window from %s: %s", tiff_path, exc)
+        return None
