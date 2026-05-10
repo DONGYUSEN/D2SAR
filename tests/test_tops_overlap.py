@@ -685,3 +685,9 @@ class TestReadOverlapWindow:
             first_line=0, num_lines=5, first_sample=-5, num_samples=10
         )
         assert read_overlap_window(tiff_path, slice_bad_samp) is None
+
+    def test_read_overlap_window_returns_none_for_out_of_bounds(self, tmp_path: Path):
+        """Requests outside raster bounds return None."""
+        tiff_path = self._create_temp_tiff(tmp_path)
+        bad = self._make_overlap_slice(first_line=48, num_lines=5, first_sample=25, num_samples=10)
+        assert read_overlap_window(tiff_path, bad) is None

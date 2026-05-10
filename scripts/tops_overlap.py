@@ -303,7 +303,7 @@ def read_overlap_window(
         GDAL unavailable, or invalid dimensions).
     """
     try:
-        import osgeo.gdal as gdal
+        from osgeo import gdal
     except ImportError:
         log.warning("GDAL not available; read_overlap_window returns None")
         return None
@@ -315,14 +315,16 @@ def read_overlap_window(
     if overlap_slice.num_lines <= 0 or overlap_slice.num_samples <= 0:
         log.warning(
             "Invalid overlap dimensions: num_lines=%d, num_samples=%d",
-            overlap_slice.num_lines, overlap_slice.num_samples,
+            overlap_slice.num_lines,
+            overlap_slice.num_samples,
         )
         return None
 
     if overlap_slice.first_line < 0 or overlap_slice.first_sample < 0:
         log.warning(
             "Negative window origin: first_line=%d, first_sample=%d",
-            overlap_slice.first_line, overlap_slice.first_sample,
+            overlap_slice.first_line,
+            overlap_slice.first_sample,
         )
         return None
 
@@ -330,6 +332,15 @@ def read_overlap_window(
         ds = gdal.Open(str(tiff_path), gdal.GA_ReadOnly)
         if ds is None:
             log.warning("GDAL failed to open: %s", tiff_path)
+            return None
+
+        if band < 1 or band > ds.RasterCount:
+            log.warning("Invalid band %d for %s", band, tiff_path)
+            return None
+
+        if overlap_slice.first_sample + overlap_slice.num_samples > ds.RasterXSize:
+            return None
+        if overlap_slice.first_line + overlap_slice.num_lines > ds.RasterYSize:
             return None
 
         data = ds.GetRasterBand(band).ReadAsArray(
@@ -342,7 +353,6 @@ def read_overlap_window(
             log.warning("ReadAsArray returned None for window in: %s", tiff_path)
             return None
 
-        # GDAL returns (num_lines, num_samples) in row-major order
         return np.asarray(data)
 
     except Exception as exc:  # pragma: no cover
