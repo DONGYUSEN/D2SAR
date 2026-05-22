@@ -92,10 +92,10 @@ class TopsInsarBackendTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         return manifest_path
 
-    def test_local_backend_passes_tops_metadata_to_strip_insar2(self) -> None:
+    def test_local_backend_passes_tops_metadata_to_strip_insar(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
             import tops_insar
-            import strip_insar2
+            import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -138,10 +138,10 @@ class TopsInsarBackendTests(unittest.TestCase):
                     "fallback_reasons": {},
                 }
 
-            with mock.patch.object(strip_insar2, "process_strip_insar2", side_effect=fake_process) as patched:
+            with mock.patch.object(strip_insar, "process_strip_insar", side_effect=fake_process) as patched:
                 record = tops_insar._run_local_tops_backend_for_swath(plan, "IW2", stop_after_stage="p6")
 
-        self.assertEqual(record["backend"], "strip_insar2-local-tops")
+        self.assertEqual(record["backend"], "strip_insar-local-tops")
         self.assertEqual(record["stop_after_stage"], "p6")
         patched.assert_called_once()
         call = patched.call_args
@@ -153,21 +153,21 @@ class TopsInsarBackendTests(unittest.TestCase):
         self.assertEqual(call.kwargs["range_looks"], 1)
         self.assertEqual(call.kwargs["azimuth_looks"], 1)
         self.assertEqual(len(call.kwargs["master_bursts"]), 2)
-        self.assertIsInstance(call.kwargs["master_bursts"][0], strip_insar2.TopsBurstInfo)
+        self.assertIsInstance(call.kwargs["master_bursts"][0], strip_insar.TopsBurstInfo)
         self.assertEqual(call.kwargs["master_bursts"][0].burst_index, 0)
         self.assertEqual(call.kwargs["master_bursts"][1].burst_index, 1)
         self.assertEqual(len(call.kwargs["overlaps"]), 1)
-        self.assertIsInstance(call.kwargs["overlaps"][0], strip_insar2.TopsOverlapInfo)
+        self.assertIsInstance(call.kwargs["overlaps"][0], strip_insar.TopsOverlapInfo)
         self.assertEqual(call.kwargs["overlaps"][0].previous_burst_index, 0)
         self.assertEqual(call.kwargs["overlaps"][0].next_burst_index, 1)
 
-    def test_process_strip_insar2_supports_stop_after_p0(self) -> None:
+    def test_process_strip_insar_supports_stop_after_p0(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "master.slc")}},
@@ -197,15 +197,15 @@ class TopsInsarBackendTests(unittest.TestCase):
                     "effective_master_window": {"row0": 0, "col0": 0, "rows": 2, "cols": 2},
                 }
 
-            with mock.patch.object(strip_insar2, "_derive_pair_identity", return_value=("pair", root / "pair")), \
-                mock.patch.object(strip_insar2, "_prepare_runtime_inputs", side_effect=fake_prepare), \
-                mock.patch.object(strip_insar2, "load_pair_context", return_value=fake_context), \
-                mock.patch.object(strip_insar2, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
-                mock.patch.object(strip_insar2, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)) as burst_geom, \
-                mock.patch.object(strip_insar2, "run_geo2rdr_stage", return_value=({"master_topo": "m", "slave_topo": "s"}, "cpu", None)) as geo2rdr, \
-                mock.patch.object(strip_insar2, "run_resample_stage") as resample, \
-                mock.patch.object(strip_insar2, "run_burst_ifg_stage") as burst_ifg:
-                result = strip_insar2.process_strip_insar2(
+            with mock.patch.object(strip_insar, "_derive_pair_identity", return_value=("pair", root / "pair")), \
+                mock.patch.object(strip_insar, "_prepare_runtime_inputs", side_effect=fake_prepare), \
+                mock.patch.object(strip_insar, "load_pair_context", return_value=fake_context), \
+                mock.patch.object(strip_insar, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
+                mock.patch.object(strip_insar, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)) as burst_geom, \
+                mock.patch.object(strip_insar, "run_geo2rdr_stage", return_value=({"master_topo": "m", "slave_topo": "s"}, "cpu", None)) as geo2rdr, \
+                mock.patch.object(strip_insar, "run_resample_stage") as resample, \
+                mock.patch.object(strip_insar, "run_burst_ifg_stage") as burst_ifg:
+                result = strip_insar.process_strip_insar(
                     root / "master.json",
                     root / "slave.json",
                     output_root=root,
@@ -221,7 +221,7 @@ class TopsInsarBackendTests(unittest.TestCase):
 
     def test_resample_complex_with_offsets_applies_bilinear_shift(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         slave = (np.arange(16, dtype=np.float32).reshape(4, 4) + 1j * np.zeros((4, 4), dtype=np.float32)).astype(
             np.complex64
@@ -229,17 +229,17 @@ class TopsInsarBackendTests(unittest.TestCase):
         range_off = np.ones((4, 4), dtype=np.float32)
         az_off = np.ones((4, 4), dtype=np.float32)
 
-        shifted = strip_insar2._resample_complex_with_offsets(slave, range_off, az_off, method="bilinear")
+        shifted = strip_insar._resample_complex_with_offsets(slave, range_off, az_off, method="bilinear")
 
         expected = np.zeros((4, 4), dtype=np.complex64)
         expected[1:, 1:] = slave[:-1, :-1]
         np.testing.assert_allclose(shifted, expected, rtol=1e-5, atol=1e-10)
 
-    def test_process_strip_insar2_supports_stop_after_p1_in_tops_mode(self) -> None:
+    def test_process_strip_insar_supports_stop_after_p1_in_tops_mode(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
-        burst = strip_insar2.TopsBurstInfo(
+        burst = strip_insar.TopsBurstInfo(
             burst_index=0,
             line_offset=0,
             number_of_lines=2,
@@ -251,7 +251,7 @@ class TopsInsarBackendTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "master.slc")}},
@@ -281,13 +281,13 @@ class TopsInsarBackendTests(unittest.TestCase):
                     "effective_master_window": {"row0": 0, "col0": 0, "rows": 2, "cols": 2},
                 }
 
-            with mock.patch.object(strip_insar2, "_derive_pair_identity", return_value=("pair", root / "pair")), \
-                mock.patch.object(strip_insar2, "_prepare_runtime_inputs", side_effect=fake_prepare), \
-                mock.patch.object(strip_insar2, "load_pair_context", return_value=fake_context), \
-                mock.patch.object(strip_insar2, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
-                mock.patch.object(strip_insar2, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)) as burst_geom, \
-                mock.patch.object(strip_insar2, "run_burst_ifg_stage") as burst_ifg:
-                result = strip_insar2.process_strip_insar2(
+            with mock.patch.object(strip_insar, "_derive_pair_identity", return_value=("pair", root / "pair")), \
+                mock.patch.object(strip_insar, "_prepare_runtime_inputs", side_effect=fake_prepare), \
+                mock.patch.object(strip_insar, "load_pair_context", return_value=fake_context), \
+                mock.patch.object(strip_insar, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
+                mock.patch.object(strip_insar, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)) as burst_geom, \
+                mock.patch.object(strip_insar, "run_burst_ifg_stage") as burst_ifg:
+                result = strip_insar.process_strip_insar(
                     root / "master.json",
                     root / "slave.json",
                     output_root=root,
@@ -307,11 +307,11 @@ class TopsInsarBackendTests(unittest.TestCase):
 
     def test_burst_merge_refreshes_filtered_interferogram_before_unwrap(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "master.slc")}},
@@ -337,10 +337,10 @@ class TopsInsarBackendTests(unittest.TestCase):
             interferogram = np.exp(1j * np.ones((4, 4), dtype=np.float32)).astype(np.complex64)
             filtered_interferogram = np.exp(1j * np.full((4, 4), 2.0, dtype=np.float32)).astype(np.complex64)
             coherence = np.full((4, 4), 0.8, dtype=np.float32)
-            ifg_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "interferogram", interferogram)
-            filtered_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "filtered_interferogram", filtered_interferogram)
-            coh_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "coherence", coherence)
-            strip_insar2._write_stage_outputs_record(
+            ifg_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "interferogram", interferogram)
+            filtered_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "filtered_interferogram", filtered_interferogram)
+            coh_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "coherence", coherence)
+            strip_insar._write_stage_outputs_record(
                 output_dir=fake_context.pair_dir,
                 stage="p2",
                 master_manifest_path=fake_context.master_manifest_path,
@@ -355,7 +355,7 @@ class TopsInsarBackendTests(unittest.TestCase):
             )
 
             bursts = [
-                strip_insar2.TopsBurstInfo(
+                strip_insar.TopsBurstInfo(
                     burst_index=0,
                     line_offset=0,
                     number_of_lines=2,
@@ -365,7 +365,7 @@ class TopsInsarBackendTests(unittest.TestCase):
                     first_valid_sample=0,
                     num_valid_samples=4,
                 ),
-                strip_insar2.TopsBurstInfo(
+                strip_insar.TopsBurstInfo(
                     burst_index=1,
                     line_offset=2,
                     number_of_lines=2,
@@ -379,8 +379,8 @@ class TopsInsarBackendTests(unittest.TestCase):
             merged_interferogram = np.exp(1j * np.full((4, 4), 3.0, dtype=np.float32)).astype(np.complex64)
             merged_coherence = np.full((4, 4), 0.5, dtype=np.float32)
 
-            with mock.patch.object(strip_insar2, "_merge_tops_burst_interferograms", return_value=(merged_interferogram, merged_coherence)):
-                merge_result, backend, fallback = strip_insar2.run_burst_merge_stage(
+            with mock.patch.object(strip_insar, "_merge_tops_burst_interferograms", return_value=(merged_interferogram, merged_coherence)):
+                merge_result, backend, fallback = strip_insar.run_burst_merge_stage(
                     fake_context,
                     master_bursts=bursts,
                     slave_bursts=bursts,
@@ -396,8 +396,8 @@ class TopsInsarBackendTests(unittest.TestCase):
                 captured["coherence"] = np.asarray(coherence_in).copy()
                 return np.zeros(interferogram_in.shape, dtype=np.float32), None
 
-            with mock.patch.object(strip_insar2, "_unwrap_with_icu_profiles", side_effect=fake_unwrap):
-                unwrap_result, unwrap_backend, unwrap_fallback = strip_insar2.run_unwrap_stage(
+            with mock.patch.object(strip_insar, "_unwrap_with_icu_profiles", side_effect=fake_unwrap):
+                unwrap_result, unwrap_backend, unwrap_fallback = strip_insar.run_unwrap_stage(
                     fake_context,
                     unwrap_method="icu",
                     block_rows=1,
@@ -420,11 +420,11 @@ class TopsInsarBackendTests(unittest.TestCase):
 
     def test_burst_merge_seam_repair_keeps_valid_window_aligned(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "master.slc")}},
@@ -451,11 +451,11 @@ class TopsInsarBackendTests(unittest.TestCase):
             burst_ifg1 = np.full((3, 4), 2.0 + 2.0j, dtype=np.complex64)
             burst_coh0 = np.full((3, 4), 0.9, dtype=np.float32)
             burst_coh1 = np.full((3, 4), 0.8, dtype=np.float32)
-            ifg0_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "burst_000_interferogram", burst_ifg0)
-            ifg1_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "burst_001_interferogram", burst_ifg1)
-            coh0_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "burst_000_coherence", burst_coh0)
-            coh1_path = strip_insar2._save_stage_array(fake_context.pair_dir, "p2", "burst_001_coherence", burst_coh1)
-            strip_insar2._write_stage_outputs_record(
+            ifg0_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "burst_000_interferogram", burst_ifg0)
+            ifg1_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "burst_001_interferogram", burst_ifg1)
+            coh0_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "burst_000_coherence", burst_coh0)
+            coh1_path = strip_insar._save_stage_array(fake_context.pair_dir, "p2", "burst_001_coherence", burst_coh1)
+            strip_insar._write_stage_outputs_record(
                 output_dir=fake_context.pair_dir,
                 stage="p2",
                 master_manifest_path=fake_context.master_manifest_path,
@@ -469,7 +469,7 @@ class TopsInsarBackendTests(unittest.TestCase):
             )
 
             bursts = [
-                strip_insar2.TopsBurstInfo(
+                strip_insar.TopsBurstInfo(
                     burst_index=0,
                     line_offset=0,
                     number_of_lines=6,
@@ -479,7 +479,7 @@ class TopsInsarBackendTests(unittest.TestCase):
                     first_valid_sample=1,
                     num_valid_samples=4,
                 ),
-                strip_insar2.TopsBurstInfo(
+                strip_insar.TopsBurstInfo(
                     burst_index=1,
                     line_offset=5,
                     number_of_lines=6,
@@ -497,8 +497,8 @@ class TopsInsarBackendTests(unittest.TestCase):
             merged_coherence[:3, :] = 0.9
             merged_coherence[5:, :] = 0.8
 
-            with mock.patch.object(strip_insar2, "_merge_tops_burst_interferograms", return_value=(merged_interferogram, merged_coherence)):
-                merge_result, backend, fallback = strip_insar2.run_burst_merge_stage(
+            with mock.patch.object(strip_insar, "_merge_tops_burst_interferograms", return_value=(merged_interferogram, merged_coherence)):
+                merge_result, backend, fallback = strip_insar.run_burst_merge_stage(
                     fake_context,
                     master_bursts=bursts,
                     slave_bursts=bursts,
@@ -517,11 +517,11 @@ class TopsInsarBackendTests(unittest.TestCase):
         self.assertTrue(np.all(np.abs(merged_ifg[3:5, :]) > 0.0))
         self.assertTrue(np.all(merged_coh[3:5, :] > 0.0))
 
-    def test_strip_insar2_tops_mode_skips_esd_for_single_burst(self) -> None:
+    def test_strip_insar_tops_mode_skips_esd_for_single_burst(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
-        burst = strip_insar2.TopsBurstInfo(
+        burst = strip_insar.TopsBurstInfo(
             burst_index=0,
             line_offset=0,
             number_of_lines=2,
@@ -542,7 +542,7 @@ class TopsInsarBackendTests(unittest.TestCase):
                     "effective_master_window": {"row0": 0, "col0": 0, "rows": 2, "cols": 2},
                 }
 
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "m.slc")}},
@@ -564,18 +564,18 @@ class TopsInsarBackendTests(unittest.TestCase):
                 wavelength=0.24,
             )
 
-            with mock.patch.object(strip_insar2, "_derive_pair_identity", return_value=("pair", root / "pair")), \
-                mock.patch.object(strip_insar2, "_prepare_runtime_inputs", side_effect=fake_prepare), \
-                mock.patch.object(strip_insar2, "load_pair_context", return_value=fake_context), \
-                mock.patch.object(strip_insar2, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
-                mock.patch.object(strip_insar2, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_geo2rdr_stage", return_value=({}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_resample_stage", return_value=({"fine_coreg_slave": str(root / "fine.slc")}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_burst_ifg_stage", return_value=({}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_esd_estimation_stage") as esd, \
-                mock.patch.object(strip_insar2, "run_burst_merge_stage", return_value=({}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_unwrap_stage", return_value=({}, "cpu", None)):
-                result = strip_insar2.process_strip_insar2(
+            with mock.patch.object(strip_insar, "_derive_pair_identity", return_value=("pair", root / "pair")), \
+                mock.patch.object(strip_insar, "_prepare_runtime_inputs", side_effect=fake_prepare), \
+                mock.patch.object(strip_insar, "load_pair_context", return_value=fake_context), \
+                mock.patch.object(strip_insar, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
+                mock.patch.object(strip_insar, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_geo2rdr_stage", return_value=({}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_resample_stage", return_value=({"fine_coreg_slave": str(root / "fine.slc")}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_burst_ifg_stage", return_value=({}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_esd_estimation_stage") as esd, \
+                mock.patch.object(strip_insar, "run_burst_merge_stage", return_value=({}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_unwrap_stage", return_value=({}, "cpu", None)):
+                result = strip_insar.process_strip_insar(
                     root / "master.json",
                     root / "slave.json",
                     output_root=root,
@@ -593,13 +593,13 @@ class TopsInsarBackendTests(unittest.TestCase):
 
     def test_run_esd_estimation_stage_uses_spectral_diversity(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pair_dir = root / "pair"
             pair_dir.mkdir(parents=True, exist_ok=True)
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "m.slc")}},
@@ -625,9 +625,9 @@ class TopsInsarBackendTests(unittest.TestCase):
             col_phase = np.arange(cols, dtype=np.float32)[None, :] * 0.1
             interferogram = np.exp(1j * (row_phase + col_phase)).astype(np.complex64)
             coherence = np.full((rows, cols), 0.9, dtype=np.float32)
-            ov_ifg_path = strip_insar2._save_stage_array(pair_dir, "p2", "overlap_000_001_ifg", interferogram)
-            ov_coh_path = strip_insar2._save_stage_array(pair_dir, "p2", "overlap_000_001_coh", coherence)
-            strip_insar2._write_stage_outputs_record(
+            ov_ifg_path = strip_insar._save_stage_array(pair_dir, "p2", "overlap_000_001_ifg", interferogram)
+            ov_coh_path = strip_insar._save_stage_array(pair_dir, "p2", "overlap_000_001_coh", coherence)
+            strip_insar._write_stage_outputs_record(
                 output_dir=pair_dir,
                 stage="p2",
                 master_manifest_path=fake_context.master_manifest_path,
@@ -640,11 +640,11 @@ class TopsInsarBackendTests(unittest.TestCase):
                 processing_options={"range_looks": 1, "azimuth_looks": 1},
             )
             bursts = [
-                strip_insar2.TopsBurstInfo(0, 0, 4, 4, 0, 4, 0, 4),
-                strip_insar2.TopsBurstInfo(1, 2, 4, 4, 0, 4, 0, 4),
+                strip_insar.TopsBurstInfo(0, 0, 4, 4, 0, 4, 0, 4),
+                strip_insar.TopsBurstInfo(1, 2, 4, 4, 0, 4, 0, 4),
             ]
 
-            result, backend, fallback = strip_insar2.run_esd_estimation_stage(
+            result, backend, fallback = strip_insar.run_esd_estimation_stage(
                 fake_context,
                 master_bursts=bursts,
                 slave_bursts=bursts,
@@ -660,11 +660,11 @@ class TopsInsarBackendTests(unittest.TestCase):
         self.assertIsNone(fallback)
         self.assertIn("median_offset_px", result)
 
-    def test_strip_insar2_tops_mode_continues_when_esd_has_no_valid_points(self) -> None:
+    def test_strip_insar_tops_mode_continues_when_esd_has_no_valid_points(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
-        burst0 = strip_insar2.TopsBurstInfo(
+        burst0 = strip_insar.TopsBurstInfo(
             burst_index=0,
             line_offset=0,
             number_of_lines=4,
@@ -674,7 +674,7 @@ class TopsInsarBackendTests(unittest.TestCase):
             first_valid_sample=0,
             num_valid_samples=4,
         )
-        burst1 = strip_insar2.TopsBurstInfo(
+        burst1 = strip_insar.TopsBurstInfo(
             burst_index=1,
             line_offset=2,
             number_of_lines=4,
@@ -696,7 +696,7 @@ class TopsInsarBackendTests(unittest.TestCase):
                     "effective_master_window": {"row0": 0, "col0": 0, "rows": 6, "cols": 4},
                 }
 
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "m.slc")}},
@@ -718,22 +718,22 @@ class TopsInsarBackendTests(unittest.TestCase):
                 wavelength=0.24,
             )
 
-            with mock.patch.object(strip_insar2, "_derive_pair_identity", return_value=("pair", root / "pair")), \
-                mock.patch.object(strip_insar2, "_prepare_runtime_inputs", side_effect=fake_prepare), \
-                mock.patch.object(strip_insar2, "load_pair_context", return_value=fake_context), \
-                mock.patch.object(strip_insar2, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
-                mock.patch.object(strip_insar2, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_geo2rdr_stage", return_value=({}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_resample_stage", return_value=({"fine_coreg_slave": str(root / "fine.slc")}, "cpu", None)), \
-                mock.patch.object(strip_insar2, "run_burst_ifg_stage", return_value=({}, "cpu", None)), \
+            with mock.patch.object(strip_insar, "_derive_pair_identity", return_value=("pair", root / "pair")), \
+                mock.patch.object(strip_insar, "_prepare_runtime_inputs", side_effect=fake_prepare), \
+                mock.patch.object(strip_insar, "load_pair_context", return_value=fake_context), \
+                mock.patch.object(strip_insar, "resolve_manifest_data_path", side_effect=lambda manifest, path: str(path)), \
+                mock.patch.object(strip_insar, "run_tops_burst_geometry_stage", return_value=({"burst_geo2rdr_records": []}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_geo2rdr_stage", return_value=({}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_resample_stage", return_value=({"fine_coreg_slave": str(root / "fine.slc")}, "cpu", None)), \
+                mock.patch.object(strip_insar, "run_burst_ifg_stage", return_value=({}, "cpu", None)), \
                 mock.patch.object(
-                    strip_insar2,
+                    strip_insar,
                     "run_esd_estimation_stage",
                     side_effect=RuntimeError("Coherence threshold too strict. No points left for reliable ESD estimate"),
                 ), \
-                mock.patch.object(strip_insar2, "run_burst_merge_stage", return_value=({}, "cpu", None)) as burst_merge, \
-                mock.patch.object(strip_insar2, "run_unwrap_stage", return_value=({}, "cpu", None)):
-                result = strip_insar2.process_strip_insar2(
+                mock.patch.object(strip_insar, "run_burst_merge_stage", return_value=({}, "cpu", None)) as burst_merge, \
+                mock.patch.object(strip_insar, "run_unwrap_stage", return_value=({}, "cpu", None)):
+                result = strip_insar.process_strip_insar(
                     root / "master.json",
                     root / "slave.json",
                     output_root=root,
@@ -741,7 +741,7 @@ class TopsInsarBackendTests(unittest.TestCase):
                     tops_mode=True,
                     master_bursts=[burst0, burst1],
                     slave_bursts=[burst0, burst1],
-                    overlaps=[strip_insar2.TopsOverlapInfo(previous_burst_index=0, next_burst_index=1, estimated_overlap_lines=2)],
+                    overlaps=[strip_insar.TopsOverlapInfo(previous_burst_index=0, next_burst_index=1, estimated_overlap_lines=2)],
                     stop_after_stage="p3",
                 )
 
@@ -753,7 +753,7 @@ class TopsInsarBackendTests(unittest.TestCase):
 
     def test_snaphu_unwrap_retries_without_row_col_overlap_kwargs(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         calls: list[dict] = []
 
@@ -771,7 +771,7 @@ class TopsInsarBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             scratch = Path(tmp) / "snaphu"
             with mock.patch.dict(sys.modules, {"snaphu": fake_snaphu}):
-                unwrapped = strip_insar2._unwrap_with_snaphu(
+                unwrapped = strip_insar._unwrap_with_snaphu(
                     ifg,
                     coh,
                     scratch,
@@ -788,13 +788,13 @@ class TopsInsarBackendTests(unittest.TestCase):
 
     def test_unwrap_stage_preserves_existing_p3_merge_outputs(self) -> None:
         with mock.patch.dict(sys.modules, {"h5py": types.ModuleType("h5py")}):
-            import strip_insar2
+            import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pair_dir = root / "pair"
             pair_dir.mkdir(parents=True, exist_ok=True)
-            fake_context = strip_insar2.PairContext(
+            fake_context = strip_insar.PairContext(
                 master_manifest_path=root / "master.json",
                 slave_manifest_path=root / "slave.json",
                 master_manifest={"slc": {"path": str(root / "m.slc")}},
@@ -818,9 +818,9 @@ class TopsInsarBackendTests(unittest.TestCase):
 
             merged_ifg = np.exp(1j * np.full((4, 4), 0.5, dtype=np.float32)).astype(np.complex64)
             merged_coh = np.full((4, 4), 0.8, dtype=np.float32)
-            merged_ifg_path = strip_insar2._save_stage_array(pair_dir, "p3", "merged_interferogram", merged_ifg)
-            merged_coh_path = strip_insar2._save_stage_array(pair_dir, "p3", "merged_coherence", merged_coh)
-            strip_insar2._write_stage_outputs_record(
+            merged_ifg_path = strip_insar._save_stage_array(pair_dir, "p3", "merged_interferogram", merged_ifg)
+            merged_coh_path = strip_insar._save_stage_array(pair_dir, "p3", "merged_coherence", merged_coh)
+            strip_insar._write_stage_outputs_record(
                 output_dir=pair_dir,
                 stage="p3",
                 master_manifest_path=fake_context.master_manifest_path,
@@ -834,11 +834,11 @@ class TopsInsarBackendTests(unittest.TestCase):
             )
 
             with mock.patch.object(
-                strip_insar2,
+                strip_insar,
                 "_unwrap_with_icu_profiles",
                 return_value=(np.zeros((4, 4), dtype=np.float32), None),
             ):
-                output_files, backend, fallback = strip_insar2.run_unwrap_stage(
+                output_files, backend, fallback = strip_insar.run_unwrap_stage(
                     fake_context,
                     unwrap_method="icu",
                     block_rows=1,

@@ -17,9 +17,9 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 class StripInsar2IcuTests(unittest.TestCase):
     def test_icu_default_profile_is_conservative(self) -> None:
-        import strip_insar2
+        import strip_insar
 
-        defaults = strip_insar2.ICU_DEFAULTS
+        defaults = strip_insar.ICU_DEFAULTS
 
         self.assertFalse(defaults["use_phase_gradient_neutron"])
         self.assertEqual(defaults["trees_number"], 7)
@@ -33,7 +33,7 @@ class StripInsar2IcuTests(unittest.TestCase):
         self.assertAlmostEqual(defaults["phase_variance_threshold"], 8.0)
 
     def test_icu_output_masks_zero_connected_component_labels(self) -> None:
-        import strip_insar2
+        import strip_insar
 
         class FakeRaster:
             def __init__(self, path, *args, **kwargs):
@@ -59,7 +59,7 @@ class StripInsar2IcuTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(sys.modules, {"isce3": fake_isce3}):
-                result = strip_insar2._unwrap_with_icu(
+                result = strip_insar._unwrap_with_icu(
                     np.ones((2, 2), dtype=np.complex64),
                     np.ones((2, 2), dtype=np.float32),
                     Path(tmp),
@@ -72,11 +72,11 @@ class StripInsar2IcuTests(unittest.TestCase):
         self.assertTrue(np.isnan(result[1, 1]))
 
     def test_run_unwrap_stage_uses_dolphin_without_logger_name_error(self) -> None:
-        import strip_insar2
+        import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             pair_dir = Path(tmp)
-            context = strip_insar2.PairContext(
+            context = strip_insar.PairContext(
                 master_manifest_path=pair_dir / "master.json",
                 slave_manifest_path=pair_dir / "slave.json",
                 master_manifest={},
@@ -115,12 +115,12 @@ class StripInsar2IcuTests(unittest.TestCase):
                     }
                 return None
 
-            with mock.patch.object(strip_insar2, "load_stage_record", side_effect=fake_load_stage_record), \
-                mock.patch.object(strip_insar2, "success_marker_path", return_value=pair_dir / "missing.ok"), \
-                mock.patch.object(strip_insar2, "mark_stage_success"), \
-                mock.patch.object(strip_insar2, "write_stage_record"), \
-                mock.patch.object(strip_insar2, "_unwrap_with_dolphin", return_value=(np.zeros((2, 2), dtype=np.float32), None)):
-                outputs, backend, fallback = strip_insar2.run_unwrap_stage(
+            with mock.patch.object(strip_insar, "load_stage_record", side_effect=fake_load_stage_record), \
+                mock.patch.object(strip_insar, "success_marker_path", return_value=pair_dir / "missing.ok"), \
+                mock.patch.object(strip_insar, "mark_stage_success"), \
+                mock.patch.object(strip_insar, "write_stage_record"), \
+                mock.patch.object(strip_insar, "_unwrap_with_dolphin", return_value=(np.zeros((2, 2), dtype=np.float32), None)):
+                outputs, backend, fallback = strip_insar.run_unwrap_stage(
                     context,
                     unwrap_method="snaphu",
                     block_rows=10,

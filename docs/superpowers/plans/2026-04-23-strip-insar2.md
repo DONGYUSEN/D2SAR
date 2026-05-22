@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a stable `strip_insar2.py` that uses a NISAR-style strip InSAR stage flow on top of manifest-based strip inputs, with GPU-first stage execution, CPU fallback, named single-product HDF5 output, and GeoTIFF/PNG/KML exports.
+**Goal:** Build a stable `strip_insar.py` that uses a NISAR-style strip InSAR stage flow on top of manifest-based strip inputs, with GPU-first stage execution, CPU fallback, named single-product HDF5 output, and GeoTIFF/PNG/KML exports.
 
 **Architecture:** Keep manifest parsing and product naming in a new orchestration layer, reuse stable strip-side implementations for stage internals, and push image export/KML generation into a separate helper module. Stages fall back independently from GPU to CPU rather than downgrading the whole pipeline at once.
 
@@ -13,7 +13,7 @@
 ### Task 1: Build Naming And Orchestration Tests
 
 **Files:**
-- Create: `tests/test_strip_insar2.py`
+- Create: `tests/test_strip_insar.py`
 
 - [ ] **Step 1: Write failing tests for pair naming, KML, and fallback**
 
@@ -25,8 +25,8 @@ class StripInsar2FallbackTests(unittest.TestCase):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m unittest -v tests/test_strip_insar2.py`
-Expected: import or behavior failures because `strip_insar2.py` does not exist yet
+Run: `python3 -m unittest -v tests/test_strip_insar.py`
+Expected: import or behavior failures because `strip_insar.py` does not exist yet
 
 - [ ] **Step 3: Implement minimal test scaffolding**
 
@@ -37,14 +37,14 @@ if "h5py" not in sys.modules:
 
 - [ ] **Step 4: Re-run test to confirm targeted failures remain**
 
-Run: `python3 -m unittest -v tests/test_strip_insar2.py`
-Expected: failures now point at missing strip_insar2 functionality instead of environment setup
+Run: `python3 -m unittest -v tests/test_strip_insar.py`
+Expected: failures now point at missing strip_insar functionality instead of environment setup
 
 ### Task 2: Create Export And KML Helpers
 
 **Files:**
-- Create: `scripts/strip_insar2_export.py`
-- Test: `tests/test_strip_insar2.py`
+- Create: `scripts/strip_insar_export.py`
+- Test: `tests/test_strip_insar.py`
 
 - [ ] **Step 1: Implement wrapped/scalar export helper**
 
@@ -62,14 +62,14 @@ def write_ground_overlay_kml_from_geotiff(*, tif_path, image_path, output_kml, o
 
 - [ ] **Step 3: Run focused tests**
 
-Run: `python3 -m unittest -v tests/test_strip_insar2.py`
+Run: `python3 -m unittest -v tests/test_strip_insar.py`
 Expected: KML-related tests pass, orchestration tests still fail
 
 ### Task 3: Implement Strip Insar2 Orchestrator
 
 **Files:**
-- Create: `scripts/strip_insar2.py`
-- Test: `tests/test_strip_insar2.py`
+- Create: `scripts/strip_insar.py`
+- Test: `tests/test_strip_insar.py`
 
 - [ ] **Step 1: Implement pair context and naming helpers**
 
@@ -91,21 +91,21 @@ def run_stage_with_fallback(*, stage_name, gpu_mode, gpu_id, gpu_runner, cpu_run
 - [ ] **Step 3: Implement stage wrappers and main process function**
 
 ```python
-def process_strip_insar2(master_manifest_path, slave_manifest_path, *, output_root="results", ...):
+def process_strip_insar(master_manifest_path, slave_manifest_path, *, output_root="results", ...):
     ...
 ```
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `python3 -m unittest -v tests/test_strip_insar2.py`
+Run: `python3 -m unittest -v tests/test_strip_insar.py`
 Expected: all tests pass
 
 ### Task 4: Verify And Extend
 
 **Files:**
-- Modify: `scripts/strip_insar2.py`
-- Modify: `scripts/strip_insar2_export.py`
-- Test: `tests/test_strip_insar2.py`
+- Modify: `scripts/strip_insar.py`
+- Modify: `scripts/strip_insar_export.py`
+- Test: `tests/test_strip_insar.py`
 
 - [ ] **Step 1: Verify stage record writing for p5/p6**
 
@@ -116,7 +116,7 @@ def _write_custom_stage_record(...):
 
 - [ ] **Step 2: Re-run tests after record-handling fixes**
 
-Run: `python3 -m unittest -v tests/test_strip_insar2.py`
+Run: `python3 -m unittest -v tests/test_strip_insar.py`
 Expected: pass
 
 - [ ] **Step 3: Extend later with real NISAR module substitution**

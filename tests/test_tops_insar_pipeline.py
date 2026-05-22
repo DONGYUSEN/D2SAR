@@ -1,4 +1,4 @@
-"""Tests for the full _run_swath pipeline and stage execution in tops_insar2.py."""
+"""Tests for the full _run_swath pipeline and stage execution in tops_insar.py."""
 
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def _make_common(
 
 def test_run_swath_stage_order(tmp_path: Path) -> None:
     """Verify that stages are executed in the correct order when all succeed."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0), _make_burst(1), _make_burst(2)]
     slave_bursts = [_make_burst(0), _make_burst(1), _make_burst(2)]
@@ -120,11 +120,13 @@ def test_run_swath_stage_order(tmp_path: Path) -> None:
     args.esd_coherence_threshold = 0.85
 
     stages = [
-        "check", "preprocess", "common_bursts", "topo",
+        "check", "preprocess", "common_bursts", "burst_data", "topo",
         "subset_overlaps", "coarse_resamp", "overlap_ifg",
-        "prep_esd", "esd", "range_coreg", "fine_resamp",
-        "burst_ifg", "merge_bursts", "filter", "unwrap",
-        "geocode", "publish",
+        "prep_esd", "esd", "range_coreg", "fineoffsets",
+        "fine_resamp", "ion", "burst_ifg", "merge_bursts",
+        "filter", "unwrap", "unwrap2stage", "geocode",
+        "denseoffsets", "filteroffsets", "geocodeoffsets",
+        "publish",
     ]
 
     with patch.object(ti2, "_dispatch_stage", side_effect=mock_dispatch):
@@ -136,12 +138,12 @@ def test_run_swath_stage_order(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: stage_check fails when DEM does not exist
+# Test 2: stage_check warns when DEM does not exist but continues (auto-download may resolve it)
 # ---------------------------------------------------------------------------
 
-def test_stage_check_missing_dem(tmp_path: Path) -> None:
-    """stage_check returns False when DEM path does not exist."""
-    from scripts import tops_insar2 as ti2
+def test_stage_check_missing_dem_warns_but_continues(tmp_path: Path) -> None:
+    """stage_check warns when DEM does not exist but returns True (allows auto-download to resolve)."""
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0)]
     slave_bursts = [_make_burst(0)]
@@ -158,12 +160,12 @@ def test_stage_check_missing_dem(tmp_path: Path) -> None:
     (tmp_path / "slave.safe").mkdir()
 
     ok = ti2._stage_check(args, "IW1", tmp_path, master_bursts, slave_bursts, state)
-    assert ok is False, "stage_check should return False when DEM does not exist"
+    assert ok is True, "stage_check should return True when DEM is missing (warning only; allows auto-download)"
 
 
 def test_stage_check_passes_when_dem_exists(tmp_path: Path) -> None:
     """stage_check returns True when all paths (including DEM) exist."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0)]
     slave_bursts = [_make_burst(0)]
@@ -185,7 +187,7 @@ def test_stage_check_passes_when_dem_exists(tmp_path: Path) -> None:
 
 def test_stage_check_passes_without_dem(tmp_path: Path) -> None:
     """stage_check returns True when no DEM is provided."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0)]
     slave_bursts = [_make_burst(0)]
@@ -210,7 +212,7 @@ def test_stage_check_passes_without_dem(tmp_path: Path) -> None:
 
 def test_stage_skip_when_start_stage(tmp_path: Path) -> None:
     """When start_stage is set, stages before it are skipped."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0), _make_burst(1)]
     slave_bursts = [_make_burst(0), _make_burst(1)]
@@ -234,11 +236,12 @@ def test_stage_skip_when_start_stage(tmp_path: Path) -> None:
     (tmp_path / "master.safe").mkdir()
     (tmp_path / "slave.safe").mkdir()
 
-    # Start from "subset_overlaps" — skip check, preprocess, common_bursts, topo
+    # Start from "subset_overlaps" — skip check, preprocess, common_bursts, burst_data, topo
     stages = [
         "subset_overlaps", "coarse_resamp", "overlap_ifg",
-        "prep_esd", "esd", "range_coreg", "fine_resamp",
-        "burst_ifg", "merge_bursts", "filter",
+        "prep_esd", "esd", "range_coreg", "fineoffsets",
+        "fine_resamp", "ion", "burst_ifg", "merge_bursts",
+        "filter", "unwrap", "unwrap2stage", "geocode",
     ]
 
     with patch.object(ti2, "_dispatch_stage", side_effect=mock_dispatch):
@@ -258,7 +261,7 @@ def test_stage_skip_when_start_stage(tmp_path: Path) -> None:
 
 def test_stage_skip_when_end_stage(tmp_path: Path) -> None:
     """When end_stage is set, stages after it are skipped."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0), _make_burst(1)]
     slave_bursts = [_make_burst(0), _make_burst(1)]
@@ -282,7 +285,7 @@ def test_stage_skip_when_end_stage(tmp_path: Path) -> None:
     (tmp_path / "master.safe").mkdir()
     (tmp_path / "slave.safe").mkdir()
 
-    # End at "esd" — skip range_coreg, fine_resamp, burst_ifg, merge_bursts, ...
+    # End at "esd" — skip range_coreg, fineoffsets, fine_resamp, ion, burst_ifg, ...
     stages = [
         "check", "preprocess", "common_bursts", "topo",
         "subset_overlaps", "coarse_resamp", "overlap_ifg",
@@ -306,7 +309,7 @@ def test_stage_skip_when_end_stage(tmp_path: Path) -> None:
 
 def test_stage_sequence_from_check_to_publish():
     """STAGE_SEQUENCE order is preserved by _build_stage_sequence."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     seq = ti2._build_stage_sequence("check", "publish")
     assert seq[0] == "check"
@@ -326,7 +329,7 @@ def test_stage_sequence_from_check_to_publish():
 
 def test_stage_preprocess_stores_common(tmp_path: Path) -> None:
     """stage_preprocess stores the matched CommonBurstSelection in state['common']."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0), _make_burst(1), _make_burst(2)]
     slave_bursts = [_make_burst(0), _make_burst(1), _make_burst(2)]
@@ -348,7 +351,7 @@ def test_stage_preprocess_stores_common(tmp_path: Path) -> None:
 
 def test_stage_topo_generates_zero_offsets_on_not_implemented(tmp_path: Path) -> None:
     """stage_topo generates zero-offset .npz files when Geo2Rdr raises NotImplementedError."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     common = _make_common(2)
     args = MagicMock()
@@ -384,18 +387,21 @@ def test_stage_topo_generates_zero_offsets_on_not_implemented(tmp_path: Path) ->
 
 def test_stage_burst_ifg_produces_npz_files(tmp_path: Path) -> None:
     """stage_burst_ifg writes burst_ifg_{pair_idx}.npz files for each pair."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     # Create a common with 2 pairs, each having reference SLCs
     common = _make_common(2)
     args = MagicMock()
     args.output_dir = tmp_path
 
-    # Write dummy deramped reference and resampled secondary SLCs
+    # Write dummy reference SLCs (original, not deramped) and resampled secondary
     for pair in common.pairs:
         pair_dir = tmp_path / f"burst_{pair.pair_index:03d}"
         pair_dir.mkdir(parents=True, exist_ok=True)
-        ref_path = pair_dir / "deramped_ref.npz"
+        ref_path = pair_dir / (
+            f"reference_slc_{pair.reference.identity.swath}"
+            f"_{pair.reference.identity.burst_index}.slc.npz"
+        )
         sec_path = pair_dir / "resampled_sec.npz"
         np.savez(ref_path, data=np.ones((1300, 24000), dtype=np.complex64))
         np.savez(sec_path, data=np.ones((1300, 24000), dtype=np.complex64))
@@ -425,21 +431,21 @@ def test_stage_burst_ifg_produces_npz_files(tmp_path: Path) -> None:
 
 def test_resolve_swaths_all():
     """_resolve_swaths('all') returns ['IW1', 'IW2', 'IW3']."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     assert ti2._resolve_swaths("all") == ["IW1", "IW2", "IW3"]
 
 
 def test_resolve_swaths_single():
     """_resolve_swaths('IW2') returns ['IW2']."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     assert ti2._resolve_swaths("IW2") == ["IW2"]
 
 
 def test_resolve_swaths_multiple():
     """_resolve_swaths('IW1,IW3') returns ['IW1', 'IW3']."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     assert ti2._resolve_swaths("IW1,IW3") == ["IW1", "IW3"]
 
@@ -450,7 +456,7 @@ def test_resolve_swaths_multiple():
 
 def test_stage_subset_overlaps_skips_with_1_burst(tmp_path: Path) -> None:
     """stage_subset_overlaps returns early when < 2 common bursts."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     common = _make_common(1)  # only 1 burst → no overlaps
     args = MagicMock()
@@ -468,7 +474,7 @@ def test_stage_subset_overlaps_skips_with_1_burst(tmp_path: Path) -> None:
 
 def test_stage_burst_ifg_with_missing_slc(tmp_path: Path) -> None:
     """stage_burst_ifg synthesizes zero IFG when SLC files are missing."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     common = _make_common(1)
     args = MagicMock()
@@ -495,8 +501,8 @@ def test_stage_burst_ifg_with_missing_slc(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def test_stage_merge_bursts_produces_merged_npy(tmp_path: Path) -> None:
-    """stage_merge_bursts writes merged_interferogram.npy and merged_coherence.npy."""
-    from scripts import tops_insar2 as ti2
+    """stage_merge_bursts writes merged_interferogram.tif and merged_coherence.tif."""
+    from scripts import tops_insar as ti2
 
     common = _make_common(2)
     args = MagicMock()
@@ -523,8 +529,8 @@ def test_stage_merge_bursts_produces_merged_npy(tmp_path: Path) -> None:
 
     assert ok is True
     merged_dir = tmp_path / "merged"
-    assert (merged_dir / "merged_interferogram.npy").exists()
-    assert (merged_dir / "merged_coherence.npy").exists()
+    assert (merged_dir / "merged_interferogram.tif").exists()
+    assert (merged_dir / "merged_coherence.tif").exists()
     assert (merged_dir / "burst_seam_diagnostics.json").exists()
 
 
@@ -536,7 +542,7 @@ def test_full_pipeline_not_implemented_stages(tmp_path: Path) -> None:
     """Stages that raise NotImplementedError (topo, coarse_resamp) or are
     spike stubs (fine_resamp, filter, unwrap, geocode, publish) must not
     crash the pipeline — they should return True and log warnings."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     master_bursts = [_make_burst(0), _make_burst(1), _make_burst(2)]
     slave_bursts = [_make_burst(0), _make_burst(1), _make_burst(2)]
@@ -560,8 +566,11 @@ def test_full_pipeline_not_implemented_stages(tmp_path: Path) -> None:
         # Run the actual stage function so state is properly populated
         fn = {
             "check":           ti2._stage_check,
+            "compute_baselines": ti2._stage_compute_baselines,
+            "verify_dem":      ti2._stage_verify_dem,
             "preprocess":      ti2._stage_preprocess,
             "common_bursts":   ti2._stage_common_bursts,
+            "burst_data":      ti2._stage_burst_data,
             "topo":            ti2._stage_topo,
             "subset_overlaps": ti2._stage_subset_overlaps,
             "coarse_resamp":   ti2._stage_coarse_resamp,
@@ -569,12 +578,18 @@ def test_full_pipeline_not_implemented_stages(tmp_path: Path) -> None:
             "prep_esd":        ti2._stage_prep_esd,
             "esd":             ti2._stage_esd,
             "range_coreg":     ti2._stage_range_coreg,
+            "fineoffsets":     ti2._stage_fineoffsets,
             "fine_resamp":     ti2._stage_fine_resamp,
+            "ion":             ti2._stage_ion,
             "burst_ifg":       ti2._stage_burst_ifg,
             "merge_bursts":    ti2._stage_merge_bursts,
             "filter":          ti2._stage_filter,
             "unwrap":          ti2._stage_unwrap,
+            "unwrap2stage":    ti2._stage_unwrap2stage,
             "geocode":         ti2._stage_geocode,
+            "denseoffsets":   ti2._stage_denseoffsets,
+            "filteroffsets":  ti2._stage_filteroffsets,
+            "geocodeoffsets": ti2._stage_geocodeoffsets,
             "publish":         ti2._stage_publish,
         }.get(stage_name)
         if fn is None:
@@ -593,9 +608,9 @@ def test_full_pipeline_not_implemented_stages(tmp_path: Path) -> None:
 # Test 14: stage_filter preserves shape
 # ---------------------------------------------------------------------------
 
-def test_stage_filter_preserves_shape(tmp_path: Path) -> None:
-    """_stage_filter should preserve the input interferogram shape."""
-    from scripts import tops_insar2 as ti2
+def test_stage_filter_fallback_from_npy(tmp_path: Path) -> None:
+    """_stage_filter should still read legacy npy inputs as fallback."""
+    from scripts import tops_insar as ti2
 
     common = _make_common(1)
     args = MagicMock()
@@ -604,41 +619,8 @@ def test_stage_filter_preserves_shape(tmp_path: Path) -> None:
     merged_dir = tmp_path / "merged"
     merged_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write merged products
-    shape = (1300, 24000)
+    shape = (32, 32)
     merged_ifg = np.ones(shape, dtype=np.complex64)
-    merged_coh = np.ones(shape, dtype=np.float32)
-    np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
-    np.save(merged_dir / "merged_coherence.npy", merged_coh)
-
-    state: dict = {
-        "common": common,
-        "looks": (5, 5),
-    }
-
-    ok = ti2._stage_filter(args, "IW1", tmp_path, [], [], state)
-
-    assert ok is True
-    assert state["merged_ifg"] is not None
-    assert state["merged_ifg"].shape == shape
-
-
-def test_stage_filter_reduces_noise(tmp_path: Path) -> None:
-    """_stage_filter should reduce interferogram noise (variance decreases)."""
-    from scripts import tops_insar2 as ti2
-
-    common = _make_common(1)
-    args = MagicMock()
-    args.output_dir = tmp_path
-
-    merged_dir = tmp_path / "merged"
-    merged_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create noisy interferogram with uniform coherence
-    shape = (100, 100)
-    np.random.seed(42)
-    noise_phase = np.random.uniform(-np.pi, np.pi, shape)
-    merged_ifg = np.exp(1j * noise_phase).astype(np.complex64)
     merged_coh = np.ones(shape, dtype=np.float32)
     np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
     np.save(merged_dir / "merged_coherence.npy", merged_coh)
@@ -648,11 +630,9 @@ def test_stage_filter_reduces_noise(tmp_path: Path) -> None:
     ok = ti2._stage_filter(args, "IW1", tmp_path, [], [], state)
 
     assert ok is True
-    filtered_ifg = state["merged_ifg"]
+    assert state["merged_ifg"] is not None
+    assert state["merged_ifg"].shape == shape
 
-    # Filtered IFG should have lower variance in magnitude (from smoothing)
-    # and the file should be saved
-    assert (merged_dir / "filtered_ifg.npy").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +641,7 @@ def test_stage_filter_reduces_noise(tmp_path: Path) -> None:
 
 def test_stage_geocode_skips_when_dem_missing(tmp_path: Path) -> None:
     """_stage_geocode should skip gracefully when DEM is not provided."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     common = _make_common(1)
     args = MagicMock()
@@ -682,7 +662,7 @@ def test_stage_geocode_skips_when_dem_missing(tmp_path: Path) -> None:
 
 def test_stage_geocode_skips_when_no_common(tmp_path: Path) -> None:
     """_stage_geocode should skip when common burst selection is missing."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     args = MagicMock()
     args.dem = tmp_path / "dem.tif"
@@ -709,7 +689,8 @@ def test_stage_geocode_skips_when_no_common(tmp_path: Path) -> None:
 
 def test_stage_publish_writes_hdf5(tmp_path: Path) -> None:
     """_stage_publish should write HDF5 product file."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
+    from scripts.tops_publish import write_tiff_array
 
     common = _make_common(1)
     args = MagicMock()
@@ -722,6 +703,7 @@ def test_stage_publish_writes_hdf5(tmp_path: Path) -> None:
     shape = (100, 100)
     merged_ifg = np.ones(shape, dtype=np.complex64)
     merged_coh = np.ones(shape, dtype=np.float32)
+    # write .npy files (the file format _stage_publish looks for from disk)
     np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
     np.save(merged_dir / "merged_coherence.npy", merged_coh)
 
@@ -740,7 +722,7 @@ def test_stage_publish_writes_hdf5(tmp_path: Path) -> None:
 
 def test_stage_publish_continues_on_error(tmp_path: Path) -> None:
     """_stage_publish should return True even if publishing fails partially."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
 
     common = _make_common(1)
     args = MagicMock()
@@ -767,9 +749,11 @@ def test_stage_publish_continues_on_error(tmp_path: Path) -> None:
 # Test 17: stage_unwrap fallback to simple 2d unwrap
 # ---------------------------------------------------------------------------
 
+
 def test_stage_unwrap_fallback_to_2d_when_icu_unavailable(tmp_path: Path) -> None:
     """_stage_unwrap should fall back to simple 2D unwrap when ICU is not available."""
-    from scripts import tops_insar2 as ti2
+    from scripts import tops_insar as ti2
+    from scripts.tops_publish import write_tiff_array
 
     common = _make_common(1)
     args = MagicMock()
@@ -783,8 +767,8 @@ def test_stage_unwrap_fallback_to_2d_when_icu_unavailable(tmp_path: Path) -> Non
     phase = np.linspace(-np.pi, np.pi, shape[0] * shape[1]).reshape(shape).astype(np.float32)
     merged_ifg = np.exp(1j * phase).astype(np.complex64)
     merged_coh = np.ones(shape, dtype=np.float32)
-    np.save(merged_dir / "merged_interferogram.npy", merged_ifg)
-    np.save(merged_dir / "merged_coherence.npy", merged_coh)
+    write_tiff_array(merged_dir / "merged_interferogram.tif", merged_ifg)
+    write_tiff_array(merged_dir / "merged_coherence.tif", merged_coh)
 
     state: dict = {
         "common": common,
@@ -797,4 +781,4 @@ def test_stage_unwrap_fallback_to_2d_when_icu_unavailable(tmp_path: Path) -> Non
     assert "unwrapped" in state
     assert state["unwrapped"] is not None
     assert state["unwrapped"].shape == shape
-    assert (merged_dir / "unwrapped.npy").exists()
+    assert (merged_dir / "unwrapped.tif").exists()

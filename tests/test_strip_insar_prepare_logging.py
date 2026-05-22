@@ -13,9 +13,9 @@ if str(SCRIPTS) not in sys.path:
 
 class StripInsar2PrepareLoggingTests(unittest.TestCase):
     def test_normalize_start_message_mentions_prf_difference_before_normal(self):
-        import strip_insar2
+        import strip_insar
 
-        message = strip_insar2._format_normalize_start_message(
+        message = strip_insar._format_normalize_start_message(
             {
                 "checks": {
                     "prf": {"severity": "warn"},
@@ -34,7 +34,7 @@ class StripInsar2PrepareLoggingTests(unittest.TestCase):
         self.assertIn("同步修改 acquisition/radargrid/doppler JSON", message)
 
     def test_runtime_prepare_runs_for_full_scene_without_window(self):
-        import strip_insar2
+        import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -126,7 +126,7 @@ class StripInsar2PrepareLoggingTests(unittest.TestCase):
 
             insar_preprocess._resample_slave_slc = fake_resample
             try:
-                prepared = strip_insar2._prepare_runtime_inputs(
+                prepared = strip_insar._prepare_runtime_inputs(
                     master_manifest_path=master,
                     slave_manifest_path=slave,
                     pair_dir=pair_dir,

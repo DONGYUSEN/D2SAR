@@ -13,6 +13,10 @@ Key invariants enforced here
 * The ``index`` field found in annotation XML is normalised to 0-based
   ``burst_index`` before being stored in ``BurstIdentity``.
 
+Supports BOTH formats of ``manifest.safe``:
+  - XML (standard ESA SAFE format, e.g. S1A IW SLC products)
+  - JSON (alternate format used by some processors)
+
 No external dependencies beyond stdlib and ``scripts/tops_model``.
 """
 
@@ -24,7 +28,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 from scripts.tops_model import (
     BurstIdentity,
@@ -121,7 +125,11 @@ def _load_manifest(
     archive_type: str,  # "zip" | "tar" | "dir"
     archive_path: Path,
 ) -> Dict[str, Any]:
-    """Load and parse ``manifest.safe`` JSON into a dict.
+    """Load and parse ``manifest.safe`` into a dict.
+
+    Supports both JSON and XML formats:
+    - JSON: alternate manifest format from some processors
+    - XML: standard ESA SAFE manifest.safe format
 
     Parameters
     ----------
@@ -131,10 +139,11 @@ def _load_manifest(
     """
     del root  # unused for archives
     manifest_path = "manifest.safe"
+
+    # Read raw bytes from the appropriate source
     if archive_type == "zip":
         with zipfile.ZipFile(archive_path) as zf:
-            with zf.open(manifest_path) as fh:
-                return json.loads(fh.read())
+            raw = zf.read(manifest_path)
     elif archive_type == "tar":
         with tarfile.open(archive_path) as tf:
             member = tf.getmember(manifest_path)
@@ -143,12 +152,76 @@ def _load_manifest(
                 raise FileNotFoundError(
                     f"Cannot extract manifest {manifest_path!r} from {archive_path}"
                 )
-            with extracted as fh:
-                return json.loads(fh.read())
+            raw = extracted.read()
     else:
         # directory
         manifest_file = archive_path / manifest_path
-        return json.loads(manifest_file.read_text(encoding="utf-8"))
+        raw = manifest_file.read_bytes()
+
+    # Try JSON first, fall back to XML
+    text = raw.decode("utf-8").strip()
+    if text.startswith("<?xml") or text.startswith("<"):
+        return _parse_xml_manifest(raw)
+    else:
+        return json.loads(text)
+
+
+def _parse_xml_manifest(raw: bytes) -> Dict[str, Any]:
+    """Parse ESA-style XML manifest.safe into a JSON-compatible dict.
+
+    Extracts the annotation file paths for each IW swath (VH and VV polarizations)
+    and structures them like the JSON manifest format expected by the pipeline.
+
+    The standard ESA manifest.safe uses XML with XFDU structure. Annotation files
+    are referenced via <fileLocation> elements within <dataObject> elements.
+    """
+    root = ET.fromstring(raw)
+    NS = {"xfdu": "urn:ccsds:schema:xfdu:1", "safe": "http://www.esa.int/safe/sentinel-1.0"}
+
+    result: Dict[str, Any] = {"acquisition": {"iw": []}}
+
+    # Iterate through all fileLocation elements in the manifest
+    for elem in root.iter():
+        tag_local = elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
+        if tag_local != "fileLocation":
+            continue
+
+        href = elem.get("href", "")
+        # Only care about annotation XML files (not calibration, noise, rfi)
+        if not href.endswith(".xml") or "/calibration/" in href or "/noise-" in href or "/rfi-" in href:
+            continue
+
+        # Parse path like: ./annotation/s1a-iw1-slc-vv-20230625t114146-...xml
+        filename = href.lstrip("./").lstrip("/")
+        if not filename.startswith("annotation/"):
+            continue
+
+        # Extract swath and polarization from filename pattern
+        # Pattern: s1a-iw{N}-slc-{POL}-YYYYMMDDTHHMMSS-...xml
+        parts = Path(filename).stem.split("-")
+        swath = None
+        pol = None
+        for part in parts:
+            low = part.lower()
+            if low.startswith("iw") and len(low) == 3 and low[2] in "123":
+                swath = "IW" + low[2]
+            elif low in ("vv", "vh", "hh", "hv"):
+                pol = low.upper()
+
+        if swath and pol:
+            # Find or create entry for this swath+pol
+            iw_list: List[Dict[str, Any]] = result["acquisition"]["iw"]
+            entry = None
+            for e in iw_list:
+                if e.get("swath") == swath and e.get("polarisation", "").upper() == pol:
+                    entry = e
+                    break
+            if entry is None:
+                entry = {"swath": swath, "polarisation": pol, "annotation": ""}
+                iw_list.append(entry)
+            entry["annotation"] = filename
+
+    return result
 
 
 def _iw_annotation_xmls(

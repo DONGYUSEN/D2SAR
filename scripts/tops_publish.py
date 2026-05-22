@@ -11,8 +11,11 @@ __all__ = [
     "unwrap_ifg",
     "write_hdf5_product",
     "write_product",
+    "write_tiff_array",
+    "read_tiff_array",
 ]
 
+import colorsys
 import json
 import logging
 import shutil
@@ -28,9 +31,68 @@ from scripts.tops_model import BurstRadarGrid, BurstWindow
 log = logging.getLogger(__name__)
 
 
+def write_tiff_array(path: Path, data: np.ndarray) -> Path:
+    try:
+        from osgeo import gdal
+    except ImportError as exc:
+        raise NotImplementedError("GDAL required for TIFF I/O") from exc
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    driver = gdal.GetDriverByName("GTiff")
+    if np.iscomplexobj(data):
+        ds = driver.Create(str(path), data.shape[1], data.shape[0], 2, gdal.GDT_Float32, options=["TILED=YES", "COMPRESS=DEFLATE"])
+        ds.GetRasterBand(1).WriteArray(np.real(data).astype(np.float32))
+        ds.GetRasterBand(2).WriteArray(np.imag(data).astype(np.float32))
+    else:
+        ds = driver.Create(str(path), data.shape[1], data.shape[0], 1, gdal.GDT_Float32, options=["TILED=YES", "COMPRESS=DEFLATE"])
+        ds.GetRasterBand(1).WriteArray(np.asarray(data, dtype=np.float32))
+    ds = None
+    return path
+
+
+def read_tiff_array(path: Path) -> np.ndarray:
+    try:
+        from osgeo import gdal
+    except ImportError as exc:
+        raise NotImplementedError("GDAL required for TIFF I/O") from exc
+    ds = gdal.Open(str(path))
+    if ds is None:
+        raise FileNotFoundError(path)
+    if ds.RasterCount == 2:
+        return ds.GetRasterBand(1).ReadAsArray().astype(np.float32) + 1j * ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
+    return ds.ReadAsArray().astype(np.float32)
+
+
+def _phase_to_color_rgba(merged_ifg: np.ndarray, merged_coh: np.ndarray | None = None) -> np.ndarray:
+    """Convert wrapped interferogram to RGBA PNG data.
+
+    Invalid pixels (NaN phase or non-positive/invalid coherence) become fully
+    transparent. Valid phase pixels are colorized in HSV space.
+    """
+    phase = np.angle(merged_ifg).astype(np.float64)
+    rgba = np.zeros((*phase.shape, 4), dtype=np.uint8)
+
+    valid = np.isfinite(phase)
+    if merged_coh is not None:
+        valid &= np.isfinite(merged_coh) & (merged_coh > 0.0)
+
+    if np.any(valid):
+        hue = (phase[valid] + np.pi) / (2.0 * np.pi)
+        sat = np.ones_like(hue)
+        val = np.full_like(hue, 1.0)
+        rgb = np.array(
+            [colorsys.hsv_to_rgb(float(h), float(s), float(v)) for h, s, v in zip(hue, sat, val, strict=False)],
+            dtype=np.float64,
+        )
+        rgba[valid, :3] = (rgb * 255.0).astype(np.uint8)
+        rgba[valid, 3] = 255
+    return rgba
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _write_raster(
     driver,
@@ -40,6 +102,8 @@ def _write_raster(
     projection: str,
 ) -> None:
     """Write a 2-D float32 array as a GDAL raster (noData=0.0)."""
+    from osgeo import gdal
+
     h, w = data.shape
     ds = driver.Create(
         path, w, h, 1, gdal.GDT_Float32,
@@ -186,36 +250,311 @@ def geocode_ifg(
 # Phase unwrapping
 # ---------------------------------------------------------------------------
 
+# ICU defaults matching strip_insar2.py ICU_DEFAULTS
+ICU_DEFAULTS = {
+    "buffer_lines": 3700,
+    "overlap_lines": 200,
+    "use_phase_gradient_neutron": False,
+    "use_intensity_neutron": False,
+    "phase_gradient_window_size": 5,
+    "neutron_phase_gradient_threshold": 3.0,
+    "neutron_intensity_threshold": 8.0,
+    "max_intensity_correlation_threshold": 0.8,
+    "trees_number": 7,
+    "max_branch_length": 64,
+    "pixel_spacing_ratio": 1.0,
+    "initial_correlation_threshold": 0.1,
+    "max_correlation_threshold": 0.9,
+    "correlation_threshold_increments": 0.1,
+    "min_tile_area": 0.003125,
+    "bootstrap_lines": 16,
+    "min_overlap_area": 16,
+    "phase_variance_threshold": 8.0,
+}
+
+# Relaxed ICU params for retry on low valid fraction
+ICU_RELAXED_OVERRIDES = {
+    "overlap_lines": 400,
+    "use_phase_gradient_neutron": True,
+    "phase_gradient_window_size": 7,
+    "neutron_phase_gradient_threshold": 1.5,
+    "trees_number": 12,
+    "max_branch_length": 128,
+    "initial_correlation_threshold": 0.015,
+    "max_correlation_threshold": 0.55,
+    "correlation_threshold_increments": 0.03,
+    "min_tile_area": 0.0005,
+    "bootstrap_lines": 12,
+    "min_overlap_area": 8,
+    "phase_variance_threshold": 15.0,
+}
+
+ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY = 0.01
+
+
+def _build_icu(config: dict | None = None):
+    """Build isce3.unwrap.ICU with config overrides."""
+    import isce3.unwrap
+
+    cfg = dict(ICU_DEFAULTS)
+    if config:
+        cfg.update(config)
+    unw = isce3.unwrap.ICU()
+    unw.corr_incr_thr = cfg["correlation_threshold_increments"]
+    unw.buffer_lines = cfg["buffer_lines"]
+    unw.overlap_lines = cfg["overlap_lines"]
+    unw.use_phase_grad_neut = cfg["use_phase_gradient_neutron"]
+    unw.use_intensity_neut = cfg["use_intensity_neutron"]
+    unw.phase_grad_win_size = cfg["phase_gradient_window_size"]
+    unw.neut_phase_grad_thr = cfg["neutron_phase_gradient_threshold"]
+    unw.neut_intensity_thr = cfg["neutron_intensity_threshold"]
+    unw.neut_correlation_thr = cfg["max_intensity_correlation_threshold"]
+    unw.trees_number = cfg["trees_number"]
+    unw.max_branch_length = cfg["max_branch_length"]
+    unw.ratio_dxdy = cfg["pixel_spacing_ratio"]
+    unw.init_corr_thr = cfg["initial_correlation_threshold"]
+    unw.max_corr_thr = cfg["max_correlation_threshold"]
+    unw.min_cc_area = cfg["min_tile_area"]
+    unw.num_bs_lines = cfg["bootstrap_lines"]
+    unw.min_overlap_area = cfg["min_overlap_area"]
+    unw.phase_var_thr = cfg["phase_variance_threshold"]
+    return unw
+
+
+def _make_mem_raster(data: np.ndarray, name: str = "mem"):
+    """Create a GDAL memory raster from a numpy array."""
+    from osgeo import gdal
+    h, w = data.shape
+    ds = gdal.GetDriverByName("MEM").Create(name, w, h, 1, gdal.GDT_Float32)
+    ds.GetRasterBand(1).WriteArray(data)
+    return ds
+
+
+def _unwrap_with_icu(
+    phase: np.ndarray,
+    coherence: np.ndarray,
+    scratch_dir: Path,
+    config: dict | None = None,
+) -> np.ndarray:
+    """Unwrap phase with ICU; NaN where mask rejected."""
+    import isce3
+    from osgeo import gdal
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    h, w = phase.shape
+
+    driver = gdal.GetDriverByName("GTiff")
+    unw_ds = driver.Create(str(scratch_dir / "unwrapped.tif"), w, h, 1, gdal.GDT_Float32)
+    cc_ds = driver.Create(str(scratch_dir / "conncomp.tif"), w, h, 1, gdal.GDT_Byte)
+    if unw_ds is None or cc_ds is None:
+        raise RuntimeError("failed to create ICU scratch rasters")
+    unw_ds = None
+    cc_ds = None
+
+    icu = _build_icu(config)
+    icu.unwrap(
+        isce3.io.Raster(str(scratch_dir / "unwrapped.tif"), update=True),
+        isce3.io.Raster(str(scratch_dir / "conncomp.tif"), update=True),
+        _make_mem_raster(phase),
+        _make_mem_raster(coherence),
+        seed=0,
+    )
+
+    ds = gdal.Open(str(scratch_dir / "unwrapped.tif"), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError("ICU did not produce unwrapped phase raster")
+    result = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    ds = None
+
+    cc_ds = gdal.Open(str(scratch_dir / "conncomp.tif"), gdal.GA_ReadOnly)
+    if cc_ds is None:
+        raise RuntimeError("ICU did not produce connected component raster")
+    cc = cc_ds.GetRasterBand(1).ReadAsArray()
+    cc_ds = None
+
+    result[cc == 0] = np.nan
+    if not np.any(np.isfinite(result)):
+        raise RuntimeError("ICU produced no finite pixels")
+    return result
+
+
+def _unwrap_with_icu_profiles(
+    phase: np.ndarray,
+    coherence: np.ndarray,
+    scratch_dir: Path,
+) -> tuple[np.ndarray, str | None]:
+    """Try ICU default, retry relaxed if coverage low."""
+    attempts = (
+        ("default", None),
+        ("relaxed", ICU_RELAXED_OVERRIDES),
+    )
+    best_result: np.ndarray | None = None
+    best_profile: str | None = None
+    best_valid_fraction = -1.0
+
+    for profile_name, config in attempts:
+        try:
+            result = _unwrap_with_icu(
+                phase, coherence,
+                scratch_dir / profile_name,
+                config=config,
+            )
+            vf = float(np.isfinite(result).mean())
+            if vf > best_valid_fraction:
+                best_result = result
+                best_profile = profile_name
+                best_valid_fraction = vf
+            if profile_name == "default" and vf >= ICU_MIN_VALID_FRACTION_FOR_RELAXED_RETRY:
+                break
+        except Exception as exc:
+            log.warning("ICU profile %s failed: %s", profile_name, exc)
+            continue
+
+    if best_result is None:
+        raise RuntimeError("All ICU profiles failed")
+
+    log.info("ICU unwrap: profile=%s valid_fraction=%.4f", best_profile, best_valid_fraction)
+    return best_result, best_profile
+
+
+def _unwrap_with_snaphu(
+    phase: np.ndarray,
+    coherence: np.ndarray,
+    scratch_dir: Path,
+    nlooks: float = 1.0,
+    range_pixel_spacing: float | None = None,
+    azimuth_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    config_overrides: dict | None = None,
+) -> np.ndarray:
+    """Unwrap phase with Python snaphu module."""
+    import snaphu
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = dict(
+        nlooks=nlooks,
+        cost_mode="defo",
+        init_method="mst",
+        ntiles_row=1,
+        ntiles_col=1,
+        row_overlap=0,
+        col_overlap=0,
+        corr_thresh=0.12 if nlooks <= 1 else 0.05,
+        min_conncomp_frac=0.01,
+        min_region_size=300,
+        phase_grad_window=(5, 5),
+        single_tile_reoptimize=False,
+        regrow_conncomps=True,
+        defomax_cycle=4.0,
+        nproc=4,
+        tile_cost_thresh=300,
+        tile_overlap=(512, 512),
+        auto_tile_max_pixels=4_000_000,
+    )
+    if range_pixel_spacing is not None:
+        cfg["range_pixel_spacing"] = range_pixel_spacing
+    if azimuth_pixel_spacing is not None:
+        cfg["azimuth_pixel_spacing"] = azimuth_pixel_spacing
+    if wavelength is not None:
+        cfg["wavelength"] = wavelength
+    if config_overrides:
+        cfg.update(config_overrides)
+
+    # Auto-tile for large images
+    rows, cols = phase.shape
+    total_pixels = rows * cols
+    if total_pixels > cfg["auto_tile_max_pixels"]:
+        target = min(cfg["auto_tile_max_pixels"], total_pixels // max(1, cfg["nproc"]))
+        tile_side = max(512, (int(np.sqrt(target)) // 128) * 128)
+        cfg["ntiles_row"] = max(1, (rows + tile_side - 1) // tile_side)
+        cfg["ntiles_col"] = max(1, (cols + tile_side - 1) // tile_side)
+
+    unw = np.zeros(phase.shape, dtype=np.float32)
+    conncomp = np.zeros(phase.shape, dtype=np.uint32)
+
+    ntiles_dict = {"n_tiles_row": cfg["ntiles_row"], "n_tiles_col": cfg["ntiles_col"]}
+
+    snaphu.unwrap(
+        (coherence * np.exp(1j * phase)).astype(np.complex64),
+        coherence.astype(np.float32),
+        cfg["nlooks"],
+        unw=unw,
+        conncomp=conncomp,
+        cost=cfg["cost_mode"],
+        init=cfg["init_method"],
+        min_conncomp_frac=cfg["min_conncomp_frac"],
+        phase_grad_window=cfg["phase_grad_window"],
+        ntiles=ntiles_dict,
+        tile_overlap=cfg["tile_overlap"],
+        nproc=cfg["nproc"],
+        tile_cost_thresh=cfg["tile_cost_thresh"],
+        min_region_size=cfg["min_region_size"],
+        single_tile_reoptimize=cfg["single_tile_reoptimize"],
+        regrow_conncomps=cfg["regrow_conncomps"],
+        row_overlap=cfg["row_overlap"],
+        col_overlap=cfg["col_overlap"],
+        scratchdir=scratch_dir,
+        delete_scratch=True,
+    )
+
+    if not np.any(np.isfinite(unw)):
+        raise RuntimeError("SNAPHU produced no finite pixels")
+    return unw.astype(np.float32)
+
+
+SNAPHU_RETRY_PROFILES = (
+    ("default", {}),
+    (
+        "relaxed",
+        {
+            "min_conncomp_frac": 0.001,
+            "min_region_size": 100,
+            "phase_grad_window": (5, 5),
+        },
+    ),
+)
+
+
 def unwrap_ifg(
     phase: np.ndarray,
     coherence: np.ndarray,
     method: str,
     *,
     work_dir: Path | None = None,
+    nlooks: float = 1.0,
+    range_pixel_spacing: float | None = None,
+    azimuth_pixel_spacing: float | None = None,
+    wavelength: float | None = None,
+    use_fallback: bool = True,
 ) -> np.ndarray:
-    """Unwrap 2-D wrapped phase via ICU or SNAPHU.
+    """Unwrap 2-D wrapped phase via ICU or SNAPHU with profile retry.
 
     Parameters
     ----------
     phase : np.ndarray
         2-D wrapped phase in radians (float32 or float64).
     coherence : np.ndarray
-        2-D coherence (float32) used as a quality mask.
+        2-D coherence (float32) used as quality mask.
     method : str
-        Unwrapping engine: ``"icu"`` or ``"snaphu"``.
+        Engine: "icu" or "snaphu".
     work_dir : Path | None
-        Directory for temporary files.  If None, a system temp dir is used.
+        Scratch directory. System temp if None.
+    nlooks : float, default 1.0
+        Effective looks (range * azimuth) for SNAPHU cost calibration.
+    range_pixel_spacing : float | None
+        Slant range pixel spacing (m). Passed to SNAPHU geometry model.
+    azimuth_pixel_spacing : float | None
+        Azimuth pixel spacing (m). Passed to SNAPHU geometry model.
+    wavelength : float | None
+        Radar wavelength (m). Passed to SNAPHU deformation cost mode.
+    use_fallback : bool, default True
+        If True and ICU/SNAPHU fail, fall back to unwrap_phase_2d.
 
     Returns
     -------
     np.ndarray
         2-D unwrapped phase in radians (float32).
-
-    Raises
-    ------
-    NotImplementedError
-        When ``method`` is not ``"icu"`` or ``"snaphu"``, or when the
-        requested tool is not installed.
     """
     method_lower = method.lower()
     if method_lower not in ("icu", "snaphu"):
@@ -225,80 +564,54 @@ def unwrap_ifg(
 
     if work_dir is None:
         work_dir = Path(tempfile.gettempdir())
-
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write input rasters
-    phase_path = work_dir / "phase_input.bin"
-    coh_path = work_dir / "coh_input.bin"
-    unw_path = work_dir / "unw_output.bin"
-
-    phase.astype(np.float32).tofile(str(phase_path))
-    coherence.astype(np.float32).tofile(str(coh_path))
-
-    h, w = phase.shape
+    phase = np.asarray(phase, dtype=np.float32)
+    coherence = np.asarray(coherence, dtype=np.float32)
 
     if method_lower == "icu":
-        # ICU: GPU-accelerated unwrapper (part of ISCE2/ISCE3).
-        # Invocation: icu -i phase.cor -o unwrapped.int
-        # We construct a minimal ICU command.
-        icu_exe = shutil.which("icu")
-        if icu_exe is None:
-            raise NotImplementedError(
-                "ICU executable not found in PATH. "
-                "Install ISCE2/ISCE3 and ensure 'icu' is on PATH."
+        try:
+            unwrapped, profile = _unwrap_with_icu_profiles(
+                phase, coherence, work_dir / "icu_profiles",
             )
+            log.info("ICU unwrap: profile=%s shape=%s", profile, phase.shape)
+            return unwrapped
+        except Exception as exc:
+            log.warning("ICU unwrap failed: %s", exc)
+            if not use_fallback:
+                raise
+            from scripts.tops_utils import unwrap_phase_2d
+            log.warning("Falling back to simple 2D unwrap")
+            return unwrap_phase_2d(phase)
 
-        cmd = [
-            icu_exe,
-            "-i", str(coh_path),
-            "-o", str(unw_path),
-            "-m", str(w),
-            "-n", str(h),
-        ]
-        log.info("Running ICU: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True,
-        )
-        if result.returncode != 0:
-            log.error("ICU stderr: %s", result.stderr)
-            raise RuntimeError(f"ICU failed: {result.stderr}")
-
-    elif method_lower == "snaphu":
-        # SNAPHU: CPU unwrapper (https://github.com/isce-framework/snaphu).
-        snaphu_exe = shutil.which("snaphu")
-        if snaphu_exe is None:
-            raise NotImplementedError(
-                "SNAPHU executable not found in PATH. "
-                "Install SNAPHU: https://github.com/isce-framework/snaphu"
+    # SNAPHU
+    for profile_name, overrides in SNAPHU_RETRY_PROFILES:
+        try:
+            unwrapped = _unwrap_with_snaphu(
+                phase, coherence,
+                work_dir / f"snaphu_{profile_name}",
+                nlooks=nlooks,
+                range_pixel_spacing=range_pixel_spacing,
+                azimuth_pixel_spacing=azimuth_pixel_spacing,
+                wavelength=wavelength,
+                config_overrides=overrides,
             )
+            log.info(
+                "SNAPHU %s: shape=%s nlooks=%.1f",
+                profile_name, phase.shape, nlooks,
+            )
+            return unwrapped
+        except Exception as exc:
+            log.warning("SNAPHU profile %s failed: %s", profile_name, exc)
+            continue
 
-        # SNAPHU config: tiled processing, correlation threshold 0.1
-        cmd = [
-            snaphu_exe,
-            "-f", str(coh_path),   # using coh as cost source file
-            "-o", str(unw_path),
-            "--nrows", str(h),
-            "--ncols", str(w),
-            "-t", "0.1",
-        ]
-        log.info("Running SNAPHU: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True,
-        )
-        if result.returncode != 0:
-            log.error("SNAPHU stderr: %s", result.stderr)
-            raise RuntimeError(f"SNAPHU failed: {result.stderr}")
+    if use_fallback:
+        from scripts.tops_utils import unwrap_phase_2d
+        log.warning("SNAPHU failed; using simple 2D unwrap fallback")
+        return unwrap_phase_2d(phase)
 
-    if not unw_path.exists():
-        raise FileNotFoundError(
-            f"Unwrap output not produced at {unw_path}. "
-            "Check unwrapper logs above."
-        )
-
-    unwrapped = np.fromfile(str(unw_path), dtype=np.float32).reshape(h, w)
-    return unwrapped
+    raise RuntimeError("SNAPHU unwrap failed -- all retry profiles exhausted")
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +813,18 @@ def write_product(
         ds = None
         log.info("Wrote GeoTIFF: %s", path)
         return path
+
+    # Wrapped phase (color PNG) → .int.geo.png
+    int_png_path = output_dir / f"{product_name}.int.geo.png"
+    int_rgba = _phase_to_color_rgba(merged_ifg, merged_coh)
+    try:
+        from PIL import Image
+
+        Image.fromarray(int_rgba, mode="RGBA").save(int_png_path)
+        written.append(int_png_path)
+        log.info("Wrote PNG: %s", int_png_path)
+    except Exception as exc:
+        log.warning("Failed to write wrapped-phase PNG %s: %s", int_png_path, exc)
 
     # Wrapped phase (real part) → .int.geo.tif
     int_data = np.angle(merged_ifg).astype(np.float32)

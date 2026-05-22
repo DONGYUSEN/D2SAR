@@ -100,6 +100,39 @@ runIon                             _run_ionospheric_correction
 
 ---
 
+## 7. 2026-05-11 实测修正记录
+
+在真实 Sentinel-1 IW1 burst-limit=2 数据上验证后，已修正以下偏差：
+
+1. **Overlap 计算**
+   - 早期按错误的边界公式计算，导致 overlap 退化为零数组。
+   - 现已改为 valid-window 交集，`overlap_ifg` 可稳定生成真实窗口数据。
+
+2. **Fine resample**
+   - 早期未尊重 `--burst-limit`，会继续处理未选中的 burst。
+   - 现已与 `_limited_pairs(common, state)` 对齐。
+
+3. **RD 镶嵌**
+   - 早期 `merge_bursts` 按 `valid_window` 直接放置，产生额外空白和错误 seam。
+   - 现已按 RD 坐标系布局，实测输出 `gap_pixels=0`。
+
+4. **ESD 统计**
+   - `EsdEstimate` 现包含 `mean_coherence`，与 `compute_esd_timing_correction()` 保持一致。
+
+5. **实测结果**
+   - `overlap_ifg`：`coherence_mean=1.000`
+   - `merge_bursts`：`shape=(2796, 20470)`
+   - 输出 PNG：`wrapped.png`、`coherence.png`、`unwrapped.png`、`filtered.png`
+
+6. **Geo2Rdr / Rdr2Geo 链路**
+   - 已确认 DEM 在 ISCE3 中仍应作为**单波段输入**，仅用于 `Rdr2Geo.topo(dem, ...)`。
+   - `Geo2Rdr` 的正确输入不是 DEM，而是 `Rdr2Geo` 生成的 `topo.vrt`，其前三个波段为 `x/y/z`。
+   - `scripts/tops_geometry.py` 已改为“参考 burst 先 `Rdr2Geo`，二级 burst 再 `Geo2Rdr`”的两段式链路。
+   - `Geo2Rdr` 输出中的 `-1e6` 无效值已从统计中排除，避免把未收敛像元计为有效样本。
+   - `run_geo2rdr_single_burst()` 现在会在 CUDA 绑定不可用时自动回退 CPU。
+
+---
+
 ## 5. 使用说明
 
 ### 启用电离层校正

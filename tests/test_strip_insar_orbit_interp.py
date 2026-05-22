@@ -12,10 +12,10 @@ if str(SCRIPTS) not in sys.path:
 
 class StripInsar2OrbitInterpTests(unittest.TestCase):
     def test_lutan_pair_forces_legendre_orbit_interpolation(self):
-        import strip_insar2
+        import strip_insar
 
-        with mock.patch("strip_insar2.choose_orbit_interp", return_value="Hermite"):
-            interp = strip_insar2._choose_context_orbit_interp(
+        with mock.patch("strip_insar.choose_orbit_interp", return_value="Hermite"):
+            interp = strip_insar._choose_context_orbit_interp(
                 {"sensor": "lutan"},
                 {"sensor": "lutan"},
                 {"stateVectors": [{} for _ in range(10)]},
@@ -25,10 +25,10 @@ class StripInsar2OrbitInterpTests(unittest.TestCase):
         self.assertEqual(interp, "Legendre")
 
     def test_non_lutan_pair_uses_default_orbit_interpolation_choice(self):
-        import strip_insar2
+        import strip_insar
 
-        with mock.patch("strip_insar2.choose_orbit_interp", return_value="Hermite"):
-            interp = strip_insar2._choose_context_orbit_interp(
+        with mock.patch("strip_insar.choose_orbit_interp", return_value="Hermite"):
+            interp = strip_insar._choose_context_orbit_interp(
                 {"sensor": "tianyi"},
                 {"sensor": "tianyi"},
                 {"stateVectors": [{} for _ in range(10)]},

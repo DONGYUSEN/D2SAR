@@ -14,7 +14,24 @@ docker run --rm --user $(id -u):$(id -g) -v /home/ysdong/Software/D2SAR:/work   
 docker run --rm --user $(id -u):$(id -g) -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Temp/:/temp   -v /home/ysdong/Software/D2SAR/results:/results   d2sar:cuda   python3 /work/scripts/tianyi_importer.py   /temp/BC3-SM-SLC-1SVV-20231121T043936-002414-000034-00096E.zip   /results/20231121   --download-dem
 
 
-docker run --rm --gpus all --user $(id -u):$(id -g) -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Software/D2SAR/results:/results   -v /home/ysdong/Temp/:/temp    d2sar:cuda   python3 /work/scripts/strip_insar2.py /results/20231110/manifest.json /results/20231121/manifest.json /results/20231110_20231121
+docker run --rm --gpus all --user $(id -u):$(id -g) -v /home/ysdong/Software/D2SAR:/work   -v /home/ysdong/Software/D2SAR/results:/results   -v /home/ysdong/Temp/:/temp    d2sar:cuda   python3 /work/scripts/strip_insar.py /results/20231110/manifest.json /results/20231121/manifest.json /results/20231110_20231121
+
+
+
+
+4. tops_insar (burst-based TOPS InSAR)
+
+# Run tops_insar.py with proper PYTHONPATH
+# PYTHONPATH order matters: /opt/isce3 and /opt/gdal first, then /work
+docker run --rm --user $(id -u):$(id -g) \
+  -v /home/ysdong/Software/D2SAR:/work \
+  -v /home/ysdong/Software/D2SAR/results:/results \
+  -v /home/ysdong/Temp/:/temp \
+  d2sar:cuda bash -c 'PYTHONPATH="/opt/isce3/packages:/opt/gdal38/lib/python3/dist-packages:/work/scripts:/work" \
+  cd /work && python3 scripts/tops_insar.py /temp/tops_output \
+  /temp/s1/raw/S1A_IW_SLC__1SDV_20230625T114146_20230625T114213_049142_05E8CA_CCD3.SAFE \
+  /temp/s1/raw/S1A_IW_SLC__1SDV_20230719T114147_20230719T114214_049492_05F38A_3C77.SAFE \
+  --swath IW1 --dem /temp/dem/dem_clip_wgs84.tif --start-stage preprocess --end-stage publish'
 
 
 

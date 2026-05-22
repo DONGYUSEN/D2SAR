@@ -24,13 +24,13 @@
 - 已具备：`--product-path`、`--swath`、静默日志、分阶段输出结构、swath 合并策略
 
 3. InSAR 核心算法与阶段框架（strip 版）
-- `scripts/strip_insar2.py`
+- `scripts/strip_insar.py`
 - 已具备：阶段机（`check/prep/crop/p0..p6`）、CPU/GPU回退、阶段缓存、产品导出、unwrap 后端
 
 ### 2.2 当前缺口
 
 1. 没有 TOPS 专用 InSAR 统一入口（只有 strip 与 tops_rtc）
-2. 还没有把 TOPS burst/overlap/merge 语义与现有 `strip_insar2` 阶段体系打通
+2. 还没有把 TOPS burst/overlap/merge 语义与现有 `strip_insar` 阶段体系打通
 3. 多 swath（IW1/2/3）在 InSAR 侧缺少统一合并与一致性约束
 
 ---
@@ -70,7 +70,7 @@
 - 负责 CLI、阶段调度、日志、产物路径、swath 批处理与合并
 
 2. Compute 层：复用现有模块
-- 复用 `strip_insar2.py` 内已成熟的注册、crossmul、filter、unwrap、geocode/HDF 发布函数
+- 复用 `strip_insar.py` 内已成熟的注册、crossmul、filter、unwrap、geocode/HDF 发布函数
 - 新增 TOPS 特有 bridge（burst 计划、merge、overlap/ESD 可选）
 
 ---
@@ -100,7 +100,7 @@
 - 多 swath：先分 swath 产物，后按规则合并（IW1+IW2、IW2+IW3）
 
 7. `p4_unwrap`
-- ICU / snaphu / dolphin（与 `strip_insar2` 同策略）
+- ICU / snaphu / dolphin（与 `strip_insar` 同策略）
 
 8. `p5_geocode_hdf`
 - 地理编码与 HDF 产品组织
@@ -217,3 +217,28 @@
 1. 文件级改动清单（新建/复用/重构）
 2. 单元测试清单（按阶段）
 3. 首个可运行命令与验收标准（含 IW1 最小样例）
+
+---
+
+## 13. 后续实测记录（2026-05-11）
+
+在 `/home/ysdong/Temp` 的真实 Sentinel-1 IW1 数据上完成一次 burst-limit=2 的完整链路验证，修正了以下问题：
+1. `overlap_ifg` 早期因 overlap 边界计算错误而退化为零数组，已改为按 valid-window 交集读取；
+2. `fine_resamp` 早期未尊重 `--burst-limit`，已修正为仅处理选中 burst；
+3. `merge_bursts` 早期按 `valid_window` 简单放置，已改为按 RD 坐标系镶嵌；
+4. `EsdEstimate` 增加 `mean_coherence` 字段，`compute_esd_timing_correction()` 已同步更新。
+
+该样例的关键结果：
+1. `overlap_ifg` 读取到真实窗口，`coherence_mean=1.000`；
+2. `prep_esd/esd/range_coreg/fineoffsets/fine_resamp` 依次通过；
+3. `merge_bursts` 输出 `shape=(2796, 20470)`，`gap_pixels=0`；
+4. `wrapped.png`、`coherence.png`、`unwrapped.png`、`filtered.png` 已导出。
+
+## 14. ISCE3 几何链路约束（2026-05-12）
+
+`tops_insar.py` 的 burst 级粗配准必须按以下链路执行：
+1. `Rdr2Geo` 使用参考 burst 的 radar grid、orbit、doppler 和单波段 DEM 生成 `topo.vrt`；
+2. `Geo2Rdr` 使用 secondary burst 的 radar grid、orbit、doppler，并以该 `topo.vrt` 作为输入计算 range/azimuth offsets；
+3. 不允许把单波段 DEM 复制成三波段后直接传给 `Geo2Rdr`；
+4. `topo.vrt` 的前三个波段必须是 `x/y/z`，这是 `Geo2Rdr` 读取地面坐标的接口契约；
+5. ISCE3 `Geo2Rdr` 的 `-1e6` 输出表示无效/未收敛像元，统计 median 与 valid count 时必须排除。

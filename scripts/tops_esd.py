@@ -72,8 +72,10 @@ def _boxcar_multilook(
 
 def estimate_esd_timing(
     overlap_ifg: np.ndarray,
+    coherence: np.ndarray,
     *,
     looks_az: int = 5,
+    az_time_interval: float = 0.002,
 ) -> EsdEstimate:
     """Estimate azimuth timing offset from a pre-computed overlap interferogram.
 
@@ -87,6 +89,9 @@ def estimate_esd_timing(
         Complex overlap interferogram, shape (L, S).  Must have at least
         one line and one sample.  Zero-filled or all-NaN arrays will raise
         ``ValueError``.
+    coherence : np.ndarray
+        Real-valued coherence raster, same shape as ``overlap_ifg``.
+        Used to compute ``mean_coherence`` for quality assessment.
     looks_az : int, default 5
         Number of azimuth looks for boxcar multilooking.
 
@@ -98,6 +103,7 @@ def estimate_esd_timing(
         - ``median_offset_pixels`` — robust azimuth misregistration (pixels)
         - ``mean_offset_pixels``   — arithmetic mean offset (pixels)
         - ``std_offset_pixels``    — standard deviation of offsets (pixels)
+        - ``mean_coherence``       — mean coherence over the ESD window (0..1)
         - ``sample_count``         — number of range columns contributing
         - ``azimuth_time_interval`` — placeholder (set to 0.0 here; the caller
           provides the real value when building ``TimingCorrection``)
@@ -148,7 +154,7 @@ def estimate_esd_timing(
     # => offset_pixels = offset_angle / (4π * f_center / PRF)
     #                   = offset_angle * wavelength * PRF / (4π * c)
     f_center = SPEED_OF_LIGHT / SENTINEL1_WAVELENGTH
-    prf = 1.0 / 0.002  # placeholder PRF; real az_time_interval is injected later
+    prf = 1.0 / az_time_interval
     offset_pixels = offset_angle * SENTINEL1_WAVELENGTH * prf / (4.0 * np.pi * SPEED_OF_LIGHT)
 
     # Per-column pixel offsets (for mean / std statistics)
@@ -168,12 +174,17 @@ def estimate_esd_timing(
             offset_pixels, MAX_OFFSET_PIXELS, SENTINEL1_WAVELENGTH, prf,
         )
 
+    # Step 5: compute mean coherence over the ESD window
+    coh_finite = coherence[np.isfinite(coherence)]
+    mean_coh = float(np.mean(coh_finite)) if coh_finite.size > 0 else 0.0
+
     return EsdEstimate(
         median_offset_pixels=float(offset_pixels),
         mean_offset_pixels=mean_pixels,
         std_offset_pixels=std_pixels,
+        mean_coherence=mean_coh,
         sample_count=int(col_offsets.size),
-        azimuth_time_interval=0.002,   # placeholder; caller replaces via compute_esd_timing_correction
+        azimuth_time_interval=az_time_interval,
     )
 
 
@@ -211,6 +222,7 @@ def compute_esd_timing_correction(
         median_offset_pixels=pixels,
         mean_offset_pixels=esd_estimate.mean_offset_pixels,
         std_offset_pixels=esd_estimate.std_offset_pixels,
+        mean_coherence=esd_estimate.mean_coherence,
         sample_count=esd_estimate.sample_count,
         azimuth_time_interval=az_time_interval,
     )

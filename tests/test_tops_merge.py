@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -94,6 +95,45 @@ def test_single_burst_passthrough():
     assert result.top_contribution_count == h * w
     assert result.bottom_contribution_count == 0
     assert len(result.segments) == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: radar-domain placement from sensing time and slant range
+# ---------------------------------------------------------------------------
+
+def test_two_bursts_with_zero_image_offsets_are_placed_by_rd_coordinates():
+    """Burst mosaicking uses RD coordinates, not only image_window offsets."""
+    h, w = 4, 5
+
+    # Both bursts have image_window.first_line=0.  If merging uses only that
+    # field, they collapse onto the same rows.  Their sensing_start values are
+    # 3 s apart and azimuth_time_interval is 1 s/line, so burst 1 belongs at
+    # output row 3 in the merged RD grid, matching tops_rtc.py/ISCE2 logic.
+    burst0 = replace(_grid(0, line_offset=0), azimuth_time_interval=1.0)
+    burst1 = replace(_grid(1, line_offset=0), azimuth_time_interval=1.0)
+    vw = BurstWindow(first_line=0, num_lines=h, first_sample=0, num_samples=w)
+
+    out_ifg = np.zeros((7, w), dtype=np.complex64)
+    out_coh = np.zeros((7, w), dtype=np.float32)
+
+    result = merge_bursts(
+        [_make_ifg(h, w, phase=0.1), _make_ifg(h, w, phase=0.2)],
+        [_make_coh(h, w, 0.8), _make_coh(h, w, 0.9)],
+        [burst0, burst1],
+        [vw, vw],
+        seam_regions=[],
+        out_ifg=out_ifg,
+        out_coh=out_coh,
+    )
+
+    assert result.segments[0].output_line_start == 0
+    assert result.segments[1].output_line_start == 3
+    np.testing.assert_array_almost_equal(np.angle(out_ifg[0:3, :]), 0.1, decimal=4)
+    assert out_coh[0, 0] == 0.8
+    # Row 3 is an overlap: avg method is not configurable yet, so current merge
+    # averages both contributions in overlaps.
+    assert out_coh[3, 0] == pytest.approx(0.85)
+    np.testing.assert_array_almost_equal(np.angle(out_ifg[4:7, :]), 0.2, decimal=4)
 
 
 # ---------------------------------------------------------------------------

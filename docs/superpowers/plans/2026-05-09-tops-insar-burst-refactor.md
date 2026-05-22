@@ -4,7 +4,7 @@
 
 **Goal:** Refactor `tops_insar` into a Sentinel-1 TOPS InSAR processor whose primary processing unit is the burst, whose registration/resampling/interferogram algorithms use ISCE3 native lower-level primitives, and whose flow is scientifically comparable to ISCE2 `topsApp`.
 
-**Architecture:** `tops_insar.py` remains the CLI/orchestrator. All Sentinel-1 TOPS logic lives in new `scripts/tops_*` modules. `tops_insar` and all new TOPS modules must not import, call, wrap, copy helpers from, or execute `scripts/strip_insar.py` or `scripts/strip_insar2.py`. High-level `nisar.workflows.*.run(cfg)` wrappers are not accepted as the algorithm implementation unless a task explicitly proves their Sentinel-1 burst compatibility; implementation should prefer lower-level ISCE3 primitives such as `isce3.geometry.Geo2Rdr`, `isce3.image.ResampSlc`, `isce3.image.v2.resample_slc_blocks`, `isce3.matchtemplate.PyCPUAmpcor` / `isce3.cuda.matchtemplate.PyCuAmpcor`, `isce3.math.offsets_polyfit`, and `isce3.signal.Crossmul`.
+**Architecture:** `tops_insar.py` remains the CLI/orchestrator. All Sentinel-1 TOPS logic lives in new `scripts/tops_*` modules. `tops_insar` and all new TOPS modules must not import, call, wrap, copy helpers from, or execute `scripts/strip_insar.py` or `scripts/strip_insar.py`. High-level `nisar.workflows.*.run(cfg)` wrappers are not accepted as the algorithm implementation unless a task explicitly proves their Sentinel-1 burst compatibility; implementation should prefer lower-level ISCE3 primitives such as `isce3.geometry.Geo2Rdr`, `isce3.image.ResampSlc`, `isce3.image.v2.resample_slc_blocks`, `isce3.matchtemplate.PyCPUAmpcor` / `isce3.cuda.matchtemplate.PyCuAmpcor`, `isce3.math.offsets_polyfit`, and `isce3.signal.Crossmul`.
 
 **Tech Stack:** Python, NumPy, GDAL/Raster IO already used in D2SAR, vendored ISCE3 lower-level APIs, pytest. Reference process: `/home/ysdong/Software/isce/isce2/applications/topsApp.py` and `/home/ysdong/Software/isce/isce2/components/isceobj/TopsProc/*.py`.
 
@@ -13,7 +13,7 @@
 ## 0. Non-Negotiable Constraints
 
 1. **Burst is the fundamental unit.** Sentinel-1 TOPS processing must be modeled as `swath -> common burst pair -> overlap pair -> burst product -> merged product`.
-2. **No strip backend dependency.** `tops_insar` and all `tops_*` modules must have zero imports/references to `strip_insar` and `strip_insar2` except in documentation text and tests that assert absence.
+2. **No strip backend dependency.** `tops_insar` and all `tops_*` modules must have zero imports/references to `strip_insar` and `strip_insar` except in documentation text and tests that assert absence.
 3. **No empty shell algorithms.** Do not add modules that only call `pass`, return the input unchanged, raise “not implemented” for planned production paths, or merely wrap high-level NISAR workflow calls without proving Sentinel-1 burst compatibility.
 4. **No silent physical simplification.** Deramp/reramp, ESD frequency separation, overlap slicing, common burst matching, and valid-window merge must be implemented or the relevant pipeline stage must remain blocked by a failing test.
 5. **ISCE2 parity is the reference.** Each major algorithmic milestone must compare its intermediate products against ISCE2 `topsApp` on at least one Sentinel-1 pair.
@@ -66,14 +66,14 @@ Mapping to ISCE2 concepts:
 
 - `scripts/tops_insar.py`
   - CLI and orchestration only.
-  - Remove all `strip_insar` / `strip_insar2` dependencies.
+  - Remove all `strip_insar` / `strip_insar` dependencies.
   - Route stages to TOPS-native modules.
 
 - `scripts/sentinel_importer.py`
   - Export complete Sentinel-1 TOPS burst metadata needed by ISCE3 primitives and TOPS algorithms.
 
 - `tests/test_tops_insar_backend.py`
-  - Update orchestration tests to expect TOPS-native backend calls, not `strip_insar2`.
+  - Update orchestration tests to expect TOPS-native backend calls, not `strip_insar`.
 
 ### New modules
 
@@ -131,7 +131,7 @@ Mapping to ISCE2 concepts:
 
 ## 3. Implementation Tasks
 
-### Task 0: Enforce no dependency on `strip_insar` or `strip_insar2`
+### Task 0: Enforce no dependency on `strip_insar` or `strip_insar`
 
 **Purpose:** Block any implementation path that reuses strip backends.
 
@@ -142,7 +142,7 @@ Mapping to ISCE2 concepts:
 **Required implementation:**
 
 - Add AST-based import checks for `tops_insar.py` and all `scripts/tops_*.py` modules.
-- Add source checks that production TOPS modules do not reference `strip_insar` / `strip_insar2` names.
+- Add source checks that production TOPS modules do not reference `strip_insar` / `strip_insar` names.
 - Add runtime poison-import test:
 
 ```python
@@ -153,16 +153,16 @@ class PoisonModule:
         raise AssertionError(f"Forbidden strip backend accessed: {name}")
 
 sys.modules["strip_insar"] = PoisonModule()
-sys.modules["strip_insar2"] = PoisonModule()
+sys.modules["strip_insar"] = PoisonModule()
 sys.modules["scripts.strip_insar"] = PoisonModule()
-sys.modules["scripts.strip_insar2"] = PoisonModule()
+sys.modules["scripts.strip_insar"] = PoisonModule()
 ```
 
 **Acceptance:**
 
 - `pytest tests/test_tops_no_strip_dependency.py -v` passes.
 - `tops_insar.py` imports only TOPS-native modules for TOPS execution.
-- There is no transitional call to `strip_insar2.process_strip_insar2()`.
+- There is no transitional call to `strip_insar.process_strip_insar()`.
 
 ---
 
@@ -320,7 +320,7 @@ MergeSegment
 **Disallowed responsibilities:**
 
 - no direct import or execution of ISCE2 `TopsProc` modules;
-- no direct import or execution of `strip_insar` / `strip_insar2`;
+- no direct import or execution of `strip_insar` / `strip_insar`;
 - no placeholder functions;
 - no functions that return input unchanged unless the function is explicitly a pure accessor tested as such;
 - no broad “misc” helpers without tests.
@@ -522,7 +522,7 @@ For each adjacent common burst pair `(top, bottom)`:
 - Synthetic offset test recovers known range/azimuth shift within tolerance.
 - Real burst residual offsets are finite over enough valid samples.
 - Outlier filtering removes low-SNR samples.
-- No `insar_registration`, `strip_insar`, or `strip_insar2` helpers are used.
+- No `insar_registration`, `strip_insar`, or `strip_insar` helpers are used.
 
 ---
 
@@ -552,7 +552,7 @@ For each adjacent common burst pair `(top, bottom)`:
 - Real overlap/common-burst test produces finite range correction when enough valid samples exist.
 - Sign convention is validated by showing improved range alignment after correction.
 - Compare correction magnitude with ISCE2 `runRangeCoreg.py` on one pair where range coreg is enabled.
-- No ISCE2, `strip_insar`, `strip_insar2`, or `insar_registration` helper is imported.
+- No ISCE2, `strip_insar`, `strip_insar`, or `insar_registration` helper is imported.
 
 ---
 
@@ -708,7 +708,7 @@ For each overlap pair:
 - If ionosphere correction is disabled, no ion placeholder products are written.
 - If enabled, synthetic two-frequency phase test recovers the known dispersive phase.
 - Real-data implementation is gated behind an explicit validation dataset and comparison with ISCE2 `runIon.py` outputs.
-- No `runIon.py`, ISCE2 module, `strip_insar`, or `strip_insar2` code is imported or copied.
+- No `runIon.py`, ISCE2 module, `strip_insar`, or `strip_insar` code is imported or copied.
 
 ---
 
@@ -812,7 +812,7 @@ python3 scripts/tops_insar.py --help
 
 The refactor is complete only when all of the following are true:
 
-- `tops_insar` and `scripts/tops_*.py` have no dependency on `strip_insar.py` or `strip_insar2.py`.
+- `tops_insar` and `scripts/tops_*.py` have no dependency on `strip_insar.py` or `strip_insar.py`.
 - `scripts/tops_insar_utils.py` contains concrete, tested utility algorithms and no placeholder functions.
 - Sentinel-1 burst metadata contains all required timing/range/Doppler/FM-rate fields.
 - common burst matching is based on global offset and continuous span, not ordinal truncation.
@@ -842,7 +842,7 @@ The following approaches are no longer acceptable:
 - ESD implemented only as `phase / frequency` without `prep_esd` frequency/coherence/sample generation.
 - Overlap represented only by JSON/window intersections without materialized top/bottom overlap products.
 - Merge represented only by segment planning without raster mosaic and seam diagnostics.
-- Any transitional call into `strip_insar` or `strip_insar2`.
+- Any transitional call into `strip_insar` or `strip_insar`.
 
 ---
 
@@ -850,7 +850,7 @@ The following approaches are no longer acceptable:
 
 ### Coverage of issues found in feasibility review
 
-- `strip_insar` / `strip_insar2` dependency: Task 0 and Definition of Done.
+- `strip_insar` / `strip_insar` dependency: Task 0 and Definition of Done.
 - ISCE3/NISAR workflow mismatch: lower-level primitive requirement in Tasks 4-5, 8-12.
 - common burst matching too simple: Task 3 global offset / continuous span algorithm.
 - overlap not first-class: Task 6 materializes four overlap SLC windows.

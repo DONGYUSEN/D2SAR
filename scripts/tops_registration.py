@@ -73,6 +73,39 @@ def _load_slc_npz(path: str | Path) -> np.ndarray:
         data = data.astype(np.complex64)
     return data
 
+def _load_offset_grid(path: str | Path) -> np.ndarray:
+    """Load a Geo2Rdr offset grid from either npz or raster output."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"offset grid not found: {path}")
+
+    if path.suffix.lower() == ".npz":
+        with np.load(path) as npz:
+            data = npz["data"]
+        return np.asarray(data, dtype=np.float64)
+
+    try:
+        from osgeo import gdal
+    except ImportError:
+        import osgeo.gdal as gdal  # type: ignore
+
+    ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"failed to open offset raster: {path}")
+    try:
+        data = ds.ReadAsArray()
+    finally:
+        ds = None
+    if data is None:
+        raise RuntimeError(f"failed to read offset raster: {path}")
+    arr = np.asarray(data, dtype=np.float64)
+    geo2rdr_nodata = -999999.0
+    invalid = ~np.isfinite(arr) | (arr == geo2rdr_nodata) | (arr <= -9.0e5)
+    if np.any(invalid):
+        arr = arr.copy()
+        arr[invalid] = 0.0
+    return arr
+
 
 def _save_slc_npz(slc: np.ndarray, path: str | Path) -> None:
     """Save a complex64 SLC to a numpy .npz file.
@@ -327,10 +360,8 @@ def run_coarse_registration(
     if not azimuth_off_path.exists():
         raise FileNotFoundError(f"azimuth.off not found: {azimuth_off_path}")
 
-    with np.load(range_off_path) as npz:
-        range_off = npz["data"].astype(np.float64)
-    with np.load(azimuth_off_path) as npz:
-        azimuth_off = npz["data"].astype(np.float64)
+    range_off = _load_offset_grid(range_off_path)
+    azimuth_off = _load_offset_grid(azimuth_off_path)
 
     if range_off.shape != out_shape:
         raise ValueError(
@@ -486,10 +517,8 @@ def fine_resample_with_timing(
     if not azimuth_off_path.exists():
         raise FileNotFoundError(f"azimuth.off not found: {azimuth_off_path}")
 
-    with np.load(range_off_path) as npz:
-        range_off = npz["data"].astype(np.float64).copy()
-    with np.load(azimuth_off_path) as npz:
-        azimuth_off = npz["data"].astype(np.float64).copy()
+    range_off = _load_offset_grid(range_off_path).copy()
+    azimuth_off = _load_offset_grid(azimuth_off_path).copy()
 
     if range_off.shape != out_shape:
         raise ValueError(
@@ -651,7 +680,7 @@ def filter_ifg(
     filter_factor = filter_power / mean_power
 
     # Apply filter and zero out decorrelated pixels
-    ifg_filtered = ifg.astype(np.complex64) * filter_factor.astype(np.complex64)
+    ifg_filtered = ifg.astype(np.complex64) * filter_factor.astype(np.float32)
     ifg_filtered = np.where(mask, ifg_filtered, 0.0 + 0.0j)
 
     return ifg_filtered.astype(np.complex64)

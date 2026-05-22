@@ -98,72 +98,96 @@ def _extract_overlap_slice(
     pair_idx: int,
     is_top: bool,
 ) -> OverlapSlice:
-    """Extract the top or bottom overlap slice between pair_idx and pair_idx+1.
+    """Extract the overlap slice between adjacent burst pair_idx and pair_idx+1.
 
-    Overlap geometry (with reference burst = common.pairs[i].reference):
-      - "top" burst: burst at index i  (earlier azimuth time)
-      - "bottom" burst: burst at index i+1 (later azimuth time)
+    The overlap is computed from the **sensing-time intersection** between
+    the reference burst of pair_idx and the reference burst of pair_idx+1.
+    This matches the ISCE2 ``runSubsetOverlaps.py`` algorithm:
 
-    Line range convention:
-      - top overlap:  [burst2.valid_line_start,  burst1.valid_line_start - 1]
-        (upper part of burst1, lines that precede burst2's start)
-      - bottom overlap: [burst2.valid_line_stop + 1, burst1.valid_line_stop]
-        (lower part of burst1, lines that follow burst2's end)
+        overlap_start = burst_b.sensing_start   (later burst first line)
+        overlap_end   = min(burst_a.sensing_stop, burst_b.sensing_stop)
+
+    Top slice (is_top=True)  → lines at the END   of the earlier burst (burst_a),
+    where it overlaps with burst_b.
+    Bottom slice (is_top=False) → lines at the START of the later burst (burst_b),
+    where it overlaps with burst_a.
+
+    Both slices have the same ``num_lines`` so the ESD double-difference
+    ``top_ifg × conj(bot_ifg)`` compares the same physical ground area.
 
     Parameters
     ----------
     common : CommonBurstSelection
     pair_idx : int
-        Index of the first burst in the pair (pairs[pair_idx] ↔ pairs[pair_idx+1]).
+        Index of the first adjacent pair.
     is_top : bool
-        True → extract top overlap slice (from burst at index pair_idx).
-        False → extract bottom overlap slice (from burst at index pair_idx).
+        True → slice from burst at pair_idx  (azimuth-earlier).
+        False → slice from burst at pair_idx+1 (azimuth-later).
 
     Returns
     -------
     OverlapSlice
-        Coordinates of the overlap region.  ``num_lines`` may be 0 if the
-        bursts do not overlap in the valid window.
+        Coordinates of the overlap region, always relative to the
+        **reference burst of the selected pair's SLC window**.
+        ``num_lines`` may be 0 if the windows do not intersect.
     """
     pair_a = common.pairs[pair_idx]
     pair_b = common.pairs[pair_idx + 1]
 
-    # Reference bursts at the overlap interface
-    burst1 = pair_a.reference  # earlier in azimuth (top)
-    burst2 = pair_b.reference  # later in azimuth (bottom)
+    burst_a = pair_a.reference  # earlier burst (lower azimuth time)
+    burst_b = pair_b.reference  # later burst
+
+    dt = burst_a.azimuth_time_interval  # same for both bursts in a swath
+
+    # --- ISCE2-style sensing-time overlap computation ---
+    # Line in burst_a where burst_b's line 0 starts
+    b0_in_a = round(
+        (burst_b.identity.sensing_start - burst_a.identity.sensing_start)
+        .total_seconds() / dt
+    )
+    # Where burst_b's valid window starts, expressed in burst_a's coordinates
+    ol_start_in_a = b0_in_a + burst_b.valid_window.first_line
+    # Overlap length bounded by both valid windows
+    ol_end_in_a = min(
+        burst_a.valid_line_stop,
+        ol_start_in_a + burst_b.valid_window.num_lines,
+    )
+    n_lines = max(0, ol_end_in_a - ol_start_in_a)
 
     if is_top:
-        # Top overlap: lines from burst1 that overlap with burst2
-        # line range = [burst2.valid_line_start, burst1.valid_line_start - 1]
-        first_line = burst2.valid_line_start
-        line_stop = burst1.valid_line_start
+        # Slice from the earlier burst — overlap is near its END
+        target = burst_a
+        first_line = ol_start_in_a
     else:
-        # Bottom overlap: lines from burst1 that overlap with burst2
-        # line range = [burst2.valid_line_stop + 1, burst1.valid_line_stop]
-        first_line = burst2.valid_line_stop + 1
-        line_stop = burst1.valid_line_stop
+        # Slice from the later burst — overlap is near its START (valid window start)
+        target = burst_b
+        first_line = burst_b.valid_line_start
 
-    num_lines = max(0, line_stop - first_line)
+    num_lines = n_lines
 
-    # Valid-window sample intersection
-    first_sample, num_samples = _valid_window_intersect(burst1, burst2)
+    # Sample intersection from valid windows
+    a_fs = burst_a.valid_window.first_sample
+    a_ns = burst_a.valid_window.num_samples
+    b_fs = burst_b.valid_window.first_sample
+    b_ns = burst_b.valid_window.num_samples
+    first_sample = max(a_fs, b_fs)
+    last_sample  = min(a_fs + a_ns, b_fs + b_ns)
+    num_samples  = max(0, last_sample - first_sample)
 
-    # Sensing time bounds: derive from line indices via azimuth_time_at_line.
-    # OverlapSlice requires sensing_stop > sensing_start.  Guard against
-    # numerical equality (e.g. zero-width line range or very close timestamps).
-    sensing_start_dt = burst1.azimuth_time_at_line(first_line)
-    line_stop_dt = burst1.azimuth_time_at_line(line_stop)
-    if line_stop_dt <= sensing_start_dt:
-        line_stop_dt = sensing_start_dt + timedelta(microseconds=1)
+    # Sensing time for the slice
+    sensing_start = target.azimuth_time_at_line(first_line)
+    line_stop_dt = target.azimuth_time_at_line(first_line + num_lines if num_lines > 0 else first_line)
+    if line_stop_dt <= sensing_start:
+        line_stop_dt = sensing_start + timedelta(microseconds=1)
 
     return OverlapSlice(
-        burst_pair=pair_a,
+        burst_pair=pair_a if is_top else pair_b,
         is_top=is_top,
         first_line=first_line,
         num_lines=num_lines,
         first_sample=first_sample,
         num_samples=num_samples,
-        sensing_start=sensing_start_dt,
+        sensing_start=sensing_start,
         sensing_stop=line_stop_dt,
     )
 
@@ -343,7 +367,12 @@ def read_overlap_window(
         if overlap_slice.first_line + overlap_slice.num_lines > ds.RasterYSize:
             return None
 
-        data = ds.GetRasterBand(band).ReadAsArray(
+        band_obj = ds.GetRasterBand(band)
+        if band_obj is None:
+            log.warning("Missing band %d in %s", band, tiff_path)
+            return None
+
+        data = band_obj.ReadAsArray(
             overlap_slice.first_sample,
             overlap_slice.first_line,
             overlap_slice.num_samples,

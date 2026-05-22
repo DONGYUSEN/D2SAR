@@ -370,7 +370,7 @@ class TestWriteProduct:
 
         assert isinstance(result, list)
         assert all(isinstance(p, Path) for p in result)
-        assert len(result) == 4  # .int + .coh + .unw + .h5
+        assert len(result) == 5  # .int.png + .int.tif + .coh.tif + .unw.tif + .h5
 
     def test_int_tif_written(self, tmp_path):
         """Wrapped phase is written as .int.geo.tif."""
@@ -431,8 +431,8 @@ class TestWriteProduct:
 
         paths_str = [str(p) for p in result]
         assert not any(".unw." in p for p in paths_str)
-        # Should still have int, coh, h5
-        assert len(result) == 3
+        # Should still have int.png, int.tif, coh, h5
+        assert len(result) == 4
 
     def test_unw_tif_written_when_provided(self, tmp_path):
         """Unwrapped TIFF is written when unwrapped is not None."""
@@ -453,8 +453,41 @@ class TestWriteProduct:
         paths_str = [str(p) for p in result]
         assert any(".unw." in p for p in paths_str)
 
-    def test_h5_file_written(self, tmp_path):
-        """HDF5 product is written by write_product."""
+    def test_int_png_is_color_and_masks_invalid_pixels(self, tmp_path):
+        """Wrapped interferogram PNG should be colorized and transparent for invalid pixels."""
+        h, w = 6, 8
+        gt = (800000.0, 2.3, 0.0, 0.0, 0.0, -0.002)
+        ifg = _make_ifg(h, w, phase=0.75)
+        coh = _make_coh(h, w, value=0.9)
+        ifg[1, 2] = np.nan + 1j * np.nan
+        ifg[3, 4] = 0.0 + 0.0j
+        coh[1, 2] = np.nan
+        coh[3, 4] = 0.0
+
+        with patch("scripts.tops_publish.write_hdf5_product"):
+            result = write_product(
+                merged_ifg=ifg,
+                merged_coh=coh,
+                unwrapped=None,
+                geo_transform=gt,
+                projection="EPSG:4326",
+                output_dir=tmp_path,
+                product_name="test_prod",
+            )
+
+        png_path = tmp_path / "test_prod.int.geo.png"
+        assert png_path in result
+        assert png_path.exists()
+
+        from PIL import Image
+
+        img = np.asarray(Image.open(png_path))
+        assert img.shape == (h, w, 4)
+        assert img.dtype == np.uint8
+        assert img[1, 2, 3] == 0
+        assert img[3, 4, 3] == 0
+        assert np.any(img[..., :3] != img[..., :1])
+
         h, w = 10, 20
         gt = (800000.0, 2.3, 0.0, 0.0, 0.0, -0.002)
 
@@ -520,6 +553,7 @@ class TestWriteProductIntegration:
 
         expected_names = {
             "IW1_full.int.geo.tif",
+            "IW1_full.int.geo.png",
             "IW1_full.coh.geo.tif",
             "IW1_full.unw.geo.tif",
             "IW1_full.h5",

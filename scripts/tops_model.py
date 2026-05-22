@@ -304,8 +304,13 @@ class EsdEstimate:
     std_offset_pixels: float
     sample_count: int
     azimuth_time_interval: float       # copy of the burst azimuth_time_interval (s/line)
+    mean_coherence: float = 1.0        # mean coherence over the ESD overlap window
 
     def __post_init__(self) -> None:
+        if not (-1.0 <= self.mean_coherence <= 1.0):
+            raise ValueError(
+                f"mean_coherence must be in [-1, 1], got {self.mean_coherence}"
+            )
         if self.sample_count < 0:
             raise ValueError(
                 f"sample_count must be non-negative, got {self.sample_count}"

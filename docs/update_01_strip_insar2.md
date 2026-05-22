@@ -2,13 +2,13 @@
 
 ## Goal
 
-Migrate the `normal(prep)` and `crop` logic from `scripts/strip_insar.py` into the front of `scripts/strip_insar2.py`, so that:
+Migrate the `normal(prep)` and `crop` logic from `scripts/strip_insar.py` into the front of `scripts/strip_insar.py`, so that:
 
 - external crop input uses only geographic bbox (`min_lon, min_lat, max_lon, max_lat`)
 - processing order is fixed as `normal -> crop`
 - a final prepared runtime input set is generated under the pair work directory
 - only final prepared artifacts are retained
-- existing `p0/p1/p2/p3/p4/p5/p6` in `strip_insar2.py` can continue without major downstream changes
+- existing `p0/p1/p2/p3/p4/p5/p6` in `strip_insar.py` can continue without major downstream changes
 
 The prepared runtime set should include:
 
@@ -44,9 +44,9 @@ Important behavior:
 - `crop` computes a master-driven crop window and applies the same window to master and normalized slave
 - downstream runtime stages then run on cropped manifests, not on the original manifests
 
-### In `strip_insar2.py`
+### In `strip_insar.py`
 
-`strip_insar2.py` currently enters the main chain directly through:
+`strip_insar.py` currently enters the main chain directly through:
 
 1. `load_pair_context(...)`
 2. `run_geo2rdr_stage(...)` (`p0`)
@@ -62,9 +62,9 @@ This means crop/normal cannot be inserted inside `run_geo2rdr_stage(...)`, becau
 
 ## Recommendation
 
-Do **not** port the `check/prep/crop` stage shell from `strip_insar.py` into `strip_insar2.py`.
+Do **not** port the `check/prep/crop` stage shell from `strip_insar.py` into `strip_insar.py`.
 
-Instead, implement a **runtime input preparation layer** in `strip_insar2.py` before `load_pair_context(...)`.
+Instead, implement a **runtime input preparation layer** in `strip_insar.py` before `load_pair_context(...)`.
 
 Recommended high-level flow:
 
@@ -78,7 +78,7 @@ Recommended high-level flow:
 8. call `load_pair_context(...)` using the prepared manifests and prepared DEM
 9. continue through existing `p0-p6` with minimal changes
 
-This keeps `strip_insar2.py` structurally simple while still reusing the useful low-level logic from `strip_insar.py`.
+This keeps `strip_insar.py` structurally simple while still reusing the useful low-level logic from `strip_insar.py`.
 
 
 ## Proposed Prepared Directory Layout
@@ -178,7 +178,7 @@ It should not be inserted into `run_geo2rdr_stage(...)` because:
 So the correct insertion point is:
 
 ```text
-process_strip_insar2(...)
+process_strip_insar(...)
   -> prepare runtime inputs
   -> load_pair_context(prepared manifests, prepared dem)
   -> existing p0-p6
@@ -187,13 +187,13 @@ process_strip_insar2(...)
 
 ## Detailed Modification Plan
 
-### 1. `scripts/strip_insar2.py`
+### 1. `scripts/strip_insar.py`
 
 This is the main integration point.
 
 #### 1.1 Extend public interface
 
-Add bbox support to `process_strip_insar2(...)` and CLI.
+Add bbox support to `process_strip_insar(...)` and CLI.
 
 Suggested new argument:
 
@@ -310,12 +310,12 @@ This should write:
 
 This summary is the only lightweight provenance file to retain.
 
-#### 1.8 Update `process_strip_insar2(...)`
+#### 1.8 Update `process_strip_insar(...)`
 
 Recommended flow:
 
 ```text
-process_strip_insar2(...)
+process_strip_insar(...)
   -> derive pair_dir
   -> _prepare_runtime_inputs(...)
   -> load_pair_context(prepared_master_manifest, prepared_slave_manifest, dem_path=prepared_dem)
@@ -343,7 +343,7 @@ Purpose:
 - control final output location and names under `prepared/slave/`
 - avoid leaving prep-stage-oriented filenames or scratch behind
 
-If no new wrapper is added here, `strip_insar2.py` will need to do more orchestration itself.
+If no new wrapper is added here, `strip_insar.py` will need to do more orchestration itself.
 
 
 ### 3. `scripts/insar_subset.py`
@@ -374,7 +374,7 @@ This is a required fix.
 
 Current `build_cropped_manifest(...)` copies `scene.json` without updating `sceneCorners`.
 
-This is unsafe because later `strip_insar2.py` may use scene corners when selecting UTM zone.
+This is unsafe because later `strip_insar.py` may use scene corners when selecting UTM zone.
 
 At minimum:
 
@@ -421,18 +421,18 @@ Recommended source to reuse:
 
 - `_resolve_dem_path(...)` logic in `scripts/strip_insar.py`
 
-Current `strip_insar2.py` DEM logic is too weak for this migration and should not remain the only path.
+Current `strip_insar.py` DEM logic is too weak for this migration and should not remain the only path.
 
 
 ## UTM / Scene Corner Risk
 
 This is the main downstream correctness risk.
 
-Current `append_utm_coordinates_hdf(...)` in `strip_insar2.py` uses scene corners first to determine the center point for UTM EPSG selection.
+Current `append_utm_coordinates_hdf(...)` in `strip_insar.py` uses scene corners first to determine the center point for UTM EPSG selection.
 
 If cropped manifests keep full-scene corners, UTM zone selection may be wrong for cropped edge cases.
 
-Recommended fix in `strip_insar2.py`:
+Recommended fix in `strip_insar.py`:
 
 - if input is marked as prepared/cropped
   - prefer deriving center lon/lat from HDF `longitude/latitude`
@@ -454,10 +454,10 @@ Do not migrate the following from `strip_insar.py`:
 Reason:
 
 - the target workflow explicitly does not want to retain those intermediate outputs
-- `strip_insar2.py` should remain a streamlined runtime pipeline
+- `strip_insar.py` should remain a streamlined runtime pipeline
 
 
-## Impact on Existing `strip_insar2.py` Stages
+## Impact on Existing `strip_insar.py` Stages
 
 ### p0
 
@@ -517,7 +517,7 @@ Verify only `prepared/` final artifacts are retained after preparation completes
 
 ### Phase 1 ✅ COMPLETED
 
-1. ✅ add bbox parameter to `strip_insar2.py`
+1. ✅ add bbox parameter to `strip_insar.py`
 2. ✅ derive pair directory before context construction
 3. ✅ implement `_prepare_runtime_inputs(...)`
 4. ✅ implement slave normalization wrapper
@@ -525,7 +525,7 @@ Verify only `prepared/` final artifacts are retained after preparation completes
 6. ✅ implement prepared DEM staging
 7. ✅ switch `load_pair_context(...)` to prepared inputs
 8. ✅ add `prepare_summary.json`
-9. ✅ tests (see `implementation_status_strip_insar2_crop.md`)
+9. ✅ tests (see `implementation_status_strip_insar_crop.md`)
 
 ### Phase 2 ✅ COMPLETED (partial)
 
@@ -544,10 +544,10 @@ Verify only `prepared/` final artifacts are retained after preparation completes
 **Date Completed**: 2025-04-25
 
 **Files Modified**:
-- `scripts/strip_insar2.py`: New functions `_derive_pair_identity()`, `_prepare_runtime_inputs()`
+- `scripts/strip_insar.py`: New functions `_derive_pair_identity()`, `_prepare_runtime_inputs()`
 - `scripts/insar_subset.py`: New function `_update_scene_corners_for_window()`
 
-**New File**: `implementation_status_strip_insar2_crop.md` - detailed implementation and test documentation
+**New File**: `implementation_status_strip_insar_crop.md` - detailed implementation and test documentation
 
 ---
 
@@ -560,7 +560,7 @@ Replace approximate scene-corner-based bbox-to-window conversion with a more geo
 
 Adopt the following implementation boundary:
 
-- `strip_insar2.py` handles orchestration and prepared runtime input generation
+- `strip_insar.py` handles orchestration and prepared runtime input generation
 - `insar_preprocess.py` provides slave normalization capability
 - `insar_subset.py` provides crop/subset capability, enhanced for prepared outputs
 - `insar_crop.py` remains the bbox-to-window normalizer
@@ -573,4 +573,4 @@ This is the lowest-risk path that satisfies:
 - `normal -> crop` order
 - final prepared master/slave/json/slc/dem artifacts under the work directory
 - no intermediate prep/crop stage clutter
-- minimal disruption to the existing `strip_insar2.py` downstream pipeline
+- minimal disruption to the existing `strip_insar.py` downstream pipeline

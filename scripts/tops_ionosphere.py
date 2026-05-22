@@ -16,6 +16,9 @@ __all__ = [
     "estimate_ionospheric_phase",
     "remove_ionospheric_phase",
     "write_ionosphere_summary",
+    "_grd2ion",
+    "_ion2grd",
+    "_esd_in_ionosphere",
 ]
 
 from pathlib import Path
@@ -266,3 +269,102 @@ def write_ionosphere_summary(
 
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Placeholder sub-steps for full ISCE2 ionospheric correction pipeline
+# ---------------------------------------------------------------------------
+
+def _grd2ion(
+    iono_phase_radar: np.ndarray,
+    burst: BurstRadarGrid,
+) -> np.ndarray:
+    """Convert radar-domain ionospheric phase to geo domain for filtering.
+
+    ISCE2 equivalent: runIon.py ``grd2ion`` step.
+    Uses burst radar-to-ground geometry (slant range + incidence angle)
+    to project ionospheric phase into geographic coordinates.
+
+    Parameters
+    ----------
+    iono_phase_radar : np.ndarray
+        Ionosphere phase in radar coordinates (radians).
+    burst : BurstRadarGrid
+        Radar geometry of the burst.
+
+    Returns
+    -------
+    np.ndarray
+        Ionosphere phase in geo (ground) coordinates (radians).
+        Same shape as input; pixels map to lon/lat grid.
+    """
+    # Placeholder: return input unchanged.
+    # Full implementation requires ISCE3 radar-to-geo transform:
+    #   1. Build geometry (range, incidence, azimuth time) per pixel
+    #   2. Project to lon/lat using DEM + orbit state vectors
+    #   3. Grid into geographic coordinates
+    return iono_phase_radar
+
+
+def _ion2grd(
+    iono_phase_geo: np.ndarray,
+    lons: np.ndarray,
+    lats: np.ndarray,
+    target_resolution_deg: float = 1.0 / 3600.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resample geo-domain ionospheric phase onto a regular lon/lat grid.
+
+    ISCE2 equivalent: runIon.py ``ion2grd`` step.
+
+    Parameters
+    ----------
+    iono_phase_geo : np.ndarray
+        Ionosphere phase in geographic coordinates (radians).
+    lons : np.ndarray
+        2-D longitude array matching ``iono_phase_geo`` shape.
+    lats : np.ndarray
+        2-D latitude array matching ``iono_phase_geo`` shape.
+    target_resolution_deg : float
+        Target grid resolution in degrees (default: 1 arcsec ≈ 0.000278°).
+
+    Returns
+    -------
+    (grid_phase, grid_lons, grid_lats)
+        tuple of (grid, 2D lon array, 2D lat array).
+    """
+    # Placeholder: returns the input as-is.
+    # Full implementation: scipy.interpolate.RegularGridInterpolator
+    # to resample onto a regular lon/lat grid.
+    return iono_phase_geo, lons, lats
+
+
+def _esd_in_ionosphere(
+    iono_phase: np.ndarray,
+    slc_high: np.ndarray,
+    slc_low: np.ndarray,
+    burst: BurstRadarGrid,
+) -> np.ndarray:
+    """Apply ESD within the ionospheric phase domain.
+
+    ISCE2 equivalent: runIon.py ``esd`` step applied to ionosphere.
+
+    Parameters
+    ----------
+    iono_phase : np.ndarray
+        Ionosphere phase in radians.
+    slc_high, slc_low : np.ndarray
+        High- and low-frequency sub-band SLCs for ESD overlap computation.
+    burst : BurstRadarGrid
+        Radar geometry.
+
+    Returns
+    -------
+    np.ndarray
+        ESD-corrected ionospheric phase (radians).
+    """
+    # Placeholder: return input unchanged.
+    # Full implementation:
+    #   1. Compute overlap windows in subband SLCs
+    #   2. Run ESD spectral diversity on subband IFGs
+    #   3. Add ESD correction to ionospheric phase
+    return iono_phase

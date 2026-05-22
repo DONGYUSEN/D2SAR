@@ -38,14 +38,14 @@ class StripInsar2AvgAmplitudePngTests(unittest.TestCase):
         self.assertLessEqual(int(img[0, 0]), 135)
 
     def test_avg_amplitude_png_stretches_before_utm_accumulation(self) -> None:
-        import strip_insar2
+        import strip_insar
 
         with tempfile.TemporaryDirectory() as tmp:
             input_h5 = Path(tmp) / "product.h5"
             output_png = Path(tmp) / "avg.png"
             self._write_input_h5(input_h5)
 
-            strip_insar2.write_geocoded_png(
+            strip_insar.write_geocoded_png(
                 str(input_h5),
                 str(output_png),
                 "avg_amplitude",

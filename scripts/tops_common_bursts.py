@@ -28,7 +28,10 @@ from scripts.tops_model import BurstRadarGrid, CommonBurstPair, CommonBurstSelec
 # Constants
 # ---------------------------------------------------------------------------
 
-TIME_TOLERANCE = timedelta(seconds=0.5)
+# For Sentinel-1 SAR interferometry with 24-day repeat cycles, temporal baselines
+# can be 24+ days. We use a large tolerance (30 days) to accommodate this.
+# The matching is further constrained by orbit direction and azimuth time interval.
+TIME_TOLERANCE = timedelta(days=30)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +162,7 @@ def _bursts_match(a: BurstRadarGrid, b: BurstRadarGrid) -> bool:
 
     Checks (all must pass):
     - swath / polarization match
+    - orbit direction match (ascending/descending)
     - |sensing_start difference| ≤ TIME_TOLERANCE
     - azimuth_time_interval difference ≤ 1e-9 s
     - both valid_window.num_lines > 0
@@ -169,6 +173,10 @@ def _bursts_match(a: BurstRadarGrid, b: BurstRadarGrid) -> bool:
         return False
 
     if id_a.polarization != id_b.polarization:
+        return False
+
+    # Orbit direction must match (both ascending or both descending)
+    if id_a.orbit_direction != id_b.orbit_direction:
         return False
 
     delta_start = abs((id_a.sensing_start - id_b.sensing_start).total_seconds())

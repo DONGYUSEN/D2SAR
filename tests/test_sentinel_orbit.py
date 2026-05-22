@@ -156,25 +156,49 @@ class SentinelOrbitTests(unittest.TestCase):
 
         eof_name = orbit_name("POEORB")
 
+        # State machine: first calls are for directory listing discovery,
+        # then the actual .EOF.zip download.
+        _call_count = [0]
+
         def fake_urlopen(url, timeout=120):
             del timeout
-            self.assertIn("/POEORB/S1A/2023/11/", url)
 
-            class Response:
-                def __enter__(self):
-                    return self
+            if url.endswith("/"):
+                # Directory listing request
+                _call_count[0] += 1
+                if _call_count[0] == 1:
+                    # First call: RESORB directory -> empty listing
+                    html = b"<!DOCTYPE html><html><body></body></html>"
+                else:
+                    # Second call: POEORB directory -> listing with candidate
+                    html = (
+                        b"<!DOCTYPE html><html><body>"
+                        + b'<a href="' + eof_name.encode() + b'.zip">' + eof_name.encode() + b'.zip</a>'
+                        + b"</body></html>"
+                    )
 
-                def __exit__(self, exc_type, exc, tb):
-                    return False
-
-                def read(self):
-                    with tempfile.TemporaryDirectory() as tmp:
-                        zip_path = Path(tmp) / "orbit.zip"
-                        with zipfile.ZipFile(zip_path, "w") as zf:
-                            zf.writestr(eof_name, EOF_XML)
-                        return zip_path.read_bytes()
-
-            return Response()
+                class DirResponse:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        return False
+                    def read(self):
+                        return html
+                return DirResponse()
+            else:
+                # File download request
+                class FileResponse:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        return False
+                    def read(self):
+                        with tempfile.TemporaryDirectory() as tmp:
+                            zip_path = Path(tmp) / "orbit.zip"
+                            with zipfile.ZipFile(zip_path, "w") as zf:
+                                zf.writestr(eof_name, EOF_XML)
+                            return zip_path.read_bytes()
+                return FileResponse()
 
         with tempfile.TemporaryDirectory() as tmp:
             target_dir = Path(tmp)

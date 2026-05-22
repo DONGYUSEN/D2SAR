@@ -672,7 +672,7 @@ def test_no_strip_imports():
     import ast, sys
     src = Path(__file__).parent.parent / "scripts" / "tops_registration.py"
     tree = ast.parse(src.read_text())
-    forbidden = {"strip_insar", "strip_insar2", "tops_insar"}
+    forbidden = {"strip_insar", "strip_insar", "tops_insar"}
     for node in ast.walk(tree):
         for alias in getattr(node, "names", []):
             name = alias.name

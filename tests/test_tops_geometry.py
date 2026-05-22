@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from scripts.tops_model import (
@@ -21,9 +23,11 @@ from scripts.tops_geometry import (
     burst_to_radar_grid,
     build_isce3_orbit_from_safe,
     build_doppler_lut,
+    _geo2rdr_valid_mask,
     run_geo2rdr_single_burst,
     _parse_eof_state_vectors,
     _find_eof_file,
+    _resolve_orbit_file_for_safe,
 )
 
 
@@ -472,6 +476,28 @@ class TestFindEofFile:
         assert result is not None
         assert result.name == "S1A_OPER_AUX_POEORB_TEST.EOF"
 
+class TestResolveOrbitFileForSafe:
+    """Test orbit auto-download fallback."""
+
+    def test_downloads_when_local_orbit_is_missing(self, tmp_path):
+        downloaded = tmp_path / "orbits" / "S1A_OPER_AUX_POEORB_TEST.EOF"
+        downloaded.parent.mkdir()
+        downloaded.write_text("<?xml version='1.0'?><Earth_Explorer_File></Earth_Explorer_File>")
+
+        with patch("scripts.tops_geometry._find_eof_file", return_value=None):
+            with patch("scripts.tops_geometry.resolve_orbit_for_product") as resolve_mock:
+                resolve_mock.return_value = SimpleNamespace(path=str(downloaded))
+                result = _resolve_orbit_file_for_safe(
+                    tmp_path / "S1A_IW_SLC__1SDV_20230625T114146_20230625T114213_049142_05E8CA_CCD3.SAFE",
+                    orbit_dir=None,
+                )
+
+        assert result == downloaded
+        resolve_mock.assert_called_once()
+        _, kwargs = resolve_mock.call_args
+        assert kwargs["download"] is True
+        assert kwargs["orbit_dir"] == tmp_path / "orbits"
+
 
 class TestBuildIsce3OrbitFromSafe:
     """Test ISCE3 orbit building from SAFE."""
@@ -486,24 +512,14 @@ class TestBuildIsce3OrbitFromSafe:
                     datetime(2024, 1, 15, tzinfo=UTC),
                 )
 
-    def test_raises_file_not_found_for_missing_eof(self):
-        """Raises FileNotFoundError when no EOF file is found."""
-        # Need to mock the entire isce3 module to prevent import failures
-        mock_isce3 = MagicMock()
-        mock_core = MagicMock()
-        mock_isce3.core = mock_core
-        mock_isce3.core.DateTime = MagicMock()
-        mock_isce3.core.StateVector = MagicMock()
-        mock_isce3.core.Orbit = MagicMock()
-        mock_isce3.core.OrbitInterpMethod = MagicMock()
-
+    def test_raises_file_not_found_when_auto_download_fails(self):
+        """Raises FileNotFoundError when local EOF is missing and download fails."""
         with patch("scripts.tops_geometry._find_eof_file", return_value=None):
-            with patch.dict("sys.modules", {"isce3": mock_isce3, "isce3.core": mock_core}):
-                with pytest.raises(FileNotFoundError, match="No POEORB or RESORB"):
-                    build_isce3_orbit_from_safe(
-                        Path("/fake/safe"),
-                        datetime(2024, 1, 15, tzinfo=UTC),
-                        datetime(2024, 1, 15, tzinfo=UTC),
+            with patch("scripts.tops_geometry.resolve_orbit_for_product", return_value=None):
+                with pytest.raises(FileNotFoundError, match="auto-download"):
+                    _resolve_orbit_file_for_safe(
+                        Path("/fake/S1A_IW_SLC__1SDV_20240115T040000_20240115T040002_TEST.SAFE"),
+                        orbit_dir=None,
                     )
 
 
@@ -530,6 +546,16 @@ class TestRunGeo2RdrSingleBurst:
                     dem_path=Path("/fake/dem.tif"),
                     work_dir=Path("/tmp/geo2rdr_work"),
                 )
+
+class TestGeo2RdrValidMask:
+    """Validate ISCE3 Geo2Rdr NULL_VALUE handling."""
+
+    def test_null_value_cells_are_excluded(self):
+        range_offsets = np.array([[0.0, -1.0e6], [1.5, 2.0]])
+        azimuth_offsets = np.array([[0.0, 3.0], [-1.0e6, 4.0]])
+        mask = _geo2rdr_valid_mask(range_offsets, azimuth_offsets)
+        assert mask.dtype == bool
+        assert mask.tolist() == [[True, False], [False, True]]
 
 
 # ---------------------------------------------------------------------------

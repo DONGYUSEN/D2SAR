@@ -163,26 +163,42 @@ def download_orbit_file(
     urlopen=default_urlopen,
     timeout: int = 120,
 ) -> str:
+    """Download orbit by discovering the real filename from ESA STEP directory listing."""
     target = Path(target_dir)
     target.mkdir(parents=True, exist_ok=True)
     errors = []
     for kind in ("POEORB", "RESORB"):
-        for url in _candidate_orbit_urls(info, kind):
-            try:
-                with urlopen(url, timeout=timeout) as response:
-                    payload = response.read()
-            except Exception as exc:
-                errors.append(f"{url}: {exc}")
-                continue
+        real_filename = _discover_orbit_filename(info, kind, urlopen)
+        if real_filename is None:
+            errors.append(f"{kind}: no valid orbit file found on ESA STEP")
+            continue
 
-            zip_path = target / Path(url).name
-            zip_path.write_bytes(payload)
-            eof_path = _materialize_orbit(zip_path)
-            if _find_best_orbit(info, target) is not None:
-                return str(eof_path)
-            errors.append(f"{url}: downloaded orbit does not cover product time")
+        year = info.stop.strftime("%Y")
+        month = info.stop.strftime("%m")
+        platform = info.platform
+        download_url = (
+            f"https://step.esa.int/auxdata/orbits/Sentinel-1/"
+            f"{kind}/{platform}/{year}/{month}/{real_filename}"
+        )
 
-    raise RuntimeError("Failed to download Sentinel-1 orbit with internal downloader: " + "; ".join(errors))
+        try:
+            with urlopen(download_url, timeout=timeout) as response:
+                payload = response.read()
+        except Exception as exc:
+            errors.append(f"{download_url}: {exc}")
+            continue
+
+        zip_path = target / real_filename
+        zip_path.write_bytes(payload)
+        eof_path = _materialize_orbit(zip_path)
+        if _find_best_orbit(info, target) is not None:
+            return str(eof_path)
+        errors.append(f"{download_url}: downloaded orbit does not cover product time")
+
+    raise RuntimeError(
+        "Failed to download Sentinel-1 orbit with internal downloader: "
+        + "; ".join(errors)
+    )
 
 
 def _fetch_orbit(product_path: str | Path, target_dir: Path, product_info: ProductInfo | None = None) -> None:
@@ -190,26 +206,49 @@ def _fetch_orbit(product_path: str | Path, target_dir: Path, product_info: Produ
     download_orbit_file(info, target_dir)
 
 
-def _candidate_orbit_urls(info: ProductInfo, kind: str) -> list[str]:
-    sensing_day = info.stop
-    year = sensing_day.strftime("%Y")
-    month = sensing_day.strftime("%m")
-    dates = [sensing_day + timedelta(days=offset) for offset in range(0, 31)]
-    names = []
-    for publish in dates:
-        publish_txt = publish.strftime("%Y%m%d")
-        start_txt = (sensing_day - timedelta(days=1)).strftime("%Y%m%dT225942")
-        stop_txt = (sensing_day + timedelta(days=1)).strftime("%Y%m%dT005942")
-        names.append(
-            f"{info.platform}_OPER_AUX_{kind}_OPOD_{publish_txt}T080803_V{start_txt}_{stop_txt}.EOF.zip"
-        )
+def _discover_orbit_filename(
+    info: ProductInfo,
+    kind: str,
+    urlopen=default_urlopen,
+) -> str | None:
+    """Discover the real orbit .EOF.zip filename from the ESA STEP directory listing.
 
-    urls = []
-    for name in names:
-        urls.append(f"https://step.esa.int/auxdata/orbits/Sentinel-1/{kind}/{info.platform}/{year}/{month}/{name}")
-        if kind == "POEORB":
-            urls.append(f"https://s1qc.asf.alaska.edu/aux_poeorb/{name[:-4]}")
-    return urls
+    Instead of guessing a hard-coded publish timestamp, this function fetches the
+    directory index for the product's year/month, parses all .EOF.zip filenames,
+    and returns the one whose coverage window best fits the sensing time of the
+    product.
+    """
+    year = info.stop.strftime("%Y")
+    month = info.stop.strftime("%m")
+    platform = info.platform
+    dir_url = f"https://step.esa.int/auxdata/orbits/Sentinel-1/{kind}/{platform}/{year}/{month}/"
+
+    try:
+        with urlopen(dir_url, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise RuntimeError(f"Cannot list orbit directory {dir_url}: {exc}") from exc
+
+    # Parse all .EOF.zip filenames from the HTML listing
+    import re as _re
+    pattern = _re.compile(
+        rf"{info.platform}_OPER_AUX_{kind}_OPOD_\d+T\d+_V\d+T\d+_\d+T\d+\.EOF\.zip"
+    )
+    candidates = pattern.findall(html)
+    if not candidates:
+        return None
+
+    # For each candidate, find coverage interval and select the first one that
+    # covers the product sensing time with the standard ±60s margin.
+    for candidate in sorted(candidates):
+        parsed = _parse_orbit_filename(candidate)
+        if parsed is None:
+            continue
+        _, orbit_kind, start, stop = parsed
+        margin = timedelta(seconds=60)
+        if start + margin <= info.start and info.stop <= stop - margin:
+            return candidate
+    return None
 
 
 def _product_path_from_manifest(manifest: dict, base_dir: Path) -> str:

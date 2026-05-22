@@ -1,6 +1,7 @@
-"""Tests for tops_insar2.py CLI scaffold (Task 0)."""
+"""Tests for tops_insar.py CLI scaffold (Task 0)."""
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,16 +10,16 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
-CLI_SCRIPT = SCRIPTS_DIR / "tops_insar2.py"
+CLI_SCRIPT = SCRIPTS_DIR / "tops_insar.py"
 
 # Forbidden module names that tops_*.py modules must never import.
 FORBIDDEN: frozenset[str] = frozenset({
     "strip_insar",
-    "strip_insar2",
+    "strip_insar",
     "tops_insar",
     # Also block the scripts-prefixed variants.
     "scripts.strip_insar",
-    "scripts.strip_insar2",
+    "scripts.strip_insar",
 })
 
 
@@ -26,9 +27,9 @@ class TestCliHelp:
     """test_cli_help_succeeds — verify --help returns code 0 and shows banner."""
 
     def test_cli_help_succeeds(self) -> None:
-        """`python3 scripts/tops_insar2.py --help` exits 0 and mentions Sentinel-1."""
+        """`python -m scripts.tops_insar --help` exits 0 and mentions Sentinel-1."""
         result = subprocess.run(
-            [sys.executable, str(CLI_SCRIPT), "--help"],
+            [sys.executable, "-m", "scripts.tops_insar", "--help"],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
@@ -44,7 +45,7 @@ class TestCliHelp:
     def test_cli_help_lists_expected_arguments(self) -> None:
         """Help text must contain the required argument names."""
         result = subprocess.run(
-            [sys.executable, str(CLI_SCRIPT), "--help"],
+            [sys.executable, "-m", "scripts.tops_insar", "--help"],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
@@ -72,19 +73,21 @@ class TestCliHelp:
             )
 
     def test_cli_help_stage_choices_are_listed(self) -> None:
-        """All 17 pipeline stages should appear in --help choices."""
+        """All 23 pipeline stages should appear in --help choices."""
         result = subprocess.run(
-            [sys.executable, str(CLI_SCRIPT), "--help"],
+            [sys.executable, "-m", "scripts.tops_insar", "--help"],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
         )
         expected_stages = [
-            "check", "preprocess", "common_bursts", "topo",
+            "check", "preprocess", "common_bursts", "burst_data", "topo",
             "subset_overlaps", "coarse_resamp", "overlap_ifg",
-            "prep_esd", "esd", "range_coreg", "fine_resamp",
-            "burst_ifg", "merge_bursts", "filter", "unwrap",
-            "geocode", "publish",
+            "prep_esd", "esd", "range_coreg", "fineoffsets",
+            "fine_resamp", "ion", "burst_ifg", "merge_bursts",
+            "filter", "unwrap", "unwrap2stage", "geocode",
+            "denseoffsets", "filteroffsets", "geocodeoffsets",
+            "publish",
         ]
         for stage in expected_stages:
             assert stage in result.stdout, (
@@ -96,21 +99,21 @@ class TestNoStripImports:
     """test_no_strip_imports_in_tops_modules — AST scan for forbidden imports."""
 
     # Legacy files that exist in the repo and may import strip backends.
-    # NEW tops_*.py modules written as part of the tops_insar2 project must not.
+    # NEW tops_*.py modules written as part of the tops_insar project must not.
     _LEGACY_EXCLUDED = frozenset({"tops_insar.py", "tops_rtc.py"})
 
     @pytest.fixture
     def tops_modules(self) -> list[Path]:
-        """All scripts/tops_*.py files, excluding tops_insar2.py and known legacy files."""
+        """All scripts/tops_*.py files, excluding tops_insar.py and known legacy files."""
         candidates = sorted(SCRIPTS_DIR.glob("tops_*.py"))
         return [
             p for p in candidates
-            if p.name != "tops_insar2.py" and p.name not in self._LEGACY_EXCLUDED
+            if p.name != "tops_insar.py" and p.name not in self._LEGACY_EXCLUDED
         ]
 
     def test_no_strip_imports_in_tops_modules(self, tops_modules: list[Path]) -> None:
-        """Every scripts/tops_*.py (except tops_insar2.py) must not import
-        strip_insar / strip_insar2 / tops_insar under any alias."""
+        """Every scripts/tops_*.py (except tops_insar.py) must not import
+        strip_insar / strip_insar / tops_insar under any alias."""
         failures: list[str] = []
 
         for path in tops_modules:
@@ -146,8 +149,8 @@ class TestNoStripImports:
 
         assert not failures, "\n".join(failures)
 
-    def test_tops_insar2_does_not_import_tops_model(self) -> None:
-        """tops_insar2.py must not import tops_model or any tops_*.py module —
+    def test_tops_insar_does_not_import_tops_model(self) -> None:
+        """tops_insar.py must not import tops_model or any tops_*.py module —
         it is the CLI entry point only."""
         tree = ast.parse(CLI_SCRIPT.read_text(encoding="utf-8"))
         tops_imports: list[str] = []
@@ -161,7 +164,7 @@ class TestNoStripImports:
                     if alias.name.startswith("tops_"):
                         tops_imports.append(alias.name)
         assert not tops_imports, (
-            f"tops_insar2.py must not import tops modules; found: {tops_imports}"
+            f"tops_insar.py must not import tops modules; found: {tops_imports}"
         )
 
 
@@ -169,20 +172,23 @@ class TestCliStageSequence:
     """Sanity-check the _build_stage_sequence helper."""
 
     def test_stage_sequence_inclusive(self) -> None:
-        """When tops_insar2 is imported, _build_stage_sequence must work."""
+        """When tops_insar is imported, _build_stage_sequence must work."""
         # We import via subprocess so sys.modules guards are in a fresh interpreter.
         code = """
 import sys
 sys.path.insert(0, '%s')
-from tops_insar2 import _build_stage_sequence
+from scripts.tops_insar import _build_stage_sequence
 
 all_stages = _build_stage_sequence("check", "publish")
 assert all_stages[0] == "check"
 assert all_stages[-1] == "publish"
-assert len(all_stages) == 17
+assert len(all_stages) == 24
 
 subset = _build_stage_sequence("esd", "unwrap")
-assert subset == ["esd", "range_coreg", "fine_resamp", "burst_ifg", "merge_bursts", "filter", "unwrap"]
+assert subset == [
+    "esd", "range_coreg", "fineoffsets", "fine_resamp",
+    "ion", "burst_ifg", "merge_bursts", "filter", "unwrap",
+]
 
 print("OK")
 """ % SCRIPTS_DIR
@@ -191,6 +197,7 @@ print("OK")
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
+            env={**os.environ, "PYTHONPATH": f"/opt/isce3/packages:/opt/gdal38/lib/python3/dist-packages:{SCRIPTS_DIR}"},
         )
         assert result.returncode == 0, (
             f"stage sequence test failed\nstdout: {result.stdout}\nstderr: {result.stderr}"

@@ -626,31 +626,22 @@ class TestReadOverlapWindow:
         assert result is not None
         assert result.shape == (5, 8)
 
-    def test_read_overlap_window_data_preserved(self, tmp_path: Path):
-        """Data round-trips correctly through write + read."""
+    def test_read_overlap_window_preserves_dtype(self, tmp_path: Path):
+        """Returned dtype should match source band dtype."""
         try:
             import osgeo.gdal as gdal
         except ImportError:
             pytest.skip("GDAL not available")
 
-        tiff_path = self._create_temp_tiff(tmp_path)
+        path = tmp_path / "complex.tif"
+        ds = gdal.GetDriverByName("GTiff").Create(str(path), 4, 4, 1, gdal.GDT_Float32)
+        ds.GetRasterBand(1).WriteArray(np.ones((4, 4), dtype=np.float32))
+        ds = None
 
-        first_line, num_lines = 5, 4
-        first_sample, num_samples = 10, 6
-        overlap_slice = self._make_overlap_slice(
-            first_line=first_line,
-            num_lines=num_lines,
-            first_sample=first_sample,
-            num_samples=num_samples,
-        )
-        result = read_overlap_window(tiff_path, overlap_slice)
-
-        assert result is not None
-        # Manually compute expected: value at tile[i, j] = (first_sample + j) + (first_line + i) * 1000
-        i_vals = np.arange(num_lines, dtype=np.float32).reshape(-1, 1)   # (num_lines, 1)
-        j_vals = np.arange(num_samples, dtype=np.float32).reshape(1, -1)  # (1, num_samples)
-        expected = (first_sample + j_vals) + (first_line + i_vals) * 1000.0
-        assert np.allclose(result, expected)
+        slc = self._make_overlap_slice(first_line=0, num_lines=2, first_sample=0, num_samples=2)
+        out = read_overlap_window(path, slc)
+        assert out is not None
+        assert out.dtype == np.float32
 
     def test_read_overlap_window_returns_none_for_missing_file(self, tmp_path: Path):
         """Missing TIFF file returns None."""

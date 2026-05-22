@@ -1,10 +1,10 @@
-# tops_insar2.py — From-Scratch Sentinel-1 TOPS ISCE3-Native Implementation Plan
+# tops_insar.py — From-Scratch Sentinel-1 TOPS ISCE3-Native Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement a complete, self-contained Sentinel-1 TOPS InSAR processor (`scripts/tops_insar2.py`) that replaces all strip-backend-coupled logic, uses ISCE3 lower-level primitives for registration/resampling/interferogram generation, and produces scientifically comparable results to ISCE2 `topsApp` on the burst level.
+**Goal:** Implement a complete, self-contained Sentinel-1 TOPS InSAR processor (`scripts/tops_insar.py`) that replaces all strip-backend-coupled logic, uses ISCE3 lower-level primitives for registration/resampling/interferogram generation, and produces scientifically comparable results to ISCE2 `topsApp` on the burst level.
 
-**Architecture:** `tops_insar2.py` is the single CLI/orchestrator entry point. All algorithmic logic lives in `scripts/tops_*.py` modules. There is no dependency on `scripts/strip_insar.py`, `scripts/strip_insar2.py`, or `scripts/tops_insar.py`. Each module has one clear responsibility. The pipeline flow mirrors ISCE2 `topsApp` stage by stage. ISCE3 lower-level primitives are used directly; high-level `nisar.workflows.*.run(cfg)` is permitted only after a task explicitly proves Sentinel-1 burst compatibility via parity test.
+**Architecture:** `tops_insar.py` is the single CLI/orchestrator entry point. All algorithmic logic lives in `scripts/tops_*.py` modules. There is no dependency on `scripts/strip_insar.py`, `scripts/strip_insar.py`, or `scripts/tops_insar.py`. Each module has one clear responsibility. The pipeline flow mirrors ISCE2 `topsApp` stage by stage. ISCE3 lower-level primitives are used directly; high-level `nisar.workflows.*.run(cfg)` is permitted only after a task explicitly proves Sentinel-1 burst compatibility via parity test.
 
 **Tech Stack:** Python, NumPy, GDAL/rasterio, existing D2SAR IO utilities, vendored ISCE3 (`isce3.geometry`, `isce3.image`, `isce3.image.v2`, `isce3.matchtemplate`, `isce3.signal`, `isce3.math`), pytest. Reference: `/home/ysdong/Software/isce/isce2/applications/topsApp.py` and `/home/ysdong/Software/isce/isce2/components/isceobj/TopsProc/*.py`.
 
@@ -13,7 +13,7 @@
 ## 0. Non-Negotiable Constraints
 
 1. **Burst is the fundamental unit.** Every pipeline stage operates on burst-level objects, not full-swath or full-scene rasters.
-2. **Zero strip backend imports.** `tops_insar2.py` and all `scripts/tops_*.py` modules must not import `strip_insar`, `strip_insar2`, `tops_insar`, or copy helpers from them.
+2. **Zero strip backend imports.** `tops_insar.py` and all `scripts/tops_*.py` modules must not import `strip_insar`, `strip_insar`, `tops_insar`, or copy helpers from them.
 3. **No empty shell algorithms.** Every function must compute something real; every module must be testable before a later module depends on it.
 4. **ISCE2 parity gates each phase.** Before advancing from one algorithmic phase to the next, intermediate products must be compared against ISCE2 `topsApp` output on at least one real Sentinel-1 pair.
 5. **Lower-level ISCE3 primitives first.** Build Sentinel-1 burst radar grids, orbit objects, Doppler LUTs, rasters, offsets, and products explicitly; then call ISCE3 primitives. High-level NISAR workflows are deferred until parity is proven.
@@ -27,7 +27,7 @@
 
 | File | Responsibility | Lines (est.) |
 |---|---|---|
-| `scripts/tops_insar2.py` | CLI entry, argument parsing, stage dispatch loop, work directory management | ~300 |
+| `scripts/tops_insar.py` | CLI entry, argument parsing, stage dispatch loop, work directory management | ~300 |
 | `scripts/tops_model.py` | Immutable dataclasses: burst identity, radar grid, overlap slices, common burst pair, ESD estimate, merge segment, timing correction | ~300 |
 | `scripts/tops_metadata.py` | Parse Sentinel-1 SAFE/manifest into `tops_model` objects; normalize annotation fields; validate required metadata | ~400 |
 | `scripts/tops_common_bursts.py` | Global-integer-offset continuous-span common burst matching; write `common_bursts.json` | ~200 |
@@ -432,7 +432,7 @@ coherence = |mean(exp(j * angle(IFG_ml))|
 
 ---
 
-#### `tops_insar2.py` — CLI 入口与调度
+#### `tops_insar.py` — CLI 入口与调度
 
 **职责：** 参数解析、stage 顺序控制、work dir 管理、swath 循环、逐模块调用。
 
@@ -514,15 +514,15 @@ main()
 
 ## 2. Implementation Tasks
 
-### Task 0: Bootstrap `tops_insar2.py` CLI scaffold
+### Task 0: Bootstrap `tops_insar.py` CLI scaffold
 
 **Files:**
-- Create: `scripts/tops_insar2.py`
-- Create: `tests/test_tops_insar2_cli.py`
+- Create: `scripts/tops_insar.py`
+- Create: `tests/test_tops_insar_cli.py`
 
 - [ ] **Step 1: Write the CLI skeleton**
 
-Create `scripts/tops_insar2.py`:
+Create `scripts/tops_insar.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -537,8 +537,8 @@ import sys
 from pathlib import Path
 
 BLOCK_GURADS = {
-    "strip_insar", "strip_insar2",
-    "scripts.strip_insar", "scripts.strip_insar2",
+    "strip_insar", "strip_insar",
+    "scripts.strip_insar", "scripts.strip_insar",
     "tops_insar",
 }
 for _name in BLOCK_GURADS:
@@ -577,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, args.log_level))
-    log = logging.getLogger("tops_insar2")
+    log = logging.getLogger("tops_insar")
 
     if not args.output_dir.exists():
         args.output_dir.mkdir(parents=True)
@@ -588,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Processing swath %s", swath)
         _run_swath(args, swath, stages)
 
-    log.info("tops_insar2 complete: %s", args.output_dir)
+    log.info("tops_insar complete: %s", args.output_dir)
     return 0
 
 
@@ -620,7 +620,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Write the CLI test**
 
-Create `tests/test_tops_insar2_cli.py`:
+Create `tests/test_tops_insar_cli.py`:
 
 ```python
 import subprocess
@@ -630,7 +630,7 @@ import pytest
 
 def test_cli_help_succeeds():
     result = subprocess.run(
-        [sys.executable, "scripts/tops_insar2.py", "--help"],
+        [sys.executable, "scripts/tops_insar.py", "--help"],
         capture_output=True, text=True
     )
     assert result.returncode == 0
@@ -643,14 +643,14 @@ def test_no_strip_imports_in_tops_modules():
         for node in ast.walk(tree):
             for alias in getattr(node, "names", []):
                 name = alias.name
-                assert name not in ("strip_insar", "strip_insar2", "tops_insar"), \
+                assert name not in ("strip_insar", "strip_insar", "tops_insar"), \
                     f"{path} imports {name}"
 ```
 
 - [ ] **Step 3: Run tests and verify they fail**
 
 ```bash
-pytest tests/test_tops_insar2_cli.py -v
+pytest tests/test_tops_insar_cli.py -v
 ```
 
 Expected: PASS (stub is empty — scaffold verified).
@@ -658,8 +658,8 @@ Expected: PASS (stub is empty — scaffold verified).
 - [ ] **Step 4: Commit**
 
 ```bash
-git add scripts/tops_insar2.py tests/test_tops_insar2_cli.py
-git commit -m "feat: bootstrap tops_insar2.py CLI scaffold"
+git add scripts/tops_insar.py tests/test_tops_insar_cli.py
+git commit -m "feat: bootstrap tops_insar.py CLI scaffold"
 ```
 
 ---
@@ -910,7 +910,7 @@ git commit -m "feat: add tops2 burst data model"
 **Files:**
 - Create: `scripts/tops_metadata.py`
 - Create: `tests/test_tops_metadata.py`
-- Modify: `tests/test_tops_insar2_cli.py`
+- Modify: `tests/test_tops_insar_cli.py`
 
 - [ ] **Step 1: Write Sentinel-1 manifest parser**
 
@@ -2525,11 +2525,11 @@ git commit -m "feat: add valid-window-aware burst merge"
 ### Task 13: Stitch main CLI pipeline together
 
 **Files:**
-- Modify: `scripts/tops_insar2.py`
+- Modify: `scripts/tops_insar.py`
 
 - [ ] **Step 1: Implement `_run_swath`**
 
-Replace the `raise NotImplementedError` in `scripts/tops_insar2.py`:
+Replace the `raise NotImplementedError` in `scripts/tops_insar.py`:
 
 ```python
 from scripts.tops_metadata import parse_sentinel1_safe
@@ -2542,7 +2542,7 @@ from scripts.tops_merge import plan_merge_segments, merge_burst_ifgs
 
 
 def _run_swath(args, swath: str, stages: list[str]) -> None:
-    log = logging.getLogger("tops_insar2")
+    log = logging.getLogger("tops_insar")
     swath_dir = args.output_dir / swath
     swath_dir.mkdir(exist_ok=True)
 
@@ -2613,7 +2613,7 @@ def _run_swath(args, swath: str, stages: list[str]) -> None:
 - [ ] **Step 2: Write integration smoke test**
 
 ```python
-def test_tops_insar2_cli_produces_output(tmp_path):
+def test_tops_insar_cli_produces_output(tmp_path):
     # Requires real Sentinel-1 data — document expected behavior
     pytest.skip("Integration test requires Sentinel-1 data")
 ```
@@ -2621,8 +2621,8 @@ def test_tops_insar2_cli_produces_output(tmp_path):
 - [ ] **Step 3: Run CLI help and basic import test**
 
 ```bash
-python3 scripts/tops_insar2.py --help
-pytest tests/test_tops_insar2_cli.py -v
+python3 scripts/tops_insar.py --help
+pytest tests/test_tops_insar_cli.py -v
 ```
 
 Expected: PASS.
@@ -2630,8 +2630,8 @@ Expected: PASS.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add scripts/tops_insar2.py
-git commit -m "feat: stitch tops_insar2 main pipeline"
+git add scripts/tops_insar.py
+git commit -m "feat: stitch tops_insar main pipeline"
 ```
 
 ---
@@ -2683,26 +2683,26 @@ Gate: Merged IFG seam phase median < 0.5 rad on validation pair.
 After Phase 1:
 
 ```bash
-pytest tests/test_tops_insar2_cli.py tests/test_tops_model.py tests/test_tops_metadata.py tests/test_tops_common_bursts.py tests/test_tops_overlap.py tests/test_tops_esd.py -v
+pytest tests/test_tops_insar_cli.py tests/test_tops_model.py tests/test_tops_metadata.py tests/test_tops_common_bursts.py tests/test_tops_overlap.py tests/test_tops_esd.py -v
 ```
 
 After Phase 2:
 
 ```bash
-pytest tests/test_tops_insar2_cli.py tests/test_tops_model.py tests/test_tops_metadata.py tests/test_tops_common_bursts.py tests/test_tops_overlap.py tests/test_tops_deramp.py tests/test_tops_esd.py tests/test_tops_geometry.py tests/test_tops_range_coreg.py tests/test_tops_registration.py -v
+pytest tests/test_tops_insar_cli.py tests/test_tops_model.py tests/test_tops_metadata.py tests/test_tops_common_bursts.py tests/test_tops_overlap.py tests/test_tops_deramp.py tests/test_tops_esd.py tests/test_tops_geometry.py tests/test_tops_range_coreg.py tests/test_tops_registration.py -v
 ```
 
 After Phase 3:
 
 ```bash
-pytest tests/test_tops_insar2_*.py -v
-python3 scripts/tops_insar2.py --help
+pytest tests/test_tops_insar_*.py -v
+python3 scripts/tops_insar.py --help
 ```
 
 Full pipeline:
 
 ```bash
-python3 scripts/tops_insar2.py OUTPUT_DIR MASTER_SAFE SLAVE_SAFE --swath IW2 --end-stage burst_ifg
+python3 scripts/tops_insar.py OUTPUT_DIR MASTER_SAFE SLAVE_SAFE --swath IW2 --end-stage burst_ifg
 ```
 
 ---
@@ -2711,7 +2711,7 @@ python3 scripts/tops_insar2.py OUTPUT_DIR MASTER_SAFE SLAVE_SAFE --swath IW2 --e
 
 The refactor is complete when ALL of the following are true:
 
-- `scripts/tops_insar2.py` imports zero lines from `strip_insar`, `strip_insar2`, `tops_insar`.
+- `scripts/tops_insar.py` imports zero lines from `strip_insar`, `strip_insar`, `tops_insar`.
 - All 13 modules (`tops_model` through `tops_merge`) pass their unit tests.
 - Geo2Rdr spike produces finite offsets on at least one real Sentinel-1 burst pair.
 - ESD recovers a known azimuth offset on synthetic overlap data within 0.5 pixel tolerance.
@@ -2725,7 +2725,7 @@ The refactor is complete when ALL of the following are true:
 
 The following are not part of this plan:
 
-- `strip_insar2.process_strip_insar2()` — not called, not wrapped
+- `strip_insar.process_strip_insar()` — not called, not wrapped
 - `tops_insar._run_local_tops_backend_for_swath()` — not used
 - `tops_insar._run_overlap_esd_backend_for_swath()` with raw SLC ESD — replaced by Task 10
 - `tops_insar._apply_tops_deramp()` no-op — replaced by Task 7

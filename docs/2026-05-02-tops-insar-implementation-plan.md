@@ -77,10 +77,10 @@
 文件：
 1. 修改 `scripts/tops_insar.py`
 2. 复用 `scripts/sentinel_importer.py`、`scripts/tops_geometry.py`
-3. 复用 `scripts/strip_insar2.py` 中已稳定工具函数（通过导入）
+3. 复用 `scripts/strip_insar.py` 中已稳定工具函数（通过导入）
 
 任务：
-1. 实现 stage runner（与 `strip_insar2` 同风格）；
+1. 实现 stage runner（与 `strip_insar` 同风格）；
 2. 先落地 `check/prep/p0`，产出可检查的中间文件与 stage record；
 3. topo 阶段支持 `--topo-gpu` 与静默日志包装。
 
@@ -99,7 +99,7 @@
 2. 必要时新增 `scripts/tops_insar_merge.py`
 
 任务：
-1. 复用 `strip_insar2` 的配准/crossmul/filter 能力；
+1. 复用 `strip_insar` 的配准/crossmul/filter 能力；
 2. 在 TOPS 语义下完成 burst 到 swath merge；
 3. 输出：
    - `mosaic_interferogram_radar.h5`
@@ -249,3 +249,29 @@ python3 scripts/tops_insar.py \
 1. 先做 Phase A（CLI + plan）；
 2. 再做 Phase B（单 swath MVP）；
 3. 最后做 Phase C（多 swath 编排/邻接合并）。
+
+---
+
+## 6. 实测回放（2026-05-11）
+
+使用 `/home/ysdong/Temp` 下真实 Sentinel-1 IW1 数据，在 Docker 中完成 burst-limit=2 的处理验证。实测中逐项修复了以下问题：
+1. `overlap_ifg` 的重叠窗口边界计算错误，导致 overlap 退化为零数组；修正为 valid-window 交集后恢复真实 overlap；
+2. `fine_resamp` 阶段未尊重 `--burst-limit`，导致调试样例外的 burst 被误处理；已限制为 `_limited_pairs(common, state)`；
+3. `merge_bursts` 早期按 `valid_window` 直接放置，导致输出并非 RD 镶嵌；已改为按 RD 坐标系布局，使用 `plan_merge_segments()` 生成 segment；
+
+## 7. 几何链路修正任务（2026-05-12）
+
+`tops_insar.py` 的 burst 级粗配准实现必须遵守 ISCE3 `rdr2geo/geo2rdr` 输入输出契约：
+1. `DEM` 保持单波段，只作为 `Rdr2Geo.topo()` 输入；
+2. `Rdr2Geo` 在参考 burst 的 RD 网格上输出 `topo.vrt`；
+3. `Geo2Rdr` 在 secondary burst 的 RD 网格上读取该 `topo.vrt`，输出 secondary 相对参考 RD 网格的 range/azimuth offsets；
+4. 禁止用“复制 DEM 为三波段”的方式伪造 `Geo2Rdr` 输入；
+5. `Geo2Rdr` 输出的 `-1e6` 无效像元不参与 offset 统计；
+6. 若 `--gpu-mode auto` 下 CUDA geometry 绑定不可用，应回退 CPU，避免真实数据批处理因环境差异中断。
+4. `EsdEstimate` 增加 `mean_coherence` 字段后，`compute_esd_timing_correction()` 已同步更新。
+
+实测结果：
+1. `overlap_ifg` 成功读取真实窗口，`coherence_mean=1.000`；
+2. `prep_esd`、`esd`、`range_coreg`、`fineoffsets`、`fine_resamp` 正常执行；
+3. `merge_bursts` 输出 `shape=(2796, 20470)`，`gap_pixels=0`；
+4. PNG 已导出：`wrapped.png`、`coherence.png`、`unwrapped.png`、`filtered.png`。

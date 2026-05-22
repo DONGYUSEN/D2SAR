@@ -1,68 +1,34 @@
-# tops_insar2 代码完善计划
+# tops_insar 文档对照审查记录
 
-## 目标
-系统梳理当前 tops_insar2 实现情况，识别缺失功能，补全实现。
+## 审查目标
+对照开发文档，检查 `tops_insar.py` 功能实现与代码衔接情况，并记录差异。
 
-## 审查范围（根据 PLAN.md）
+## 已检查模块
+- `tops_insar.py`
+- `tops_registration.py`
+- `tops_overlap.py`
+- `tops_publish.py`
+- `tops_utils.py`
 
-### 模块接口核对清单
+## 当前结论
 
-| # | 模块 | 状态 | 说明 |
-|---|---|---|---|
-| 1 | tops_model.py | ✅ 已实现 | 15 个 frozen dataclass |
-| 2 | tops_metadata.py | ✅ 已实现 | SAFE/XML 解析 |
-| 3 | tops_common_bursts.py | ✅ 已实现 | global integer offset 匹配 |
-| 4 | tops_geometry.py | ✅ 已实现 | ISCE3 orbit/doppler/Geo2Rdr |
-| 5 | tops_overlap.py | ✅ 已实现 | top/bottom overlap 物化 |
-| 6 | tops_deramp.py | ✅ 已实现 | TOPS deramp/reramp |
-| 7 | tops_registration.py | 🔶 部分 | coarse resamp OK, fine_resamp 待检查 |
-| 8 | tops_range_coreg.py | ✅ 已实现 | range 配准 |
-| 9 | tops_esd.py | ✅ 已实现 | ESD 时序校正 |
-| 10 | tops_ifg.py | ✅ 已实现 | cross-multiply IFG |
-| 11 | tops_merge.py | ✅ 已实现 | valid-window merge |
-| 12 | tops_utils.py | ✅ 已实现 | 共享工具 |
-| 13 | tops_publish.py | ✅ 已实现 | geocode/publish |
-| 14 | tops_ionosphere.py | ✅ 已实现 | split-band ionosphere |
-| 15 | tops_insar2.py | 🔶 部分 | CLI OK, _run_swath 待检查 |
+### 已对齐
+- `STAGE_SEQUENCE` 完整覆盖文档中的 stage。
+- `_dispatch_stage` 已连接所有 stage。
+- `fine_resamp -> burst_ifg -> merge_bursts -> filter -> unwrap -> geocode -> publish` 衔接正常。
+- `fine_resample_with_timing` 已接入 `_stage_fine_resamp`。
+- `filter_ifg` 已接入 `_stage_filter`。
+- `geocode_ifg / unwrap_ifg / write_product` 已接入 `_stage_geocode` / `_stage_publish`。
 
-## 待深入检查项
+### 需要注意的差异（非阻塞）
+1. `tops_insar.py` 中部分 stage 注释仍残留 “spike” 字样，但函数已实现。
+2. `geocode` 阶段目前输出 `.npy` 中间文件，最终 TIFF/HDF5 由 `publish` 阶段统一写出。
+3. `preprocess` / `common_bursts` 的职责拆分与文档描述略有差异，但不影响执行链路。
 
-### A. tops_registration.py — fine_resamp 是否实现？
-- PLAN: `fine_resample_with_timing` 函数应存在
-- 当前实现: 只有 `run_coarse_registration`
+## 代码衔接检查
+- `state["merged_ifg"]`、`state["merged_coh"]`、`state["unwrapped"]`、`state["geocoded_ifg"]`、`state["geocoded_coh"]`、`state["published_files"]` 传递一致。
+- `merged/` 目录作为中间产品缓存目录使用，命名统一。
 
-### B. tops_insar2.py — 完整 stage 实现
-- PLAN Section 1.3 pipeline flow vs 当前实现
-- 检查 `_run_swath` 各 stage 是否完整
-
-### C. ISCE3 ResampSlc 是否实现？
-- PLAN: deramp → ISCE3 ResampSlc(coarse) → reramp
-- 当前 tops_registration.py 用 scipy.ndimage 替代
-
-### D. tops_overlap.py — overlap SLC 读取是否实现？
-- PLAN: `read_overlap_window(tiff_path, slice)` 应从全 swath TIFF 读取
-- 当前: `materialize_overlaps` 只返回 OverlapPair，未读取实际 SLC 数据
-
-### E. tops_registration.py — coarse_resamp 读取 offsets
-- 当前: `run_coarse_registration` 假设 offsets 已在 work_dir
-- topo stage 应生成 offsets，但 Geo2Rdr 输出路径需确认
-
-## 阶段划分
-
-### 阶段 1: 审计 (Audit)
-- [ ] 逐模块核对 PLAN.md 接口
-- [ ] 确认每个函数/类的输入/输出/行为
-- [ ] 记录缺失项
-
-### 阶段 2: 补全 (Complete)
-- [ ] 补全缺失的函数
-- [ ] 补全缺失的测试
-- [ ] 验证 pipeline 端到端
-
-### 阶段 3: 验证 (Verify)
-- [ ] 全量测试通过
-- [ ] 无 strip_insar 导入
-- [ ] commit
-
-## 关键发现记录 → findings.md
-## 进度 → progress.md
+## 后续建议
+- 清理 `tops_insar.py` 中残留的 spike 注释。
+- 如需进一步贴合文档，可把 `geocode` 阶段输出说明改为“生成中间 geocoded arrays”，最终产品留给 `publish`。
