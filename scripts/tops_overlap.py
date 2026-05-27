@@ -22,7 +22,7 @@ from typing import Sequence, Tuple
 
 import numpy as np
 
-from scripts.tops_model import (
+from .tops_model import (
     BurstRadarGrid,
     CommonBurstPair,
     CommonBurstSelection,

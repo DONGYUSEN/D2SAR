@@ -21,7 +21,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Sequence, Tuple
 
-from scripts.tops_model import BurstRadarGrid, CommonBurstPair, CommonBurstSelection
+from .tops_model import BurstRadarGrid, CommonBurstPair, CommonBurstSelection
 
 
 # ---------------------------------------------------------------------------

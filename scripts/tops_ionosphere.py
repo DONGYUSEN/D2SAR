@@ -25,8 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.tops_ifg import generate_ifg
-from scripts.tops_model import BurstRadarGrid
+from .tops_ifg import generate_ifg
+from .tops_model import BurstRadarGrid
 
 
 # ---------------------------------------------------------------------------

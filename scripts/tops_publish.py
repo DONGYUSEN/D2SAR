@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.tops_model import BurstRadarGrid, BurstWindow
+from .tops_model import BurstRadarGrid, BurstWindow
 
 log = logging.getLogger(__name__)
 
@@ -581,7 +581,7 @@ def unwrap_ifg(
             log.warning("ICU unwrap failed: %s", exc)
             if not use_fallback:
                 raise
-            from scripts.tops_utils import unwrap_phase_2d
+            from .tops_utils import unwrap_phase_2d
             log.warning("Falling back to simple 2D unwrap")
             return unwrap_phase_2d(phase)
 
@@ -607,7 +607,7 @@ def unwrap_ifg(
             continue
 
     if use_fallback:
-        from scripts.tops_utils import unwrap_phase_2d
+        from .tops_utils import unwrap_phase_2d
         log.warning("SNAPHU failed; using simple 2D unwrap fallback")
         return unwrap_phase_2d(phase)
 

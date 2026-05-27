@@ -13,7 +13,7 @@ from typing import TextIO
 
 import numpy as np
 
-from scripts.tops_model import RangeCoregEstimate
+from .tops_model import RangeCoregEstimate
 
 # Physical constants
 SPEED_OF_LIGHT = 299792458.0  # m/s  (exact by SI definition)

@@ -27,7 +27,7 @@ from typing import Optional
 
 import numpy as np
 
-from scripts.tops_model import BurstRadarGrid, EsdEstimate, TimingCorrection
+from .tops_model import BurstRadarGrid, EsdEstimate, TimingCorrection
 
 # Physical constants (Sentinel-1 C-band)
 SPEED_OF_LIGHT: float = 299_792_458.0   # m/s

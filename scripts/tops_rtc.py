@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -10,6 +11,7 @@ from typing import Any
 
 import h5py
 import numpy as np
+import isce3.core
 from osgeo import gdal, osr
 
 from common_processing import (
@@ -23,6 +25,10 @@ from common_processing import (
     write_geocoded_png,
 )
 from tops_geometry import iter_burst_radar_grids, load_tops_metadata, select_burst_doppler
+from dem_manager import DEFAULT_DEM_CACHE_DIR, fetch_dem
+from sentinel_orbit import parse_product_filename, resolve_orbit_for_product
+
+log = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -324,8 +330,6 @@ def _merged_radar_grid_json(bursts: list[dict[str, Any]]) -> dict[str, Any]:
         }
     )
     if "rangeTimeFirstPixel" in merged:
-        import isce3.core
-
         merged["rangeTimeFirstPixel"] = 2.0 * float(ref_range) / isce3.core.speed_of_light
     return merged
 
@@ -543,6 +547,8 @@ def apply_burst_rtc_factor(
     amplitude_h5: str | Path,
     rtc_factor_tif: str | Path,
     output_h5: str | Path,
+    *,
+    block_rows: int = 256,
 ) -> str:
     amp_path = Path(amplitude_h5)
     factor_path = Path(rtc_factor_tif)
@@ -553,20 +559,13 @@ def apply_burst_rtc_factor(
     if factor_ds is None:
         raise RuntimeError(f"failed to open RTC factor: {factor_path}")
     factor_band = factor_ds.GetRasterBand(1)
+
     with h5py.File(amp_path, "r") as f_in:
-        amp = f_in["slc_amplitude"][:]
+        length, width = f_in["slc_amplitude"].shape
         valid = f_in["valid_mask"][:]
-        shape = amp.shape
 
-        factor_data = factor_band.ReadAsArray(0, 0, shape[1], shape[0])
-        if factor_data is None:
-            raise RuntimeError("failed to read RTC factor block")
-
-        factor_data = np.where(np.isfinite(factor_data) & (factor_data > 0), factor_data, np.nan)
-
-        rtc_amp = np.zeros_like(amp)
-        valid_mask = (valid == 1) & np.isfinite(factor_data) & (factor_data > 0)
-        rtc_amp[valid_mask] = (amp[valid_mask] / np.sqrt(factor_data[valid_mask])).astype(np.float32)
+        chunk_rows = max(1, min(int(block_rows), length))
+        chunk_cols = max(1, min(1024, width))
 
         with h5py.File(out_path, "w") as f_out:
             for key, value in f_in.attrs.items():
@@ -578,17 +577,26 @@ def apply_burst_rtc_factor(
                 if ds_name in f_in:
                     f_in.copy(ds_name, f_out)
 
-            chunk_rows = max(1, min(256, shape[0]))
-            chunk_cols = max(1, min(1024, shape[1]))
             d_rtc = f_out.create_dataset(
                 "rtc_amplitude",
-                shape=shape,
+                shape=(length, width),
                 dtype=np.float32,
                 chunks=(chunk_rows, chunk_cols),
                 compression="gzip",
                 shuffle=True,
             )
-            d_rtc[:] = rtc_amp.astype(np.float32)
+
+            for row0 in range(0, length, block_rows):
+                rows = min(block_rows, length - row0)
+                amp_block = f_in["slc_amplitude"][row0 : row0 + rows, :]
+                valid_block = valid[row0 : row0 + rows, :]
+                factor_block = factor_band.ReadAsArray(0, row0, width, rows).astype(np.float32)
+
+                factor_safe = np.where(np.isfinite(factor_block) & (factor_block > 0), factor_block, np.nan)
+                rtc_block = np.zeros((rows, width), dtype=np.float32)
+                write_mask = (valid_block == 1) & np.isfinite(factor_safe) & (factor_safe > 0)
+                rtc_block[write_mask] = (amp_block[write_mask] / np.sqrt(factor_safe[write_mask])).astype(np.float32)
+                d_rtc[row0 : row0 + rows, :] = rtc_block
 
     factor_ds = None
     return str(out_path)
@@ -741,30 +749,8 @@ def _burst_range_start(grid: dict[str, Any]) -> float:
     if "startingRange" in grid:
         return float(grid["startingRange"])
     if "rangeTimeFirstPixel" in grid:
-        return float(grid["rangeTimeFirstPixel"]) * 299792458.0 / 2.0
+        return float(grid["rangeTimeFirstPixel"]) * isce3.core.speed_of_light / 2.0
     return 0.0
-
-
-def _can_merge_bursts_radar_grid(bursts: list[dict[str, Any]], dataset_name: str) -> bool:
-    if not bursts:
-        return False
-    for burst in bursts:
-        if "radargrid" not in burst or "outputs" not in burst:
-            return False
-        if dataset_name == "rtc_amplitude":
-            data_h5 = Path(burst["outputs"]["directory"]) / "amplitude_rtc.h5"
-        else:
-            data_h5 = Path(burst["outputs"]["amplitude_h5"])
-        if not data_h5.is_file():
-            return False
-        try:
-            with h5py.File(data_h5, "r") as f:
-                required = (dataset_name, "valid_mask", "longitude", "latitude", "height")
-                if any(name not in f for name in required):
-                    return False
-        except OSError:
-            return False
-    return True
 
 
 def _burst_data_h5_path(burst: dict[str, Any], dataset_name: str) -> str:
@@ -1065,6 +1051,228 @@ def export_radar_hdf_geocoded(
     }
 
 
+# ---------------------------------------------------------------------------
+# Auto-download helpers
+# ---------------------------------------------------------------------------
+
+def _find_safe_from_manifest(manifest_path: Path, manifest: dict) -> Path | None:
+    """Derive original SAFE product path from manifest contents.
+
+    Handles:
+    - ZIP mode:  /vsizip//path/to/S1A_...SAFE.zip/measurement/...tiff
+    - Dir mode:  looks for ancestor directory ending in .SAFE
+    - Metadata:  manifest ``source_product`` field (set by importer)
+    """
+    # 1) Check for explicit source_product field
+    src = manifest.get("source_product")
+    if src:
+        p = Path(src)
+        if p.exists():
+            return p
+
+    # 2) Extract from SLC path (VSI ZIP path)
+    slc_entry = manifest.get("slc", {}).get("path")
+    if slc_entry:
+        slc_resolved = resolve_manifest_data_path(manifest_path, slc_entry)
+        if slc_resolved:
+            # /vsizip//path/to/SAFE.zip/measurement/... → /path/to/SAFE.zip
+            for prefix in ("/vsizip/", "/vsitar/"):
+                if slc_resolved.startswith(prefix):
+                    remainder = slc_resolved[len(prefix):]
+                    for marker in (".zip/", ".SAFE/", ".tar/", ".tar.gz/"):
+                        idx = remainder.lower().find(marker)
+                        if idx >= 0:
+                            candidate = Path(remainder[:idx + len(marker) - 1])
+                            if candidate.exists():
+                                return candidate
+                            # Try with prefix stripped for relative paths
+                            if not candidate.is_absolute():
+                                abs_candidate = (manifest_path.parent / candidate).resolve()
+                                if abs_candidate.exists():
+                                    return abs_candidate
+                            break
+            # Plain path — look for SAFE ancestor
+            p = Path(slc_resolved)
+            for parent in p.parents:
+                if parent.name.upper().endswith(".SAFE"):
+                    if parent.exists():
+                        return parent
+# Also match .SAFE.zip, .zip
+                if parent.suffix.lower() == ".zip" and parent.stem.upper().endswith(".SAFE"):
+                    if parent.exists():
+                        return parent
+            # 3) Walk up from manifest directory looking for SAFE dirs/zips
+    for parent in manifest_path.parents:
+        for child in parent.iterdir():
+            name = child.name.upper()
+            if child.is_dir() and name.endswith(".SAFE"):
+                return child
+            if child.is_file() and (name.endswith(".SAFE.ZIP") or
+                                     (child.suffix.lower() == ".zip" and ".SAFE" in name)):
+                return child
+    return None
+
+
+def _compute_scene_bbox_from_bursts(
+    manifest_path: Path,
+    bursts: list[dict[str, Any]],
+) -> list[float] | None:
+    """Compute [west, east, south, north] from TOPS burst radar-grid metadata.
+
+    Avoids ISCE3 C++ bindings — uses lat/lon corner data embedded in the
+    burst radar-grid dict.
+    """
+    lats: list[float] = []
+    lons: list[float] = []
+    for burst in bursts:
+        rg = burst.get("radargrid") or burst
+        for corner_key in ("cornerLats", "cornerLat"):
+            grid_lats = rg.get(corner_key)
+            if grid_lats and isinstance(grid_lats, (list, tuple)):
+                lats.extend(float(v) for v in grid_lats if v is not None)
+                break
+        for corner_key in ("cornerLons", "cornerLon"):
+            grid_lons = rg.get(corner_key)
+            if grid_lons and isinstance(grid_lons, (list, tuple)):
+                lons.extend(float(v) for v in grid_lons if v is not None)
+                break
+
+    if not lats or not lons:
+        return None
+
+    margin = 0.05
+    west = min(lons) - margin
+    east = max(lons) + margin
+    south = min(lats) - margin
+    north = max(lats) + margin
+
+    # Handle date-line crossing
+    if east - west > 180.0:
+        west = -180.0
+        east = 180.0
+
+    return [round(west, 6), round(east, 6), round(south, 6), round(north, 6)]
+
+
+def _ensure_dem_and_orbits(
+    args: argparse.Namespace,
+    manifest_path: Path,
+    manifest: dict,
+    safe_path: Path | None,
+) -> tuple[Path | None, Path | None]:
+    """Ensure DEM and orbit files exist, downloading if ``--auto-download``.
+
+    Returns ``(dem_path, orbit_dir)`` with resolved paths.
+    """
+    dem_path: Path | None = Path(args.dem) if getattr(args, "dem", None) else None
+    orbit_dir: Path | None = (
+        Path(args.orbit_dir) if getattr(args, "orbit_dir", None) else None
+    )
+
+    # ── Orbit resolution ────────────────────────────────────────────────
+    if orbit_dir is None:
+        orbit_dir = Path(args.output_dir) / "orbits"
+    orbit_dir.mkdir(parents=True, exist_ok=True)
+
+    if safe_path and safe_path.exists():
+        try:
+            # Validate it's a recognizable Sentinel product
+            parse_product_filename(safe_path)
+            orbit_result = resolve_orbit_for_product(
+                str(safe_path),
+                orbit_dir=str(orbit_dir),
+                download=False,
+            )
+            if orbit_result is None and getattr(args, "auto_download", False):
+                log.info("Orbit not found locally; downloading POEORB/RESORB...")
+                try:
+                    orbit_result = resolve_orbit_for_product(
+                        str(safe_path),
+                        orbit_dir=str(orbit_dir),
+                        download=True,
+                    )
+                    log.info("Orbit downloaded: %s", orbit_result)
+                except Exception as exc:
+                    log.warning("Orbit download failed: %s", exc)
+            elif orbit_result is None:
+                log.warning(
+                    "Orbit not found in %s; use --auto-download to fetch. "
+                    "Topo stage may use zero offsets.",
+                    orbit_dir,
+                )
+        except Exception as exc:
+            log.warning("Could not resolve orbits from SAFE path %s: %s", safe_path, exc)
+    else:
+        log.info(
+            "SAFE product path not available from manifest; skip orbit download. "
+            "Use --product-path to enable orbit auto-download."
+        )
+
+    # ── DEM resolution ──────────────────────────────────────────────────
+    if dem_path is not None and dem_path.exists():
+        log.info("DEM already available: %s", dem_path)
+        return dem_path, orbit_dir
+
+    dem_cache = Path(
+        args.dem_cache_dir
+        if getattr(args, "dem_cache_dir", None)
+        else str(DEFAULT_DEM_CACHE_DIR)
+    )
+    dem_cache.mkdir(parents=True, exist_ok=True)
+
+    # Compute scene bbox from burst metadata
+    burst_metadata = manifest.get("tops", {}).get("bursts", [])
+    if not burst_metadata:
+        # Fall back to metadata/acquisition.json scene corners
+        try:
+            meta = resolve_manifest_metadata_path(manifest_path, manifest, "acquisition")
+            if meta and meta.exists():
+                acq = json.loads(meta.read_text(encoding="utf-8"))
+                corners = acq.get("sceneCorners") or acq.get("cornerLonLat")
+                if corners and len(corners) >= 4:
+                    lons = [c[0] for c in corners]
+                    lats = [c[1] for c in corners]
+                    burst_metadata = [{"cornerLats": lats, "cornerLons": lons}]
+        except Exception:
+            pass
+
+    scene_bbox = _compute_scene_bbox_from_bursts(manifest_path, burst_metadata) if burst_metadata else None
+    if scene_bbox is None:
+        log.warning("Could not compute scene bbox; using full-globe for DEM.")
+        scene_bbox = [-180.0, 180.0, -90.0, 90.0]
+    else:
+        log.info(
+            "Scene bbox for DEM: west=%.2f east=%.2f south=%.2f north=%.2f",
+            scene_bbox[0], scene_bbox[1], scene_bbox[2], scene_bbox[3],
+        )
+
+    if getattr(args, "auto_download", False):
+        log.info(
+            "DEM not found locally; downloading SRTMGL1 "
+            "(this may take a few minutes on first run)..."
+        )
+        try:
+            fetched = fetch_dem(
+                scene_bbox,
+                output_dir=str(dem_cache),
+                source=1,
+                correct_geoid=True,
+            )
+            dem_path = Path(fetched)
+            log.info("DEM ready: %s", dem_path)
+        except Exception as exc:
+            log.warning("DEM download failed: %s; topo may use zero offsets.", exc)
+            dem_path = None
+    else:
+        log.warning(
+            "DEM not found and --auto-download not set; "
+            "use --auto-download to fetch SRTMGL1 automatically."
+        )
+        dem_path = None
+
+    return dem_path, orbit_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sentinel TOPS RTC unified pipeline")
     parser.add_argument("manifest", nargs="?", help="Path to Sentinel importer manifest.json")
@@ -1091,9 +1299,56 @@ def main() -> None:
         action="store_true",
         help="Only run final cross-swath mosaic using existing per-swath geocoded RTC TIFFs",
     )
+    parser.add_argument(
+        "--auto-download",
+        action="store_true",
+        help="Automatically download missing DEM (SRTMGL1) and orbit (POEORB/RESORB) files",
+    )
+    parser.add_argument(
+        "--orbit-dir",
+        type=Path,
+        default=None,
+        help="Directory containing Sentinel-1 orbit EOF files. "
+             "If not provided, defaults to <output_dir>/orbits.",
+    )
+    parser.add_argument(
+        "--dem-cache-dir",
+        type=Path,
+        default=None,
+        help="Local directory for DEM cache (SRTM tiles). "
+             "If not set, defaults to D2SAR_DEM_CACHE_DIR env var or /tmp/d2sar_dem_cache.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity (default: INFO)",
+    )
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
     def run_one_manifest(manifest_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
+        manifest_path = Path(manifest_path)
+        out_dir = Path(out_dir)
+
+        # ── Auto-resolve DEM and orbits ──────────────────────────────────
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        if getattr(args, "auto_download", False) or not args.dem:
+            safe_path = _find_safe_from_manifest(manifest_path, manifest)
+            resolved_dem, resolved_orbit_dir = _ensure_dem_and_orbits(
+                args, manifest_path, manifest, safe_path,
+            )
+            if resolved_dem:
+                args.dem = str(resolved_dem)
+                log.info("DEM resolved: %s", resolved_dem)
+            if resolved_orbit_dir:
+                args.orbit_dir = str(resolved_orbit_dir)
+
         result = prepare_tops_rtc(manifest_path, out_dir)
         if args.materialize:
             result["materialized"] = materialize_tops_rtc_plan(

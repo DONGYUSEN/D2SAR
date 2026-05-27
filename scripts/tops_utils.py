@@ -26,7 +26,7 @@ from typing import Optional
 
 import numpy as np
 
-from scripts.tops_model import BurstWindow
+from .tops_model import BurstWindow
 
 
 # ---------------------------------------------------------------------------

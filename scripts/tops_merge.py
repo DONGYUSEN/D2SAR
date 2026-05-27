@@ -17,7 +17,7 @@ from typing import Sequence
 
 import numpy as np
 
-from scripts.tops_model import (
+from .tops_model import (
     BurstRadarGrid,
     BurstWindow,
     MergeResult,

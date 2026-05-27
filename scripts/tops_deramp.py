@@ -28,7 +28,7 @@ __all__ = [
 
 import numpy as np
 
-from scripts.tops_model import BurstRadarGrid
+from .tops_model import BurstRadarGrid
 
 
 def tophu_phase(

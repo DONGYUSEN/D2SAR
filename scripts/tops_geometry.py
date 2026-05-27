@@ -9,6 +9,7 @@ No imports from strip/tops_insar backends.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import xml.etree.ElementTree as ET
@@ -19,8 +20,9 @@ from typing import Any
 
 import numpy as np
 
-from scripts.tops_model import BurstRadarGrid, Geo2RdrOffsets
-from scripts.sentinel_orbit import resolve_orbit_for_product
+from .tops_model import BurstRadarGrid, Geo2RdrOffsets
+from .sentinel_orbit import resolve_orbit_for_product
+from .common_processing import resolve_manifest_metadata_path
 
 UTC = timezone.utc
 LOG = logging.getLogger(__name__)
@@ -550,31 +552,15 @@ def run_geo2rdr_single_burst(
     from isce3.geometry import rdr2geo, DEMInterpolator
 
     if use_gpu:
-        import isce3.cuda.core as _cuda_core
-        try:
-            _device = _cuda_core.Device(gpu_id)
-            _cuda_core.set_device(_device)
-        except Exception as exc:
-            LOG.warning("Failed to set CUDA device %d, falling back to CPU: %s", gpu_id, exc)
-            use_gpu = False
-
-    if use_gpu:
-        try:
-            from isce3.cuda.geometry import Geo2Rdr, Rdr2Geo
-        except (ImportError, AttributeError) as exc:
-            LOG.warning("ISCE3 CUDA geometry unavailable; falling back to CPU: %s", exc)
-            use_gpu = False
-
-    # Use strip_insar2.py style GPU check instead of forcing CPU
-    if use_gpu:
-        try:
-            from isce3.core.gpu_check import use_gpu as gpu_check
-            use_gpu = gpu_check(True, gpu_id)
-            if not use_gpu:
-                LOG.info("GPU check failed; using CPU mode")
-        except Exception as exc:
-            LOG.warning("GPU check failed: %s; using CPU mode", exc)
-            use_gpu = False
+        from .gpu_utils import init_cuda_device
+        gpu_info = init_cuda_device(gpu_id, gpu_mode="auto", log=LOG)
+        use_gpu = gpu_info.available
+        if use_gpu:
+            try:
+                from isce3.cuda.geometry import Geo2Rdr, Rdr2Geo
+            except (ImportError, AttributeError) as exc:
+                LOG.warning("ISCE3 CUDA geometry import failed: %s; using CPU", exc)
+                use_gpu = False
 
     # Use strip_insar2.py style parameters for better stability
     GEOMETRY_THRESHOLD = 1e-8  # More strict than default 1e-4
@@ -587,49 +573,34 @@ def run_geo2rdr_single_burst(
 
     # Step 1: Build ISCE3 RadarGridParameters for both bursts
     # Use separate epochs for master and slave to avoid time reference issues
-    ref_epoch = DateTime(
-        ref.identity.sensing_start.year,
-        ref.identity.sensing_start.month,
-        ref.identity.sensing_start.day,
-        ref.identity.sensing_start.hour,
-        ref.identity.sensing_start.minute,
-        ref.identity.sensing_start.second + ref.identity.sensing_start.microsecond * 1e-6
-    )
-
-    sec_epoch = DateTime(
-        sec.identity.sensing_start.year,
-        sec.identity.sensing_start.month,
-        sec.identity.sensing_start.day,
-        sec.identity.sensing_start.hour,
-        sec.identity.sensing_start.minute,
-        sec.identity.sensing_start.second + sec.identity.sensing_start.microsecond * 1e-6
-    )
+    ref_epoch = _burst_sensing_to_isce3_dt(ref)
+    sec_epoch = _burst_sensing_to_isce3_dt(sec)
 
     ref_prf = 1.0 / ref.azimuth_time_interval
     sec_prf = 1.0 / sec.azimuth_time_interval
 
     ref_radar_grid = RadarGridParameters(
-        0.0,
-        ref.radar_wavelength,
-        ref_prf,
-        ref.starting_range,
-        ref.range_pixel_spacing,
-        LookSide.Right,
-        ref.valid_window.num_lines,
-        ref.valid_window.num_samples,
-        ref_epoch
+        sensing_start=0.0,
+        wavelength=ref.radar_wavelength,
+        prf=ref_prf,
+        starting_range=ref.starting_range,
+        range_pixel_spacing=ref.range_pixel_spacing,
+        lookside=LookSide.Right,
+        length=ref.valid_window.num_lines,
+        width=ref.valid_window.num_samples,
+        ref_epoch=ref_epoch,
     )
 
     sec_radar_grid = RadarGridParameters(
-        0.0,
-        sec.radar_wavelength,
-        sec_prf,
-        sec.starting_range,
-        sec.range_pixel_spacing,
-        LookSide.Right,
-        sec.valid_window.num_lines,
-        sec.valid_window.num_samples,
-        sec_epoch
+        sensing_start=0.0,
+        wavelength=sec.radar_wavelength,
+        prf=sec_prf,
+        starting_range=sec.starting_range,
+        range_pixel_spacing=sec.range_pixel_spacing,
+        lookside=LookSide.Right,
+        length=sec.valid_window.num_lines,
+        width=sec.valid_window.num_samples,
+        ref_epoch=sec_epoch,
     )
 
     LOG.info("Ref radar grid: epoch=%s, lines=%d, samples=%d",
@@ -841,3 +812,90 @@ def run_geo2rdr_single_burst(
         median_azimuth_offset=median_az,
         valid_sample_count=valid_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# tops_rtc helpers — manifest metadata, burst grid iteration, doppler
+# ---------------------------------------------------------------------------
+
+_GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
+
+
+def load_tops_metadata(manifest_path: str | Path) -> dict[str, Any]:
+    manifest_path = Path(manifest_path)
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    expected_keys = {"acquisition", "tops"}
+    missing = expected_keys - set(manifest.get("metadata", {}))
+    if missing:
+        raise ValueError(
+            f"Manifest metadata missing required keys: {', '.join(sorted(missing))}"
+        )
+    tops_path = resolve_manifest_metadata_path(manifest_path, manifest, "tops")
+    tops = json.loads(tops_path.read_text(encoding="utf-8"))
+    return {"manifest": manifest, "tops": tops}
+
+
+def iter_burst_radar_grids(manifest_path: str | Path):
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tops_path = resolve_manifest_metadata_path(manifest_path, manifest, "tops")
+    tops = json.loads(tops_path.read_text(encoding="utf-8"))
+
+    _corner_lats: list[float] = []
+    _corner_lons: list[float] = []
+    try:
+        acq_path = resolve_manifest_metadata_path(manifest_path, manifest, "acquisition")
+        acquisition = json.loads(acq_path.read_text(encoding="utf-8"))
+        corners = acquisition.get("sceneCorners") or []
+        for c in corners:
+            if isinstance(c, dict):
+                clat = c.get("lat")
+                clon = c.get("lon")
+                if clat is not None and clon is not None:
+                    _corner_lats.append(float(clat))
+                    _corner_lons.append(float(clon))
+            elif isinstance(c, (list, tuple)) and len(c) >= 2:
+                _corner_lats.append(float(c[1]))
+                _corner_lons.append(float(c[0]))
+    except Exception:
+        pass
+
+    for burst in tops.get("bursts", []):
+        sensing_start_utc = burst.get("sensingStartUTC", "")
+        gps_seconds = 0.0
+        try:
+            st = sensing_start_utc.strip()
+            if st.endswith("Z"):
+                st = st[:-1] + "+00:00"
+            gps_seconds = (datetime.fromisoformat(st) - _GPS_EPOCH).total_seconds()
+        except Exception:
+            pass
+
+        yield {
+            "burstIndex": int(burst.get("index", 0)),
+            "lineOffset": int(burst.get("lineOffset", 0)),
+            "numberOfRows": int(burst.get("numberOfLines", 0)),
+            "numberOfColumns": int(burst.get("numberOfSamples", 0)),
+            "firstValidSample": int(burst.get("firstValidSample", 0)),
+            "firstValidLine": int(burst.get("firstValidLine", 0)),
+            "numValidSamples": int(burst.get("numValidSamples", 0)),
+            "numValidLines": int(burst.get("numValidLines", 0)),
+            "rowSpacing": float(burst.get("azimuthTimeInterval", 0.0)),
+            "columnSpacing": float(burst.get("rangePixelSize", 0.0)),
+            "sensingStartGPSTime": gps_seconds,
+            "startingRange": float(burst.get("startingRange", 0.0)),
+            "cornerLats": _corner_lats,
+            "cornerLons": _corner_lons,
+        }
+
+
+def select_burst_doppler(burst: dict[str, Any]) -> dict[str, Any]:
+    doppler = burst.get("doppler", {})
+    coefficients = doppler.get("coefficients", [])
+    if isinstance(coefficients, str):
+        coefficients = [float(v) for v in coefficients.split()]
+    return {
+        "coefficients": coefficients,
+        "t0": float(doppler.get("t0", 0.0)),
+    }

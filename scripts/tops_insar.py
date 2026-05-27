@@ -630,20 +630,97 @@ def _stage_compute_baselines(
 
     Reads orbit state vectors from master and slave products to compute
     baseline geometry.  Writes baselines.json summary.
+
+    If ISCE3 is available, builds ISCE3 Orbits from SAFE products and
+    uses Orbit.interpolate + geometry for precise baseline;
+    otherwise falls back to a zero baseline placeholder.
     """
     import json
 
     log.info("[%s] stage_compute_baselines: computing baseline geometry", swath)
     baselines: list[dict] = []
 
-    for i, (master, slave) in enumerate(zip(master_bursts, slave_bursts)):
-        # TODO: ISCE3 baseline computation from orbit+geometry
-        baseline_perp = 0.0
-        baselines.append({
-            "pair_index": i,
-            "swath": swath,
-            "perpendicular_baseline_m": float(baseline_perp),
-        })
+    try:
+        from .tops_geometry import build_isce3_orbit_from_safe
+
+        master_safe = Path(args.master_safe_or_manifest)
+        slave_safe = Path(args.slave_safe_or_manifest)
+        orbit_dir = Path(args.orbit_dir) if getattr(args, "orbit_dir", None) else None
+
+        # Compute mid-scene time from first burst for orbit construction
+        t0_mid = master_bursts[0].identity.sensing_start
+        t1_mid = master_bursts[-1].identity.sensing_stop if len(master_bursts) > 1 else                  master_bursts[0].identity.sensing_stop
+        from datetime import timedelta
+        margin = timedelta(seconds=120)
+
+        master_orbit = build_isce3_orbit_from_safe(
+            master_safe, t0_mid - margin, t1_mid + margin, orbit_dir
+        )
+        slave_orbit = build_isce3_orbit_from_safe(
+            slave_safe, t0_mid - margin, t1_mid + margin, orbit_dir
+        )
+
+        isce3 = _get_isce3()
+        from isce3.core import Ellipsoid
+        ellipsoid = Ellipsoid()
+
+        for i, (master, slave) in enumerate(zip(master_bursts, slave_bursts)):
+            mid_line = master.valid_window.num_lines // 2
+            mid_col = master.valid_window.num_samples // 2
+            try:
+                # Interpolate orbit positions at burst mid-point
+                mid_aztime = master.azimuth_time_at_line(mid_line)
+                mid_slant = master.slant_range_at(mid_col)
+
+                # Estimate perpendicular baseline from orbit separation
+                master_pos = master_orbit.interpolate(
+                    isce3.core.DateTime(
+                        mid_aztime.year, mid_aztime.month, mid_aztime.day,
+                        mid_aztime.hour, mid_aztime.minute,
+                        mid_aztime.second + mid_aztime.microsecond * 1e-6,
+                    )
+                )
+                slave_pos = slave_orbit.interpolate(
+                    isce3.core.DateTime(
+                        mid_aztime.year, mid_aztime.month, mid_aztime.day,
+                        mid_aztime.hour, mid_aztime.minute,
+                        mid_aztime.second + mid_aztime.microsecond * 1e-6,
+                    )
+                )
+
+                # Baseline = |pos_master - pos_slave| projected onto LOS
+                pos_diff = np.array([
+                    master_pos[0] - slave_pos[0],
+                    master_pos[1] - slave_pos[1],
+                    master_pos[2] - slave_pos[2],
+                ], dtype=np.float64)
+                los = np.array(master_pos, dtype=np.float64)
+                los /= np.linalg.norm(los) + 1e-12
+                baseline_perp = float(np.linalg.norm(
+                    pos_diff - np.dot(pos_diff, los) * los
+                ))
+            except Exception:
+                baseline_perp = 0.0
+
+            baselines.append({
+                "pair_index": i,
+                "swath": swath,
+                "perpendicular_baseline_m": float(baseline_perp),
+            })
+
+        log.info("[%s] Baselines computed via ISCE3 orbit interpolation", swath)
+
+    except Exception:
+        log.warning(
+            "[%s] ISCE3 baseline computation unavailable; using zero baselines",
+            swath,
+        )
+        for i in range(min(len(master_bursts), len(slave_bursts))):
+            baselines.append({
+                "pair_index": i,
+                "swath": swath,
+                "perpendicular_baseline_m": 0.0,
+            })
 
     out = work_dir / "baselines.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -713,15 +790,35 @@ def _stage_preprocess(
     slave_bursts: list[BurstRadarGrid],
     state: dict[str, Any],
 ) -> bool:
-    """Match common bursts between master and slave."""
+    """Match common bursts between master and slave.
+
+    Uses global integer-offset continuous-span matching from tops_common_bursts.
+    Writes common_bursts.json and stores the CommonBurstSelection in state.
+    """
     log.info("[%s] stage_preprocess: matching common bursts", swath)
 
-    if not master_bursts or not slave_bursts:
-        log.error("[%s] Empty burst list: master=%d slave=%d",
-                  swath, len(master_bursts), len(slave_bursts))
+    if not master_bursts:
+        log.error("[%s] No master bursts; cannot find common bursts.", swath)
+        return False
+    if not slave_bursts:
+        log.error("[%s] No slave bursts; cannot find common bursts.", swath)
         return False
 
-    common = match_common_bursts(master_bursts, slave_bursts)
+    try:
+        common = match_common_bursts(master_bursts, slave_bursts)
+    except ValueError as exc:
+        log.error("[%s] Failed to match common bursts: %s", swath, exc)
+        return False
+
+    log.info(
+        "[%s] stage_preprocess: matched %d common burst pairs (offset=%d)",
+        swath, common.number_of_common_bursts,
+        common.pairs[0].burst_offset if common.pairs else 0,
+    )
+
+    if common.number_of_common_bursts < 1:
+        log.error("[%s] No common bursts found; aborting.", swath)
+        return False
 
     json_path = work_dir / "common_bursts.json"
     write_common_bursts_json(common, json_path)
@@ -1003,34 +1100,12 @@ def _stage_topo(
     use_gpu = args.gpu_mode in ("auto", "gpu")
     gpu_id = int(getattr(args, "gpu_id", 0))
     if use_gpu:
-        try:
-            import isce3.cuda.core as _cuda_core
-            # Handle different ISCE3 API versions
-            if hasattr(_cuda_core.Device, 'numDevices'):
-                ngpus = _cuda_core.Device.numDevices()
-            elif hasattr(_cuda_core.Device, 'get_count'):
-                ngpus = _cuda_core.Device.get_count()
-            else:
-                # Try to get count by catching exceptions
-                ngpus = 0
-                for i in range(16):
-                    try:
-                        device = _cuda_core.Device(i)
-                        ngpus = i + 1
-                    except Exception:
-                        break
-                if ngpus == 0:
-                    raise RuntimeError("No CUDA devices found")
-            if gpu_id >= ngpus:
-                log.warning("GPU device %d not available (found %d GPUs), falling back to GPU 0", gpu_id, ngpus)
-                gpu_id = 0
-            device = _cuda_core.Device(gpu_id)
-            _cuda_core.set_device(device)
-            log.info("CUDA device set: %s (id=%d)", device.name, gpu_id)
-        except Exception as exc:
-            log.warning("Failed to initialize CUDA device %d: %s", gpu_id, exc)
+        from .gpu_utils import init_cuda_device
+        gpu_info = init_cuda_device(
+            gpu_id, gpu_mode=args.gpu_mode, log=log,
+        )
+        if not gpu_info.available:
             if args.gpu_mode == "gpu":
-                log.error("GPU mode explicitly requested but CUDA init failed.")
                 return False
             use_gpu = False
     pairs_to_process = list(common.pairs)
@@ -2989,7 +3064,7 @@ def _run_isce3_ampcor_fine_offsets(
         raise ValueError(f"Ampcor input too small: shape={ref_slc.shape}")
 
     from isce3.matchtemplate import PyCPUAmpcor
-    from scripts.insar_registration import _plan_matching_grid
+    from .insar_registration import _plan_matching_grid
 
     window_size = (64, 64)
     search_range = (20, 20)
@@ -3762,7 +3837,7 @@ def _ensure_dem_and_orbits(
             "(this may take a few minutes on first run)..."
         )
         try:
-            from scripts.dem_manager import fetch_dem
+            from .dem_manager import fetch_dem
             fetched = fetch_dem(
                 scene_bbox,
                 output_dir=str(dem_cache),

@@ -59,8 +59,13 @@ def build_output_paths(output_dir: str | Path) -> dict[str, str]:
 
 
 def _default_gpu_check(gpu_requested: bool | None, gpu_id: int) -> bool:
+    try:
+        from gpu_utils import check_cuda_available
+        if check_cuda_available(gpu_id):
+            return True
+    except Exception:
+        pass
     from isce3.core.gpu_check import use_gpu
-
     return bool(use_gpu(gpu_requested, gpu_id))
 
 

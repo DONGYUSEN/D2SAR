@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
-from scripts.tops_model import (
+from .tops_model import (
     BurstIdentity,
     BurstWindow,
     BurstRadarGrid,

@@ -1121,12 +1121,14 @@ def append_topo_coordinates_hdf(
     dem_raster = isce3.io.Raster(str(dem_path))
 
     if use_gpu:
-        import isce3.cuda.core
-        import isce3.cuda.geometry
-
-        device = isce3.cuda.core.Device(gpu_id)
-        isce3.cuda.core.set_device(device)
-        rdr2geo_cls = isce3.cuda.geometry.Rdr2Geo
+        from gpu_utils import init_cuda_device
+        gpu_info = init_cuda_device(gpu_id, gpu_mode="auto")
+        if gpu_info.available:
+            import isce3.cuda.geometry
+            rdr2geo_cls = isce3.cuda.geometry.Rdr2Geo
+        else:
+            import isce3.geometry
+            rdr2geo_cls = isce3.geometry.Rdr2Geo
     else:
         import isce3.geometry
 

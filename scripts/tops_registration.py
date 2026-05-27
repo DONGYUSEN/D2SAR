@@ -37,8 +37,8 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.tops_model import BurstRadarGrid, Geo2RdrOffsets, RangeCoregEstimate, TimingCorrection
-from scripts.tops_deramp import deramp_slc, reramp_slc
+from .tops_model import BurstRadarGrid, Geo2RdrOffsets, RangeCoregEstimate, TimingCorrection
+from .tops_deramp import deramp_slc, reramp_slc
 
 log = logging.getLogger(__name__)
 

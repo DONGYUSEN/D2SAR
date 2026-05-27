@@ -1,1 +1,25 @@
 .worktrees/
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.legacy
+*.orig
+.env
+result/
+results/
+/temp/
+/tmp/
+*.log
+*.EOF
+*.EOF.zip
+demo_enhancements.py
+CODE_ANALYSIS_REPORT.md
+ENHANCEMENT_SUMMARY.md
+PROJECT_COMPLETION_REPORT.md
+QUICK_REF.md
+
+# standalone repos embedded in tree
+/dolphin
+/isce3
+/plant-isce3
